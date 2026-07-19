@@ -2,6 +2,5 @@
     "name": "SP Group",
     "country": "SG",
     "homeassistant": "2026.7.2",
-    "render_readme": true,
-    "persistent_directory": "ledger"
+    "render_readme": true
 }

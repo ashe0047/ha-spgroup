@@ -43,14 +43,19 @@ This checkout does not expose Git history, so use short imperative commit subjec
 When starting a local HA dev instance (`mise run ha:dev`), the HA UI shows two repair warnings that are expected for non-Docker development:
 - `deprecated_method` — Core installations are deprecated per HA 2025.12 policy. To suppress this, use Docker-based development (devcontainer).
 
-## Repository Conventions & HACS Distribution
+## Contributing
+
+See `CONTRIBUTING.md` for development setup, testing, and SDK dependency
+instructions.
+
+## HACS Distribution & Repository Conventions
 
 This repo is set up for HACS distribution as a custom integration. Two docs
-define the conventions and requirements:
+define the alignment and conventions:
 
 - `docs/hacs-integration-checklist.md` — HACS alignment requirements
 - `docs/repo-conventions.md` — Repo naming, domain, versioning, and GitHub
-  conventions for this workspace
+  conventions
 
 ## Agent-Specific Instructions
 
