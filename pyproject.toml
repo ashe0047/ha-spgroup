@@ -1,0 +1,27 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: tests that call live external services",
+    "spgroup_ha_live_soak: opt-in live Home Assistant runtime soak for SP Group",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+src = ["custom_components"]
+exclude = []
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "TID"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_configs = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["homeassistant.*"]
+ignore_missing_imports = true

@@ -1,0 +1,16 @@
+{
+  "domain": "sp_group",
+  "name": "SP Group",
+  "codeowners": [
+    "@ashe0047"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/ashe0047/spgroup-ha",
+  "issue_tracker": "https://github.com/ashe0047/spgroup-ha/issues",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "quality_scale": "bronze",
+  "requirements": ["spgroup>=0.1.0"],
+  "version": "0.2.0"
+}

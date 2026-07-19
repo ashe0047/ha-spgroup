@@ -1,0 +1,261 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "description": "Enter your SP Group account credentials.",
+                "data": {
+                    "username": "Email",
+                    "password": "Password"
+                },
+                "data_description": {
+                    "username": "Use the email address you use in the SP app.",
+                    "password": "Your password is used only to complete setup and is not stored by Home Assistant."
+                }
+            },
+            "dev_auth_choice": {
+                "title": "Developer authentication",
+                "description": "Choose how to authenticate this local development setup flow. The cached-session option is available only when the developer bypass environment variable is enabled.",
+                "data": {
+                    "dev_auth_method": "Authentication method"
+                },
+                "data_description": {
+                    "dev_auth_method": "Use the cached developer session to skip username, password, and one-time password prompts while testing the rest of setup."
+                }
+            },
+            "dev_session_confirm": {
+                "title": "Use cached developer session?",
+                "description": "Load the local SP Group mobile session from {session_file}. If the session is expired, Home Assistant will refresh it before discovery and write the refreshed tokens back to that file.",
+                "data": {
+                    "confirm_dev_cached_session": "Use cached developer session"
+                },
+                "data_description": {
+                    "confirm_dev_cached_session": "Enable this only in a local development instance you control. Tokens are never stored in the config entry before setup completes."
+                }
+            },
+            "otp": {
+                "description": "Enter the one-time password sent by SP Group through {channel}.",
+                "data": {
+                    "otp": "One-time password"
+                },
+                "data_description": {
+                    "otp": "Enter the latest code from SP Group. Setup will continue to discovery after the code is accepted."
+                }
+            },
+            "sources": {
+                "description": "Choose the discovered utilities to enable with a manual meter-reading seed.",
+                "data": {
+                    "enabled_utilities": "Utilities"
+                },
+                "data_description": {
+                    "enabled_utilities": "Selected utilities become dashboard-ready after you enter a physical meter reading seed."
+                }
+            },
+            "no_sources_confirm": {
+                "description": "No utilities were selected. This creates a discovery-only SP Group entry with unavailable, non-dashboard sensors until utilities are enabled later in options.",
+                "data": {
+                    "confirm_no_sources": "Create without seeded utilities"
+                },
+                "data_description": {
+                    "confirm_no_sources": "Enable this only if you intentionally want to finish setup without dashboard-ready electricity or water sensors."
+                }
+            },
+            "seed": {
+                "description": "Enter the physical meter reading for {utility}. Step {step} of {total}. Use the reading shown on the meter at the selected time.",
+                "data": {
+                    "seed_value": "Meter reading",
+                    "seed_observed_at": "Observed at",
+                    "backfill_from": "Backfill from"
+                },
+                "data_description": {
+                    "seed_value": "Enter the cumulative physical meter reading in {unit}.",
+                    "seed_observed_at": "Use Singapore time. Electricity is cleanest at HH:00 or HH:30; water is cleanest at the start of a month.",
+                    "backfill_from": "Choose the earliest historical source data to import for this utility. Electricity is rounded down to a 30-minute boundary; water is rounded down to the start of the selected month."
+                }
+            },
+            "approximate_seed_confirm": {
+                "description": "The timestamp for {utility} is not exactly on the clean bucket boundary. The integration will start accumulation at the next safe boundary and may skip the partial interval before that boundary.",
+                "data": {
+                    "confirm_approximate_seed": "Use this approximate seed"
+                },
+                "data_description": {
+                    "confirm_approximate_seed": "Confirm only if you accept that usage between the physical reading time and the next bucket boundary may not be included."
+                }
+            },
+            "stale_flow_reset_confirm": {
+                "title": "Reset previous setup?",
+                "description": "Another SP Group setup for this account is still in progress in Home Assistant. Because that setup has not created an integration entry yet, it cannot be reliably resumed from here. Reset the previous setup and continue with this one?",
+                "data": {
+                    "confirm_stale_flow_reset": "Reset previous setup and continue"
+                },
+                "data_description": {
+                    "confirm_stale_flow_reset": "This only closes the unfinished setup flow. It does not remove an existing SP Group integration entry or change SP Group account data."
+                }
+            },
+            "reauth_confirm": {
+                "title": "Re-authenticate SP Group",
+                "description": "SP Group needs to re-authenticate your account.",
+                "data": {
+                    "username": "Email",
+                    "password": "Password"
+                },
+                "data_description": {
+                    "username": "Use the same SP Group account as this integration entry.",
+                    "password": "Your password is used only to refresh the stored mobile session."
+                }
+            }
+        },
+        "error": {
+            "approximate_seed_not_confirmed": "Confirm the approximate seed before continuing, or choose a clean boundary timestamp.",
+            "cannot_connect": "Could not connect to SP Group.",
+            "discovery_failed": "SP Group discovery completed but the utility account data could not be matched safely.",
+            "dev_session_invalid": "The cached developer session does not contain the token fields needed for setup.",
+            "dev_session_malformed": "The cached developer session file is not readable JSON.",
+            "dev_session_missing": "The cached developer session file was not found.",
+            "dev_session_missing_identity": "The cached developer session does not include a stable account identity.",
+            "dev_session_missing_refresh_token": "The cached developer session is missing a refresh token.",
+            "dev_session_refresh_failed": "The cached developer session could not be refreshed. Recreate the session cache with the live SDK setup command.",
+            "invalid_auth": "Invalid SP Group credentials or one-time password.",
+            "mfa_required": "Multi-factor authentication is required.",
+            "future_seed": "The seed timestamp cannot be in the future.",
+            "future_backfill": "The backfill start cannot be in the future.",
+            "backfill_after_seed": "The backfill start must be at or before the seed boundary.",
+            "invalid_decimal": "The seed reading must be a valid number.",
+            "invalid_backfill": "The backfill start must be valid.",
+            "invalid_timestamp": "The seed timestamp must be valid.",
+            "missing_backfill_from": "Enter a backfill start.",
+            "seed_negative": "The seed reading cannot be negative.",
+            "seed_too_old": "The seed timestamp is too old for the initial bounded backfill window.",
+            "stale_flow_reset_failed": "The previous setup could not be reset because another setup is still in progress. Close other SP Group setup dialogs or restart Home Assistant, then try again.",
+            "unknown": "Unexpected error.",
+            "password_too_short": "The password must be at least 8 characters long.",
+            "invalid_otp": "The one-time password must be 6 to 8 digits.",
+            "no_utilities_selected": "Select at least one utility to enable."
+        },
+        "abort": {
+            "already_configured": "This SP Group account is already configured.",
+            "dev_session_not_confirmed": "The cached developer session was not used. Start setup again and choose a different authentication method.",
+            "no_supported_utilities": "No supported electricity or water utilities were discovered for this SP Group account.",
+            "reauth_successful": "Re-authentication was successful.",
+            "stale_flow_not_reset": "The previous SP Group setup was left unchanged. Close any other SP Group setup dialogs or restart Home Assistant before trying again.",
+            "wrong_account": "The credentials belong to a different SP Group account."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "description": "Choose utilities to keep enabled, or run one reseed/rebuild maintenance action.",
+                "data": {
+                    "enabled_utilities": "Enabled utilities",
+                    "maintenance_action": "Maintenance action",
+                    "electricity_poll_interval_hours": "Electricity poll interval",
+                    "water_poll_day": "Water poll day",
+                    "water_poll_time": "Water poll time"
+                },
+                "data_description": {
+                    "enabled_utilities": "Disabling a utility removes its source configuration. Enabling a skipped utility asks for a meter seed.",
+                    "maintenance_action": "Choose at most one refresh, backfill, reseed, or ledger rebuild action. Run options again for additional utilities.",
+                    "electricity_poll_interval_hours": "How often to check electricity AMI buckets, in hours. The default is 1 hour.",
+                    "water_poll_day": "Day of the month to check water monthly buckets. The default is day 1, with catch-up checks through day 7.",
+                    "water_poll_time": "Local Singapore time for the monthly water poll."
+                }
+            },
+            "seed": {
+                "description": "Enter the physical meter reading for {utility}. Step {step} of {total}.",
+                "data": {
+                    "seed_value": "Meter reading",
+                    "seed_observed_at": "Observed at",
+                    "backfill_from": "Backfill from"
+                },
+                "data_description": {
+                    "seed_value": "Enter the cumulative physical meter reading in {unit}.",
+                    "seed_observed_at": "Use Singapore time. Electricity is cleanest at HH:00 or HH:30; water is cleanest at the start of a month.",
+                    "backfill_from": "Choose the earliest historical source data to import for this utility. Electricity is rounded down to a 30-minute boundary; water is rounded down to the start of the selected month."
+                }
+            },
+            "approximate_seed_confirm": {
+                "description": "The timestamp for {utility} is not exactly on the clean bucket boundary. The integration will start accumulation at the next safe boundary and may skip the partial interval before that boundary.",
+                "data": {
+                    "confirm_approximate_seed": "Use this approximate seed"
+                },
+                "data_description": {
+                    "confirm_approximate_seed": "Confirm only if you accept that usage between the physical reading time and the next bucket boundary may not be included."
+                }
+            },
+            "reset_confirm": {
+                "description": "The new seed for {utility} is lower than the currently published total. Confirm this only when you are replacing the meter or intentionally resetting the cumulative baseline.",
+                "data": {
+                    "confirm_reset_replacement": "Confirm meter replacement or reset"
+                },
+                "data_description": {
+                    "confirm_reset_replacement": "This starts a new accumulation epoch for the same Home Assistant entity."
+                }
+            },
+            "rebuild_confirm": {
+                "description": "Rebuilding the ledger for {utility} discards accepted and pending bucket history and returns the sensor to the stored seed baseline. Continue only when you intentionally want to rebuild the accumulation ledger.",
+                "data": {
+                    "confirm_rebuild_ledger": "Confirm ledger rebuild"
+                },
+                "data_description": {
+                    "confirm_rebuild_ledger": "This does not change the stored seed or the entity unique ID."
+                }
+            }
+        },
+        "error": {
+            "approximate_seed_not_confirmed": "Confirm the approximate seed before continuing, or choose a clean boundary timestamp.",
+            "future_seed": "The seed timestamp cannot be in the future.",
+            "future_backfill": "The backfill start cannot be in the future.",
+            "backfill_after_seed": "The backfill start must be at or before the seed boundary.",
+            "invalid_decimal": "The seed reading must be a valid number.",
+            "invalid_backfill": "The backfill start must be valid.",
+            "invalid_timestamp": "The seed timestamp must be valid.",
+            "missing_backfill_from": "Enter a backfill start.",
+            "reset_not_confirmed": "Confirm the meter replacement/reset before applying a lower seed.",
+            "seed_negative": "The seed reading cannot be negative.",
+            "seed_too_old": "The seed timestamp is too old for the initial bounded backfill window.",
+            "unknown": "Unexpected error.",
+            "rebuild_not_confirmed": "Confirm the ledger rebuild before applying it."
+        },
+        "abort": {
+            "no_discovery": "Discovery data is not available yet.",
+            "missing_entry": "The SP Group config entry is no longer available."
+        }
+    },
+    "entity": {
+        "sensor": {
+            "electricity": {
+                "name": "Electricity consumption"
+            },
+            "water": {
+                "name": "Water consumption"
+            }
+        }
+    },
+    "issues": {
+        "malformed_ledger": {
+            "title": "SP Group accumulation ledger needs repair",
+            "description": "The stored SP Group accumulation ledger could not be read safely. Repairing it will rebuild the ledger from the stored seed configuration and discard accepted or pending bucket history.",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Rebuild SP Group accumulation ledger",
+                        "description": "Select Submit to rebuild the malformed ledger from stored seed configuration. The integration will keep opaque entity IDs and will not expose raw SP account data."
+                    }
+                },
+                "abort": {
+                    "missing_entry": "The SP Group config entry is no longer available."
+                }
+            }
+        }
+    },
+    "repair": {
+        "backfill_failed": {
+            "title": "SP Group historical data backfill failed",
+            "description": "The initial backfill of historical SP Group data failed.\n\nError: {error}\n\nGo to the SP Group integration options to retry."
+        }
+    },
+    "source_config": {
+        "error": {
+            "backfill_too_old": "The backfill start date is too far in the past. Please choose a date within 5 years."
+        }
+    }
+}
