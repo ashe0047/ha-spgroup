@@ -3106,3 +3106,19 @@ tests after commit 1; Recorder statistics tests after commit 2; auth/init tests
 after commit 3; config-flow/sensor/diagnostic tests after commit 4; lint,
 compileall, and dev-script checks after commit 5. No reset, checkout, or
 destructive cleanup is authorized.
+
+### 2026-07-22 19:37 +08 - Commit Checkpoint Completed
+
+Committed the accumulated implementation in verified slices:
+
+- `85d3917` `feat: harden runtime polling and session lifecycle`
+- `492fe3a` `test: cover source backfill orchestration`
+- `b1a09c7` `feat: harden native statistics backfill`
+- `48dd538` `chore: add developer runtime helpers and observability`
+- `2614cb8` `docs: record architecture decisions and implementation plans`
+
+Post-commit verification passed: 278 integration tests passed with 1 skipped,
+Ruff and mypy passed, compileall passed, and the worktree was clean apart from
+ignored `.runtime/` state. Provider-owned external statistics remains a
+separate future implementation; these commits preserve the current
+native-offset checkpoint and its documented migration plan.
