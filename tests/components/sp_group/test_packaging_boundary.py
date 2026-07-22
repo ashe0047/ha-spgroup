@@ -11,6 +11,8 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
+from homeassistant.helpers.service import _SERVICES_SCHEMA
+from homeassistant.util.yaml import load_yaml_dict
 
 PROJECT_ROOT = Path(__file__).parents[3]
 INTEGRATION_ROOT = PROJECT_ROOT / "custom_components" / "sp_group"
@@ -87,7 +89,7 @@ def test_spgroup_mobile_imports_in_subprocess() -> None:
     (
         ("domain", "sp_group"),
         ("name", "SP Group"),
-        ("version", "0.1.0"),
+        ("version", "0.2.0"),
         ("config_flow", True),
         ("iot_class", "cloud_polling"),
         ("integration_type", "hub"),
@@ -107,3 +109,12 @@ def test_manifest_config_flow_matches_file_structure() -> None:
 
     assert manifest["config_flow"] is True
     assert (INTEGRATION_ROOT / "config_flow.py").is_file()
+
+
+def test_services_yaml_describes_registered_dev_service() -> None:
+    """Registered services must have valid HA service metadata."""
+    services_path = INTEGRATION_ROOT / "services.yaml"
+
+    services = _SERVICES_SCHEMA(load_yaml_dict(str(services_path)))
+
+    assert services["dev_force_statistics_compile"] == {"fields": {}}

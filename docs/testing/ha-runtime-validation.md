@@ -71,6 +71,12 @@ For a real HA runtime, additionally verify:
 - seeded electricity and water sensors are visible as long-term-statistics
   sources;
 - Energy/Water dashboard selection shows only seeded ledger-backed sensors;
+- after initial source-history backfill, the integration automatically retries
+  statistics import when HA fires the hourly Recorder statistics event;
+- the automatic retry imports from persisted ledger data only and does not
+  re-fetch provider history;
+- the options action `Retry statistics import` remains available as a fallback
+  and also avoids provider-history refetch;
 - unseeded or malformed-ledger utilities are unavailable and not selectable;
 - pending AMI buckets do not advance statistics;
 - accepted bucket deltas advance totals monotonically;

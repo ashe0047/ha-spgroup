@@ -17,7 +17,7 @@ exclude = []
 select = ["E", "F", "I", "UP", "B", "ASYNC", "TID"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.14"
 strict = true
 warn_unused_configs = true
 explicit_package_bases = true

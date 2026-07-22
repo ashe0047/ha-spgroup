@@ -199,6 +199,7 @@ def _port_available(port: int) -> bool:
 def _ha_environment() -> dict[str, str]:
     """Return an environment with common local HA runtime binaries available."""
     env = os.environ.copy()
+    env["SPGROUP_HA_DEV_TOOLS"] = "1"
     if shutil.which("ffmpeg", path=env.get("PATH")):
         return env
 
@@ -241,6 +242,11 @@ def _write_minimal_config(config_dir: Path, port: int) -> None:
                 "onboarding:",
                 "",
                 "recorder:",
+                "",
+                "logger:",
+                "  default: info",
+                "  logs:",
+                "    custom_components.sp_group: debug",
                 "",
                 "history:",
                 "",

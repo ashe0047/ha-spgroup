@@ -113,6 +113,56 @@ ledger storage for that local HA instance.
 Use plain `ha:dev` when you want to keep a completed config entry and avoid
 going through setup again.
 
+## Historical Statistics Backfill In Dev
+
+After a seeded setup completes, SP Group runs source-history backfill once and
+stores accepted buckets in the local ledger. Historical long-term statistics are
+then imported automatically after Home Assistant Recorder fires its hourly
+statistics event and the integration can validate HA's native reference row.
+
+Expected flow:
+
+```text
+config flow complete -> source-history backfill -> HA hourly Recorder stats
+event -> automatic SP Group statistics import -> Energy Dashboard history
+```
+
+The options action `Retry statistics import` remains available as a fallback,
+but it uses the same statistics-only scheduler and does not re-fetch SP Group
+provider history. Do not expect HA restarts to rerun full historical source
+backfill; use a disposable reset or explicit maintenance action only when
+intentionally rebuilding test data.
+
+For fast full-flow validation in a disposable dev instance, force the local HA
+Recorder statistics pass and SP Group statistics import:
+
+```bash
+mise run ha:dev:force-statistics
+```
+
+Use this after completing the SP Group config flow. The command calls a
+developer-only service that exists only when HA is started through `ha:dev` or
+`ha:dev:cached-session`. It waits for any in-flight one-shot source-history
+backfill, then queues HA Recorder statistics tasks. The resulting Recorder
+hourly statistics event is handled by SP Group's normal event listener, which
+then starts the statistics-only import from persisted ledger data. The command
+itself does not call SP Group provider history endpoints and does not directly
+call SP Group's import scheduler. After calling the service, the CLI waits
+briefly for the listener-driven import metadata to settle before printing
+Recorder row counts and ledger status.
+
+Recommended fast reset loop:
+
+```bash
+mise run ha:dev:cached-session:reset
+# complete HA onboarding and the SP Group setup flow in the browser
+mise run ha:dev:force-statistics
+```
+
+This helper intentionally accelerates Recorder timing for local verification.
+Do not use it as evidence of production scheduling behavior; production waits
+for Home Assistant's normal Recorder hourly statistics event.
+
 ## Brand Images (HA 2026.3+)
 
 The SP Group brand logo and icon are shipped as PNG files in
@@ -213,6 +263,18 @@ These commands set:
 SPGROUP_HA_DEV_AUTH_BYPASS=1
 SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json
 ```
+
+Refresh the cached mobile session without starting HA:
+
+```bash
+mise run ha:dev:refresh-session
+```
+
+This uses the refresh token already stored in `.runtime/mobile-session.json`,
+writes the refreshed cache atomically with owner-only permissions, and prints
+only sanitized token metadata. It is useful before starting
+`ha:dev:cached-session` when the access token may have expired but you do not
+want to enter username, password, or OTP again.
 
 When enabled, the setup flow shows a developer-only authentication choice:
 
