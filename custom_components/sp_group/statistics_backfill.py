@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
@@ -14,6 +15,7 @@ from homeassistant.components.recorder import get_instance  # type: ignore[attr-
 from homeassistant.components.recorder.const import DOMAIN as RECORDER_DOMAIN
 from homeassistant.components.recorder.models.statistics import (
     StatisticData,
+    StatisticMeanType,
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
@@ -23,10 +25,15 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
-from homeassistant.util import dt as dt_utils
+from homeassistant.helpers import issue_registry as ir
 
 from .const import DOMAIN
-from .ledger import SpGroupAcceptedBucket, SpGroupLedgerEntry
+from .ledger import (
+    STATISTICS_STRATEGY_NATIVE_OFFSET_V2,
+    WARNING_LEGACY_STATISTICS_STRATEGY_MIGRATED,
+    SpGroupAcceptedBucket,
+    SpGroupLedgerEntry,
+)
 from .sources import SINGAPORE_TZ, UTILITY_ELECTRIC, UTILITY_WATER
 
 LOGGER = logging.getLogger(__name__)
@@ -44,39 +51,268 @@ class PlannedStatistic:
     sum: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectedStatistic:
+    """Accepted source usage projected onto an HA statistics row."""
+
+    start: datetime
+    period_start: datetime
+    period_end: datetime
+    state: Decimal
+    delta: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class NativeReference:
+    """Validated HA-native statistics row used as the import anchor."""
+
+    start: datetime
+    state: Decimal
+    sum: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOffset:
+    """Offset that connects imported history with HA-native statistics."""
+
+    reference: NativeReference
+    desired: Decimal
+    missing: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticsImportResult:
+    """Summary of one statistics import run."""
+
+    planned_count: int = 0
+    importable_count: int = 0
+    processed_count: int = 0
+    warning_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerStatisticsIndex:
+    """Indexed accepted buckets for efficient cumulative statistics planning."""
+
+    entry: SpGroupLedgerEntry
+    accepted_by_start: dict[datetime, SpGroupAcceptedBucket]
+    starts: tuple[datetime, ...]
+    prefix_values: tuple[Decimal, ...]
+    half_hour_slots: tuple[int, ...]
+
+    @classmethod
+    def build(cls, entry: SpGroupLedgerEntry) -> LedgerStatisticsIndex:
+        """Build an immutable calculation index for one ledger entry."""
+        accepted_by_start = _accepted_by_start(entry)
+        starts = tuple(sorted(accepted_by_start))
+        prefix: list[Decimal] = [Decimal("0")]
+        for start in starts:
+            prefix.append(prefix[-1] + accepted_by_start[start].value)
+        half_hour_slots = tuple(
+            sorted(_half_hour_slot(start) for start in starts)
+            if entry.utility_type == UTILITY_ELECTRIC
+            else ()
+        )
+        return cls(
+            entry=entry,
+            accepted_by_start=accepted_by_start,
+            starts=starts,
+            prefix_values=tuple(prefix),
+            half_hour_slots=half_hour_slots,
+        )
+
+    def state_at(self, at: datetime) -> Decimal:
+        """Return the cumulative meter state at a point in Singapore time."""
+        point = at.astimezone(SINGAPORE_TZ)
+        seed = self.entry.seed_effective_from
+        if self.entry.utility_type == UTILITY_WATER:
+            return self._water_state_at(point, seed)
+        if point <= seed:
+            return self.entry.seed_value - self.sum_between(point, seed)
+        return self.entry.seed_value + self.sum_between(seed, point)
+
+    def _water_state_at(self, point: datetime, seed: datetime) -> Decimal:
+        """Return water state using closed monthly bucket end boundaries."""
+        if point <= seed:
+            return self.entry.seed_value - sum(
+                (
+                    bucket.value
+                    for bucket in self.entry.accepted
+                    if point < bucket.end.astimezone(SINGAPORE_TZ) <= seed
+                ),
+                Decimal("0"),
+            )
+        return self.entry.seed_value + sum(
+            (
+                bucket.value
+                for bucket in self.entry.accepted
+                if bucket.start.astimezone(SINGAPORE_TZ) >= seed
+                and bucket.end.astimezone(SINGAPORE_TZ) <= point
+            ),
+            Decimal("0"),
+        )
+
+    def sum_between(self, start: datetime, end: datetime) -> Decimal:
+        """Return accepted bucket value for starts inside [start, end)."""
+        local_start = start.astimezone(SINGAPORE_TZ)
+        local_end = end.astimezone(SINGAPORE_TZ)
+        left = bisect_left(self.starts, local_start)
+        right = bisect_left(self.starts, local_end)
+        return self.prefix_values[right] - self.prefix_values[left]
+
+    def has_contiguous_fixed_range(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        step: timedelta,
+    ) -> bool:
+        """Return whether every fixed-size bucket start exists in [start, end)."""
+        local_start = start.astimezone(SINGAPORE_TZ)
+        local_end = end.astimezone(SINGAPORE_TZ)
+        if local_start >= local_end:
+            return True
+        step_seconds = int(step.total_seconds())
+        duration_seconds = int((local_end - local_start).total_seconds())
+        if duration_seconds % step_seconds:
+            return False
+        expected = duration_seconds // step_seconds
+        start_slot = _half_hour_slot(local_start)
+        end_slot = start_slot + expected
+        left = bisect_left(self.half_hour_slots, start_slot)
+        right = bisect_left(self.half_hour_slots, end_slot)
+        return right - left == expected
+
+    def has_contiguous_variable_range(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> bool:
+        """Return whether chained variable buckets fully cover [start, end)."""
+        current = start.astimezone(SINGAPORE_TZ)
+        target = end.astimezone(SINGAPORE_TZ)
+        if current >= target:
+            return True
+        while current < target:
+            bucket = self.accepted_by_start.get(current)
+            if bucket is None:
+                return False
+            current = bucket.end.astimezone(SINGAPORE_TZ)
+        return current == target
+
+
 _IMPORT_BATCH_SIZE = 1000
+_WAITING_ISSUE_PREFIX = "statistics_backfill_waiting"
+_CONFLICT_ISSUE_PREFIX = "statistics_backfill_conflict"
+_HALF_HOUR = timedelta(minutes=30)
+_HALF_HOUR_SECONDS = int(_HALF_HOUR.total_seconds())
+_SLOT_EPOCH = datetime(2000, 1, 1, tzinfo=SINGAPORE_TZ)
 
 
 async def async_backfill_statistics(
     hass: HomeAssistant,
     entry: SpGroupConfigEntry,
-) -> None:
+    *,
+    force: bool = False,
+) -> StatisticsImportResult:
     """Import safe HA statistics rows for accepted ledger buckets."""
     if RECORDER_DOMAIN not in hass.config.components:
-        return
+        return StatisticsImportResult()
     ledger_store = entry.runtime_data.ledger_store
     if ledger_store is None or ledger_store.snapshot.malformed:
-        return
+        return StatisticsImportResult()
     registry = er.async_get(hass)
+    total_planned = 0
+    total_importable = 0
+    total_processed = 0
+    total_warnings = 0
     for sensor_key, ledger_entry in ledger_store.snapshot.entries.items():
         entity_id = registry.async_get_entity_id("sensor", DOMAIN, sensor_key)
         if entity_id is None:
             continue
-        planned, bridge_warnings = _planned_statistics_with_warnings(ledger_entry)
-        if ledger_entry.statistics_imported_through is not None:
-            planned = tuple(
-                row
-                for row in planned
-                if row.start > ledger_entry.statistics_imported_through
-            )
-        if not planned:
+        projected, bridge_warnings = await hass.async_add_executor_job(
+            _projected_statistics_with_warnings,
+            ledger_entry,
+        )
+        if not projected:
             if bridge_warnings:
-                await ledger_store.async_update_statistics_metadata(
+                LOGGER.info(
+                    "SP Group statistics import skipped: utility=%s projected=0 "
+                    "warnings=%d",
+                    ledger_entry.utility_type,
+                    len(bridge_warnings),
+                )
+                await _update_statistics_metadata(
+                    ledger_store,
                     sensor_key,
                     warnings=bridge_warnings,
                 )
+                total_warnings += len(bridge_warnings)
             continue
-        all_importable, all_processed, all_warnings, last_successful_start = (
+        planned, anchor_warnings, native_offset = await _native_anchored_statistics(
+            hass,
+            entity_id,
+            ledger_entry,
+            projected,
+            force=force,
+        )
+        all_warnings = tuple(dict.fromkeys((*bridge_warnings, *anchor_warnings)))
+        total_planned += len(planned)
+        if not planned:
+            LOGGER.info(
+                "SP Group statistics import not ready: utility=%s projected=%d "
+                "planned=0 warnings=%s",
+                ledger_entry.utility_type,
+                len(projected),
+                ",".join(all_warnings) if all_warnings else "none",
+            )
+            await _update_statistics_metadata(
+                ledger_store,
+                sensor_key,
+                reference_start=(
+                    native_offset.reference.start
+                    if native_offset is not None
+                    else None
+                ),
+                reference_sum_offset=(
+                    native_offset.desired if native_offset is not None else None
+                ),
+                warnings=all_warnings,
+            )
+            total_warnings += len(all_warnings)
+            _create_or_clear_statistics_issues(
+                hass,
+                entry.entry_id,
+                sensor_key,
+                all_warnings,
+            )
+            continue
+        if native_offset is not None and native_offset.missing > Decimal("0"):
+            LOGGER.info(
+                "SP Group statistics native offset applying: utility=%s "
+                "reference_start=%s desired_offset=%s missing_offset=%s",
+                ledger_entry.utility_type,
+                native_offset.reference.start.isoformat(),
+                native_offset.desired,
+                native_offset.missing,
+            )
+            await _async_apply_reference_offset(
+                hass,
+                entity_id,
+                ledger_entry,
+                native_offset,
+            )
+        elif native_offset is not None:
+            LOGGER.debug(
+                "SP Group statistics native offset skipped: utility=%s "
+                "reference_start=%s desired_offset=%s missing_offset=%s",
+                ledger_entry.utility_type,
+                native_offset.reference.start.isoformat(),
+                native_offset.desired,
+                native_offset.missing,
+            )
+        _all_importable, _all_processed, import_warnings, last_successful_start = (
             await _import_in_batches(
                 hass,
                 entity_id,
@@ -84,36 +320,67 @@ async def async_backfill_statistics(
                 ledger_entry,
             )
         )
-        # Import a continuation row at the current hour with the last known
-        # sum to prevent HA's Recorder from inserting a sum=0 live row that
-        # would cause the Energy Dashboard to show negative consumption for
-        # the current period equal to the total backfill sum.
-        if all_processed and last_successful_start is not None:
-            last_processed = max(all_processed, key=lambda r: r.start)
-            if last_processed.sum is not None:
-                now = dt_utils.utcnow()
-                current_hour = now.replace(minute=0, second=0, microsecond=0)
-                continuation = PlannedStatistic(
-                    start=current_hour,
-                    state=Decimal(str(ledger_entry.latest_total)),
-                    sum=last_processed.sum,
-                )
-                try:
-                    async_import_statistics(
-                        hass,
-                        _metadata(entity_id, ledger_entry.utility_type),
-                        [_statistic_data(continuation)],
-                    )
-                except Exception:  # noqa: BLE001
-                    LOGGER.warning(
-                        "Continuation row failed for %s (non-critical)",
-                        entity_id,
-                    )
-        await ledger_store.async_update_statistics_metadata(
+        final_warnings = tuple(
+            dict.fromkeys((*bridge_warnings, *anchor_warnings, *import_warnings))
+        )
+        LOGGER.info(
+            "SP Group statistics import planned: utility=%s planned=%d "
+            "importable=%d processed=%d warnings=%d",
+            ledger_entry.utility_type,
+            len(planned),
+            len(_all_importable),
+            len(_all_processed),
+            len(final_warnings),
+        )
+        total_importable += len(_all_importable)
+        total_processed += len(_all_processed)
+        total_warnings += len(final_warnings)
+        await _update_statistics_metadata(
+            ledger_store,
             sensor_key,
             imported_through=last_successful_start,
-            warnings=tuple(dict.fromkeys((*bridge_warnings, *all_warnings))),
+            reference_start=(
+                native_offset.reference.start
+                if native_offset is not None
+                else None
+            ),
+            reference_sum_offset=(
+                native_offset.desired if native_offset is not None else None
+            ),
+            strategy_version=(
+                STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+                if last_successful_start is not None
+                else None
+            ),
+            warnings=final_warnings,
         )
+        LOGGER.info(
+            "SP Group statistics metadata updated: utility=%s imported_through=%s "
+            "reference_start=%s strategy=%s warnings=%d",
+            ledger_entry.utility_type,
+            last_successful_start.isoformat()
+            if last_successful_start is not None
+            else "none",
+            native_offset.reference.start.isoformat()
+            if native_offset is not None
+            else "none",
+            STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+            if last_successful_start is not None
+            else "none",
+            len(final_warnings),
+        )
+        _create_or_clear_statistics_issues(
+            hass,
+            entry.entry_id,
+            sensor_key,
+            final_warnings,
+        )
+    return StatisticsImportResult(
+        planned_count=total_planned,
+        importable_count=total_importable,
+        processed_count=total_processed,
+        warning_count=total_warnings,
+    )
 
 
 async def _import_in_batches(
@@ -156,32 +423,54 @@ async def _import_in_batches(
     return (
         tuple(all_importable),
         tuple(all_processed),
-            tuple(dict.fromkeys(all_warnings)),
+        tuple(dict.fromkeys(all_warnings)),
         last_successful,
     )
 
 
 def _planned_statistics(entry: SpGroupLedgerEntry) -> tuple[PlannedStatistic, ...]:
     """Return statistic rows, omitting warnings for test/backward compatibility."""
-    planned, _warnings = _planned_statistics_with_warnings(entry)
-    return planned
+    projected, _warnings = _projected_statistics_with_warnings(entry)
+    if not projected:
+        return ()
+    reference = NativeReference(
+        start=max(row.start for row in projected) + timedelta(hours=1),
+        state=projected[-1].state,
+        sum=sum((row.delta for row in projected), Decimal("0")),
+    )
+    return _positive_projected_rows(projected, reference)
 
 
 def _planned_statistics_with_warnings(
     entry: SpGroupLedgerEntry,
 ) -> tuple[tuple[PlannedStatistic, ...], tuple[str, ...]]:
+    projected, warnings = _projected_statistics_with_warnings(entry)
+    if not projected:
+        return (), warnings
+    reference = NativeReference(
+        start=max(row.start for row in projected) + timedelta(hours=1),
+        state=projected[-1].state,
+        sum=sum((row.delta for row in projected), Decimal("0")),
+    )
+    return _positive_projected_rows(projected, reference), warnings
+
+
+def _projected_statistics_with_warnings(
+    entry: SpGroupLedgerEntry,
+) -> tuple[tuple[ProjectedStatistic, ...], tuple[str, ...]]:
+    index = LedgerStatisticsIndex.build(entry)
     if entry.utility_type == UTILITY_ELECTRIC:
-        return _electricity_statistics(entry)
+        return _electricity_statistics(entry, index)
     if entry.utility_type == UTILITY_WATER:
-        return _water_statistics(entry)
+        return _water_statistics(entry, index)
     return (), ()
 
 
 def _electricity_statistics(
     entry: SpGroupLedgerEntry,
-) -> tuple[tuple[PlannedStatistic, ...], tuple[str, ...]]:
+    index: LedgerStatisticsIndex,
+) -> tuple[tuple[ProjectedStatistic, ...], tuple[str, ...]]:
     by_hour: dict[datetime, list[SpGroupAcceptedBucket]] = defaultdict(list)
-    accepted_by_start = _accepted_by_start(entry)
     for bucket in entry.accepted:
         hour_start = bucket.start.astimezone(SINGAPORE_TZ).replace(
             minute=0,
@@ -190,38 +479,37 @@ def _electricity_statistics(
         )
         by_hour[hour_start].append(bucket)
 
-    rows: list[PlannedStatistic] = []
+    rows: list[ProjectedStatistic] = []
     warnings: list[str] = []
-    cumulative = Decimal("0")
     for hour_start in sorted(by_hour):
         hour_end = hour_start + timedelta(hours=1)
         if hour_start < entry.seed_effective_from < hour_end:
             continue
-        if not _has_contiguous_buckets(
-            accepted_by_start,
+        if not index.has_contiguous_fixed_range(
             start=hour_start,
             end=hour_end,
-            step=timedelta(minutes=30),
+            step=_HALF_HOUR,
         ):
             warnings.append(f"statistics_missing_bridge:{hour_start.isoformat()}")
             continue
         if not _has_seed_bridge(
             entry,
-            accepted_by_start,
+            index,
             row_start=hour_start,
             row_end=hour_end,
-            step=timedelta(minutes=30),
+            step=_HALF_HOUR,
         ):
             warnings.append(f"statistics_missing_bridge:{hour_start.isoformat()}")
             continue
         ordered_buckets = sorted(by_hour[hour_start], key=lambda item: item.start)
         hour_delta = sum((bucket.value for bucket in ordered_buckets), Decimal("0"))
-        cumulative += hour_delta
         rows.append(
-            PlannedStatistic(
+            ProjectedStatistic(
                 start=hour_start,
-                state=_state_at(entry, accepted_by_start, hour_end),
-                sum=cumulative,
+                period_start=hour_start,
+                period_end=hour_end,
+                state=index.state_at(hour_end),
+                delta=hour_delta,
             )
         )
     return tuple(rows), tuple(dict.fromkeys(warnings))
@@ -229,13 +517,11 @@ def _electricity_statistics(
 
 def _water_statistics(
     entry: SpGroupLedgerEntry,
-) -> tuple[tuple[PlannedStatistic, ...], tuple[str, ...]]:
-    rows: list[PlannedStatistic] = []
+    index: LedgerStatisticsIndex,
+) -> tuple[tuple[ProjectedStatistic, ...], tuple[str, ...]]:
+    rows: list[ProjectedStatistic] = []
     warnings: list[str] = []
-    cumulative = Decimal("0")
-    accepted_by_start = _accepted_by_start(entry)
     for bucket in sorted(entry.accepted, key=lambda item: item.start):
-        cumulative += bucket.value
         row_start = (bucket.end.astimezone(SINGAPORE_TZ) - timedelta(hours=1)).replace(
             minute=0,
             second=0,
@@ -243,22 +529,320 @@ def _water_statistics(
         )
         if not _has_seed_bridge(
             entry,
-            accepted_by_start,
+            index,
             row_start=bucket.start,
             row_end=bucket.end,
             step=None,
         ):
-            cumulative -= bucket.value
             warnings.append(f"statistics_missing_bridge:{bucket.start.isoformat()}")
             continue
         rows.append(
-            PlannedStatistic(
+            ProjectedStatistic(
                 start=row_start,
-                state=_state_at(entry, accepted_by_start, bucket.end),
-                sum=cumulative,
+                period_start=bucket.start,
+                period_end=bucket.end,
+                state=index.state_at(bucket.end),
+                delta=bucket.value,
             )
         )
     return tuple(rows), tuple(dict.fromkeys(warnings))
+
+
+async def _native_anchored_statistics(
+    hass: HomeAssistant,
+    entity_id: str,
+    entry: SpGroupLedgerEntry,
+    projected: tuple[ProjectedStatistic, ...],
+    *,
+    force: bool,
+) -> tuple[tuple[PlannedStatistic, ...], tuple[str, ...], NativeOffset | None]:
+    existing_start = min(
+        (
+            min(row.start for row in projected) - timedelta(hours=1),
+            entry.statistics_reference_start,
+        )
+        if entry.statistics_reference_start is not None
+        else (min(row.start for row in projected) - timedelta(hours=1),)
+    )
+    existing = await _existing_statistics(hass, entity_id, existing_start, None)
+    LOGGER.info(
+        "SP Group statistics existing rows loaded: utility=%s projected=%d "
+        "existing=%d",
+        entry.utility_type,
+        len(projected),
+        len(existing),
+    )
+    return await hass.async_add_executor_job(
+        _native_anchored_statistics_from_existing,
+        entry,
+        projected,
+        existing,
+        force,
+    )
+
+
+def _native_anchored_statistics_from_existing(
+    entry: SpGroupLedgerEntry,
+    projected: tuple[ProjectedStatistic, ...],
+    existing: list[dict[str, Any]],
+    force: bool = False,
+) -> tuple[tuple[PlannedStatistic, ...], tuple[str, ...], NativeOffset | None]:
+    contamination = _existing_decreasing_sum_warning(existing)
+    if contamination is not None:
+        return (), (contamination,), None
+    if (
+        entry.statistics_strategy_version != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+        and entry.statistics_imported_through is not None
+    ):
+        post_legacy = [
+            row
+            for row in existing
+            if isinstance(row.get("start"), datetime)
+            and row["start"] > entry.statistics_imported_through
+        ]
+        if post_legacy:
+            return (
+                (),
+                (
+                    WARNING_LEGACY_STATISTICS_STRATEGY_MIGRATED,
+                    "statistics_legacy_rows_need_manual_rebuild",
+                ),
+                None,
+            )
+    reference = _select_native_reference(entry, projected, existing)
+    if reference is None:
+        return (), ("statistics_waiting_for_native_reference",), None
+    rows_before_reference = tuple(
+        row for row in projected if row.start < reference.start
+    )
+    native_offset = _native_offset(entry, rows_before_reference, reference)
+    if not rows_before_reference and not force:
+        return (), (), native_offset
+    planned = list(_positive_projected_rows(rows_before_reference, reference))
+    if force:
+        planned.extend(
+            _forward_projected_rows(
+                projected,
+                reference,
+                reference_sum_adjustment=native_offset.missing,
+            )
+        )
+    if not planned:
+        return (), (), native_offset
+    return tuple(sorted(planned, key=lambda row: row.start)), (), native_offset
+
+
+async def _existing_statistics(
+    hass: HomeAssistant,
+    entity_id: str,
+    start: datetime,
+    end: datetime | None,
+) -> list[dict[str, Any]]:
+    existing = await get_instance(hass).async_add_executor_job(
+        partial(
+            statistics_during_period,
+            hass,
+            start.astimezone(UTC),
+            end.astimezone(UTC) if end is not None else None,
+            {entity_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+    )
+    return cast(list[dict[str, Any]], existing.get(entity_id, []))
+
+
+def _select_native_reference(
+    entry: SpGroupLedgerEntry,
+    projected: tuple[ProjectedStatistic, ...],
+    existing: list[dict[str, Any]],
+) -> NativeReference | None:
+    index = LedgerStatisticsIndex.build(entry)
+    if entry.statistics_reference_start is not None:
+        for row in existing:
+            start = _statistics_start_datetime(row.get("start"))
+            if start == entry.statistics_reference_start:
+                return _validated_reference(entry, index, row)
+        return None
+    latest_projected_start = max(row.start for row in projected)
+    for row in sorted(existing, key=_statistics_row_start, reverse=True):
+        start = _statistics_start_datetime(row.get("start"))
+        if start is None:
+            LOGGER.info(
+                "SP Group statistics reference rejected: utility=%s reason=no_start "
+                "keys=%s",
+                entry.utility_type,
+                ",".join(str(key) for key in row.keys()),
+            )
+            continue
+        if start <= latest_projected_start:
+            LOGGER.info(
+                "SP Group statistics reference rejected: utility=%s "
+                "reason=before_projected row_start=%s latest_projected=%s",
+                entry.utility_type,
+                start.isoformat(),
+                latest_projected_start.isoformat(),
+            )
+            continue
+        reference = _validated_reference(entry, index, row)
+        if reference is not None:
+            return reference
+        expected_state = index.state_at(
+            start.astimezone(SINGAPORE_TZ) + timedelta(hours=1)
+        )
+        LOGGER.info(
+            "SP Group statistics reference rejected: utility=%s "
+            "reason=state_mismatch row_start=%s row_state=%s row_sum=%s "
+            "expected_state=%s",
+            entry.utility_type,
+            start.isoformat(),
+            row.get("state"),
+            row.get("sum"),
+            expected_state,
+        )
+    return None
+
+
+def _validated_reference(
+    entry: SpGroupLedgerEntry,
+    index: LedgerStatisticsIndex,
+    row: dict[str, Any],
+) -> NativeReference | None:
+    del entry
+    start = _statistics_start_datetime(row.get("start"))
+    state = row.get("state")
+    stat_sum = row.get("sum")
+    if start is None or state is None or stat_sum is None:
+        return None
+    expected_state = index.state_at(start.astimezone(SINGAPORE_TZ) + timedelta(hours=1))
+    if not _float_equal(state, expected_state):
+        return None
+    return NativeReference(
+        start=start,
+        state=Decimal(str(state)),
+        sum=Decimal(str(stat_sum)),
+    )
+
+
+def _native_offset(
+    entry: SpGroupLedgerEntry,
+    projected_before_reference: tuple[ProjectedStatistic, ...],
+    reference: NativeReference,
+) -> NativeOffset:
+    desired = sum(
+        (row.delta for row in projected_before_reference),
+        Decimal("0"),
+    )
+    applied = entry.statistics_reference_sum_offset or Decimal("0")
+    missing = max(Decimal("0"), desired - applied)
+    return NativeOffset(reference=reference, desired=desired, missing=missing)
+
+
+def _positive_projected_rows(
+    projected: tuple[ProjectedStatistic, ...],
+    reference: NativeReference,
+) -> tuple[PlannedStatistic, ...]:
+    del reference
+    if not projected:
+        return ()
+    running_sum = Decimal("0")
+    rows: list[PlannedStatistic] = []
+    first = projected[0]
+    rows.append(
+        PlannedStatistic(
+            start=first.period_start - timedelta(hours=1),
+            state=first.state - first.delta,
+            sum=running_sum,
+        )
+    )
+    for row in projected:
+        running_sum += row.delta
+        rows.append(
+            PlannedStatistic(
+                start=row.start,
+                state=row.state,
+                sum=running_sum,
+            )
+        )
+    return tuple(sorted(rows, key=lambda item: item.start))
+
+
+def _forward_projected_rows(
+    projected: tuple[ProjectedStatistic, ...],
+    reference: NativeReference,
+    *,
+    reference_sum_adjustment: Decimal = Decimal("0"),
+) -> tuple[PlannedStatistic, ...]:
+    """Return rows after a native reference for forced gap repair."""
+    running_sum = reference.sum + reference_sum_adjustment
+    rows: list[PlannedStatistic] = []
+    for row in sorted(projected, key=lambda item: item.start):
+        if row.start <= reference.start:
+            continue
+        running_sum += row.delta
+        rows.append(
+            PlannedStatistic(
+                start=row.start,
+                state=row.state,
+                sum=running_sum,
+            )
+        )
+    return tuple(rows)
+
+
+async def _async_apply_reference_offset(
+    hass: HomeAssistant,
+    entity_id: str,
+    ledger_entry: SpGroupLedgerEntry,
+    native_offset: NativeOffset,
+) -> None:
+    """Shift HA-native sums from the reference onward by the missing offset."""
+    recorder = get_instance(hass)
+    recorder.async_adjust_statistics(
+        entity_id,
+        native_offset.reference.start,
+        float(native_offset.missing),
+        str(_metadata(entity_id, ledger_entry.utility_type)["unit_of_measurement"]),
+    )
+    await recorder.async_block_till_done()
+
+
+def _existing_decreasing_sum_warning(
+    existing: list[dict[str, Any]],
+) -> str | None:
+    previous: Decimal | None = None
+    previous_start: datetime | None = None
+    for row in sorted(existing, key=_statistics_row_start):
+        start = _statistics_start_datetime(row.get("start"))
+        value = row.get("sum")
+        if start is None or value is None:
+            continue
+        current = Decimal(str(value))
+        if previous is not None and current < previous - Decimal("0.000001"):
+            return (
+                "statistics_existing_negative_delta:"
+                f"{previous_start.isoformat() if previous_start else 'unknown'}"
+                f":{start.isoformat()}"
+            )
+        previous = current
+        previous_start = start
+    return None
+
+
+def _statistics_row_start(row: dict[str, Any]) -> datetime:
+    if (start := _statistics_start_datetime(row.get("start"))) is not None:
+        return start
+    return datetime.min.replace(tzinfo=SINGAPORE_TZ)
+
+
+def _statistics_start_datetime(value: object) -> datetime | None:
+    """Normalize HA statistics row starts across HA return shapes."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, int | float):
+        return datetime.fromtimestamp(value, UTC)
+    return None
 
 
 def _accepted_by_start(
@@ -269,7 +853,7 @@ def _accepted_by_start(
 
 def _has_seed_bridge(
     entry: SpGroupLedgerEntry,
-    accepted_by_start: dict[datetime, SpGroupAcceptedBucket],
+    index: LedgerStatisticsIndex,
     *,
     row_start: datetime,
     row_end: datetime,
@@ -279,20 +863,32 @@ def _has_seed_bridge(
     if row_start < seed < row_end:
         return False
     if row_end <= seed:
-        return _has_contiguous_buckets(
-            accepted_by_start,
+        return _has_indexed_contiguous_range(
+            index,
             start=row_start,
             end=seed,
             step=step,
         )
     if row_start >= seed:
-        return _has_contiguous_buckets(
-            accepted_by_start,
+        return _has_indexed_contiguous_range(
+            index,
             start=seed,
             end=row_end,
             step=step,
         )
     return False
+
+
+def _has_indexed_contiguous_range(
+    index: LedgerStatisticsIndex,
+    *,
+    start: datetime,
+    end: datetime,
+    step: timedelta | None,
+) -> bool:
+    if step is None:
+        return index.has_contiguous_variable_range(start=start, end=end)
+    return index.has_contiguous_fixed_range(start=start, end=end, step=step)
 
 
 def _has_contiguous_buckets(
@@ -323,25 +919,13 @@ def _state_at(
     accepted_by_start: dict[datetime, SpGroupAcceptedBucket],
     at: datetime,
 ) -> Decimal:
-    point = at.astimezone(SINGAPORE_TZ)
-    seed = entry.seed_effective_from
-    if point <= seed:
-        return entry.seed_value - sum(
-            (
-                bucket.value
-                for start, bucket in accepted_by_start.items()
-                if point <= start < seed
-            ),
-            Decimal("0"),
-        )
-    return entry.seed_value + sum(
-        (
-            bucket.value
-            for start, bucket in accepted_by_start.items()
-            if seed <= start < point
-        ),
-        Decimal("0"),
-    )
+    del accepted_by_start
+    return LedgerStatisticsIndex.build(entry).state_at(at)
+
+
+def _half_hour_slot(value: datetime) -> int:
+    local = value.astimezone(SINGAPORE_TZ)
+    return int((local - _SLOT_EPOCH).total_seconds() // _HALF_HOUR_SECONDS)
 
 
 async def _filter_conflicts(
@@ -355,23 +939,26 @@ async def _filter_conflicts(
 ]:
     start = min(row.start for row in planned)
     end = max(row.start for row in planned) + timedelta(hours=1)
-    existing = await get_instance(hass).async_add_executor_job(
-        partial(
-            statistics_during_period,
-            hass,
-            start,
-            end,
-            {entity_id},
-            "hour",
-            None,
-            {"state", "sum"},
-        )
+    existing_rows = await _existing_statistics(hass, entity_id, start, end)
+    return await hass.async_add_executor_job(
+        _filter_conflicts_from_existing,
+        planned,
+        existing_rows,
     )
-    existing_rows = cast(list[dict[str, Any]], existing.get(entity_id, []))
+
+
+def _filter_conflicts_from_existing(
+    planned: tuple[PlannedStatistic, ...],
+    existing_rows: list[dict[str, Any]],
+) -> tuple[
+    tuple[PlannedStatistic, ...],
+    tuple[PlannedStatistic, ...],
+    tuple[str, ...],
+]:
     existing_by_start: dict[datetime, dict[str, Any]] = {
-        row["start"]: row
+        start: row
         for row in existing_rows
-        if isinstance(row.get("start"), datetime)
+        if (start := _statistics_start_datetime(row.get("start"))) is not None
     }
     importable: list[PlannedStatistic] = []
     processed: list[PlannedStatistic] = []
@@ -395,10 +982,12 @@ async def _filter_conflicts(
 def _metadata(entity_id: str, utility_type: str) -> StatisticMetaData:
     return {
         "has_mean": False,
+        "mean_type": StatisticMeanType.NONE,
         "has_sum": True,
         "name": None,
         "source": RECORDER_DOMAIN,
         "statistic_id": entity_id,
+        "unit_class": "energy" if utility_type == UTILITY_ELECTRIC else "volume",
         "unit_of_measurement": (
             UnitOfEnergy.KILO_WATT_HOUR
             if utility_type == UTILITY_ELECTRIC
@@ -422,7 +1011,65 @@ def _float_equal(value: object, expected: Decimal) -> bool:
         return False
 
 
+async def _update_statistics_metadata(
+    ledger_store: Any,
+    sensor_key: str,
+    *,
+    imported_through: datetime | None = None,
+    reference_start: datetime | None = None,
+    reference_sum_offset: Decimal | None = None,
+    strategy_version: str | None = None,
+    warnings: tuple[str, ...] = (),
+) -> None:
+    await ledger_store.async_update_statistics_metadata(
+        sensor_key,
+        imported_through=imported_through,
+        reference_start=reference_start,
+        reference_sum_offset=reference_sum_offset,
+        strategy_version=strategy_version,
+        warnings=warnings,
+    )
+
+
+def _create_or_clear_statistics_issues(
+    hass: HomeAssistant,
+    entry_id: str,
+    sensor_key: str,
+    warnings: tuple[str, ...],
+) -> None:
+    waiting_issue = f"{_WAITING_ISSUE_PREFIX}_{entry_id}_{sensor_key}"
+    conflict_issue = f"{_CONFLICT_ISSUE_PREFIX}_{entry_id}_{sensor_key}"
+    # Waiting for HA's native statistics compiler is normal after setup and is
+    # not user-actionable yet.  Clear any older waiting repairs and only create
+    # repair issues for states that need user intervention.
+    ir.async_delete_issue(hass, DOMAIN, waiting_issue)
+
+    conflict = next(
+        (
+            warning
+            for warning in warnings
+            if warning.startswith("statistics_existing_negative_delta:")
+            or warning.startswith("statistics_conflict:")
+            or warning == "statistics_legacy_rows_need_manual_rebuild"
+        ),
+        None,
+    )
+    if conflict is not None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            conflict_issue,
+            is_fixable=True,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="statistics_backfill_conflict",
+            translation_placeholders={"warning": conflict},
+        )
+    else:
+        ir.async_delete_issue(hass, DOMAIN, conflict_issue)
+
+
 __all__ = [
     "PlannedStatistic",
+    "StatisticsImportResult",
     "async_backfill_statistics",
 ]
