@@ -135,6 +135,8 @@ class SpGroupUtilitySensor(
     @property
     def available(self) -> bool:
         """Return whether the discovered utility is currently available."""
+        if not super().available:
+            return False
         data = self._discovery_coordinator.data
         if data is None:
             return False

@@ -12,6 +12,11 @@ from custom_components.sp_group.discovery import (
     SpGroupUtilityAccount,
 )
 from custom_components.sp_group.ledger import (
+    SOURCE_BACKFILL_FAILED,
+    SOURCE_BACKFILL_NEVER_ATTEMPTED,
+    SOURCE_BACKFILL_RUNNING,
+    SOURCE_BACKFILL_SUCCEEDED,
+    WARNING_SOURCE_BACKFILL_INTERRUPTED,
     WARNING_USER_REBUILT_LEDGER,
     SpGroupBucketObservation,
     SpGroupLedgerEntry,
@@ -96,6 +101,139 @@ async def test_ledger_publishes_seed_then_accepts_two_sighting_buckets(
     )
     assert snapshot.entries["opaque_electric"].latest_total == Decimal("101.25")
     assert len(snapshot.entries["opaque_electric"].accepted) == 1
+
+
+async def test_source_backfill_state_transitions_and_interrupted_recovery(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Source backfill state moves through running, failed, and succeeded."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-source-state")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100.0",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+
+    snapshot = await store.async_mark_source_backfill_running(
+        sensor_keys={"opaque_electric"},
+        started_at=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    assert (
+        snapshot.entries["opaque_electric"].source_backfill_status
+        == SOURCE_BACKFILL_RUNNING
+    )
+
+    snapshot = await store.async_mark_interrupted_source_backfills_failed(
+        failed_at=datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ),
+    )
+    entry = snapshot.entries["opaque_electric"]
+    assert entry.source_backfill_status == SOURCE_BACKFILL_FAILED
+    assert WARNING_SOURCE_BACKFILL_INTERRUPTED in entry.warnings
+
+    snapshot = await store.async_mark_source_backfill_succeeded(
+        sensor_keys={"opaque_electric"},
+        succeeded_at=datetime(2026, 7, 15, 16, 0, tzinfo=SINGAPORE_TZ),
+    )
+    entry = snapshot.entries["opaque_electric"]
+    assert entry.source_backfill_status == SOURCE_BACKFILL_SUCCEEDED
+    assert entry.source_backfill_attempted_at == datetime(
+        2026, 7, 15, 16, 0, tzinfo=SINGAPORE_TZ
+    )
+    assert entry.last_source_poll_succeeded_at == datetime(
+        2026, 7, 15, 16, 0, tzinfo=SINGAPORE_TZ
+    )
+
+
+def test_legacy_source_backfill_attempt_migrates_conservatively() -> None:
+    """Legacy attempted timestamps only imply success when data evidence exists."""
+    base = {
+        "sensor_key": "opaque_electric",
+        "source": SOURCE_MANUAL_SEED_AMI,
+        "utility_type": "electric",
+        "epoch_id": "epoch",
+        "seed_value": "100",
+        "seed_effective_from": "2026-07-15T13:00:00+08:00",
+        "backfill_from": "2026-07-15T13:00:00+08:00",
+        "latest_total": "100",
+        "source_backfill_attempted_at": "2026-07-15T14:00:00+08:00",
+        "accepted": [],
+        "pending": [],
+    }
+
+    assert (
+        SpGroupLedgerEntry.from_dict(base).source_backfill_status
+        == SOURCE_BACKFILL_NEVER_ATTEMPTED
+    )
+    assert (
+        SpGroupLedgerEntry.from_dict(
+            {
+                **base,
+                "statistics_imported_through": "2026-07-15T14:00:00+08:00",
+            }
+        ).source_backfill_status
+        == SOURCE_BACKFILL_SUCCEEDED
+    )
+
+
+async def test_source_poll_cursor_derives_from_pending_then_accepted(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Polling cursor is derived from persisted pending/accepted buckets."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-cursor")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    observation = SpGroupBucketObservation(
+        bucket_key="bucket-1500",
+        start=datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 15, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1"),
+    )
+    snapshot = await store.async_apply_observations(
+        "opaque_electric",
+        (observation,),
+        now=datetime(2026, 7, 15, 16, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=True,
+    )
+    assert snapshot.entries["opaque_electric"].source_poll_cursor_start(
+        overlap=timedelta(hours=2)
+    ) == datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ)
+
+    snapshot = await store.async_apply_observations(
+        "opaque_electric",
+        (observation,),
+        now=datetime(2026, 7, 15, 17, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=True,
+    )
+    assert snapshot.entries["opaque_electric"].source_poll_cursor_start(
+        overlap=timedelta(hours=1)
+    ) == datetime(2026, 7, 15, 14, 30, tzinfo=SINGAPORE_TZ)
 
 
 async def test_ledger_subtracts_pre_seed_history_and_adds_post_seed_buckets(

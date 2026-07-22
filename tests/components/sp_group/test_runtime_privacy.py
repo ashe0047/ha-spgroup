@@ -61,6 +61,10 @@ async def test_runtime_logs_and_diagnostics_remain_sanitized(
 ) -> None:
     """Coordinator errors and diagnostics expose summaries, not raw payload values."""
     caplog.set_level(logging.DEBUG, logger="custom_components.sp_group")
+    caplog.set_level(
+        logging.WARNING,
+        logger="pytest_homeassistant_custom_component.common",
+    )
     entry = await _setup_seeded_entry(hass, tmp_path)
     coordinator = entry.runtime_data.electricity_coordinator
     assert coordinator is not None

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from custom_components.sp_group import SpGroupRuntimeData
@@ -17,6 +17,7 @@ from custom_components.sp_group.const import CONF_ACCOUNT_ID, CONF_SESSION, DOMA
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.storage import Store
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from spgroup.mobile import MobileSession, SpGroupAuthError, TokenMetadata
 
@@ -200,7 +201,6 @@ async def test_runtime_refresh_persists_and_updates_runtime_session(
     entry.add_to_hass(hass)
     client = FakeRefreshClient(session=refreshed)
     attach_runtime(entry, session=old_session, client=client)
-    hass.config_entries.async_update_entry = Mock()  # type: ignore[method-assign]
 
     result = await async_refresh_runtime_session_if_needed(hass, entry)  # type: ignore[arg-type]
 
@@ -208,9 +208,6 @@ async def test_runtime_refresh_persists_and_updates_runtime_session(
     assert entry.runtime_data.session == refreshed
     assert entry.runtime_data.account_id == "auth0|account-2"
     assert client.refresh_calls == [old_session]
-    _, kwargs = hass.config_entries.async_update_entry.call_args
-    assert kwargs["data"][CONF_SESSION]["accessToken"] == "new-access-token"
-    assert kwargs["data"][CONF_ACCOUNT_ID] == "auth0|account-2"
 
 
 async def test_runtime_refresh_coalesces_concurrent_calls(
@@ -223,7 +220,6 @@ async def test_runtime_refresh_coalesces_concurrent_calls(
     entry.add_to_hass(hass)
     client = FakeRefreshClient(session=refreshed)
     attach_runtime(entry, session=old_session, client=client)
-    hass.config_entries.async_update_entry = Mock()  # type: ignore[method-assign]
 
     first, second = await asyncio.gather(
         async_refresh_runtime_session_if_needed(hass, entry),  # type: ignore[arg-type]
@@ -234,9 +230,116 @@ async def test_runtime_refresh_coalesces_concurrent_calls(
     assert second == refreshed
     assert entry.runtime_data.session == refreshed
     assert client.refresh_calls == [old_session]
-    hass.config_entries.async_update_entry.assert_called_once()
 
 
+async def test_runtime_refresh_persists_store(
+    hass: HomeAssistant,
+) -> None:
+    """Runtime refresh persists session to HA Store when store is available."""
+    old_session = expired_session()
+    refreshed = make_mobile_session(
+        "auth0|account-2",
+        access_token="new-access-token",
+    )
+    entry = make_entry(old_session)
+    entry.add_to_hass(hass)
+    client = FakeRefreshClient(session=refreshed)
+    attach_runtime(entry, session=old_session, client=client)
+    # Attach a mock Store
+    mock_store = AsyncMock(spec=Store)
+    entry.runtime_data.session_store = mock_store
+
+    result = await async_refresh_runtime_session_if_needed(hass, entry)  # type: ignore[arg-type]
+
+    assert result == refreshed
+    assert entry.runtime_data.session == refreshed
+    mock_store.async_save.assert_awaited_once()
+    call_data = mock_store.async_save.call_args[0][0]
+    assert call_data["accessToken"] == "new-access-token"
+    assert call_data["refreshToken"] == "refresh-token"
+
+
+async def test_runtime_refresh_skips_persistence_without_store(
+    hass: HomeAssistant,
+) -> None:
+    """Runtime refresh gracefully skips persistence when no Store is attached."""
+    old_session = expired_session()
+    refreshed = make_mobile_session(
+        "auth0|account-2",
+        access_token="new-access-token",
+    )
+    entry = make_entry(old_session)
+    entry.add_to_hass(hass)
+    client = FakeRefreshClient(session=refreshed)
+    attach_runtime(entry, session=old_session, client=client)
+    # No session_store attached — defaults to None
+
+    result = await async_refresh_runtime_session_if_needed(hass, entry)  # type: ignore[arg-type]
+
+    assert result == refreshed
+    assert entry.runtime_data.session == refreshed
+
+
+async def test_persist_session_writes_to_store(
+    hass: HomeAssistant,
+) -> None:
+    """async_persist_session writes the session dict to the Store."""
+    session = expired_session()
+    entry = make_entry(session)
+    entry.add_to_hass(hass)
+    client = FakeRefreshClient(session=session)
+    attach_runtime(entry, session=session, client=client)
+    mock_store = AsyncMock(spec=Store)
+    entry.runtime_data.session_store = mock_store
+
+    from custom_components.sp_group.auth import async_persist_session
+
+    await async_persist_session(hass, entry, session)  # type: ignore[arg-type]
+
+    mock_store.async_save.assert_awaited_once()
+    call_data = mock_store.async_save.call_args[0][0]
+    assert call_data["accessToken"] == session.access_token
+
+
+async def test_persist_session_skips_without_store(
+    hass: HomeAssistant,
+) -> None:
+    """async_persist_session is a no-op when no Store is attached."""
+    session = expired_session()
+    entry = make_entry(session)
+    entry.add_to_hass(hass)
+    client = FakeRefreshClient(session=session)
+    attach_runtime(entry, session=session, client=client)
+    # No session_store attached
+
+    from custom_components.sp_group.auth import async_persist_session
+
+    # Should not raise
+    await async_persist_session(hass, entry, session)  # type: ignore[arg-type]
+
+
+async def test_persist_session_writes_to_named_store(
+    hass: HomeAssistant,
+) -> None:
+    """async_persist_session writes session dict with expected keys."""
+    session = expired_session()
+    entry = make_entry(session)
+    entry.add_to_hass(hass)
+    client = FakeRefreshClient(session=session)
+    attach_runtime(entry, session=session, client=client)
+    mock_store = AsyncMock(spec=Store)
+    entry.runtime_data.session_store = mock_store
+
+    from custom_components.sp_group.auth import async_persist_session
+
+    await async_persist_session(hass, entry, session)  # type: ignore[arg-type]
+
+    mock_store.async_save.assert_awaited_once()
+    call_data = mock_store.async_save.call_args[0][0]
+    assert isinstance(call_data, dict)
+    assert "accessToken" in call_data
+    assert "refreshToken" in call_data
+    assert "idToken" in call_data
 async def test_runtime_refresh_preserves_existing_account_id_without_identity(
     hass: HomeAssistant,
 ) -> None:
@@ -252,14 +355,11 @@ async def test_runtime_refresh_preserves_existing_account_id_without_identity(
     entry.add_to_hass(hass)
     client = FakeRefreshClient(session=refreshed)
     attach_runtime(entry, session=old_session, client=client)
-    hass.config_entries.async_update_entry = Mock()  # type: ignore[method-assign]
 
     result = await async_refresh_runtime_session_if_needed(hass, entry)  # type: ignore[arg-type]
 
     assert result == refreshed
     assert entry.runtime_data.account_id == "auth0|account-1"
-    _, kwargs = hass.config_entries.async_update_entry.call_args
-    assert kwargs["data"][CONF_ACCOUNT_ID] == "auth0|account-1"
 
 
 @pytest.mark.parametrize(

@@ -106,6 +106,12 @@ def _ledger_summary(runtime: Any) -> dict[str, Any]:
             len(getattr(entry, "statistics_warnings", ()))
             for entry in entries.values()
         ),
+        "source_backfill_statuses": dict(
+            Counter(
+                str(getattr(entry, "source_backfill_status", "unknown"))
+                for entry in entries.values()
+            )
+        ),
     }
 
 

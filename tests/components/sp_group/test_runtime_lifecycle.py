@@ -55,8 +55,12 @@ async def test_transient_runtime_refresh_failure_preserves_trusted_state(
 
     assert isinstance(coordinator.last_exception, UpdateFailed)
     registry = er.async_get(hass)
-    assert_entity_state(hass, registry, ELECTRIC_KEY, "100.0")
+    assert_entity_state(hass, registry, ELECTRIC_KEY, STATE_UNAVAILABLE)
     assert_entity_state(hass, registry, WATER_KEY, "10.0")
+    assert (
+        entry.runtime_data.ledger_store.snapshot.entries[ELECTRIC_KEY].latest_total
+        == 100
+    )
 
 
 async def test_unseeded_runtime_entities_remain_unavailable(

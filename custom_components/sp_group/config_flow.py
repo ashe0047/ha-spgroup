@@ -30,13 +30,14 @@ from spgroup.mobile import (
     YggdrasilClient,
 )
 
-from .backfill import async_run_backfill
+from .backfill import async_schedule_statistics_backfill, async_start_initial_backfill
 from .const import (
     CONF_ACCOUNT_ID,
     CONF_APPROXIMATE_SEED_CONFIRM,
     CONF_BACKFILL_FROM,
     CONF_DEV_AUTH_METHOD,
     CONF_DEV_SESSION_CONFIRM,
+    CONF_ELECTRICITY_POLL_INTERVAL,
     CONF_ELECTRICITY_POLL_INTERVAL_HOURS,
     CONF_ENABLED_UTILITIES,
     CONF_MAINTENANCE_ACTION,
@@ -62,7 +63,7 @@ from .discovery import (
     SpGroupFutureSensorKey,
 )
 from .discovery_service import async_fetch_discovery_data
-from .polling_options import normalize_options, polling_options
+from .polling_options import SpGroupPollingOptions, normalize_options, polling_options
 from .sources import (
     SINGAPORE_TZ,
     UTILITY_ELECTRIC,
@@ -145,7 +146,8 @@ ACTION_NONE = "none"
 ACTION_RESEED_PREFIX = "reseed:"
 ACTION_REBUILD_PREFIX = "rebuild:"
 ACTION_REFRESH_DISCOVERY = "refresh_discovery"
-ACTION_RETRY_BACKFILL = "retry_backfill"
+ACTION_RETRY_STATISTICS_BACKFILL = "retry_statistics_backfill"
+ACTION_RETRY_SOURCE_BACKFILL = "retry_source_backfill"
 DEV_AUTH_BYPASS_ENV = "SPGROUP_HA_DEV_AUTH_BYPASS"
 DEV_SESSION_FILE_ENV = "SPGROUP_HA_DEV_SESSION_FILE"
 DEFAULT_DEV_SESSION_FILE = ".runtime/mobile-session.json"
@@ -301,8 +303,12 @@ def _maintenance_action_schema(
             label="Refresh discovered utilities",
         ),
         selector.SelectOptionDict(
-            value=ACTION_RETRY_BACKFILL,
-            label="Retry historical backfill",
+            value=ACTION_RETRY_STATISTICS_BACKFILL,
+            label="Retry statistics import",
+        ),
+        selector.SelectOptionDict(
+            value=ACTION_RETRY_SOURCE_BACKFILL,
+            label="Retry source backfill",
         ),
     ]
     poll_options = polling_options(current_options)
@@ -354,15 +360,11 @@ def _maintenance_action_schema(
                 )
             ),
             vol.Required(
-                CONF_ELECTRICITY_POLL_INTERVAL_HOURS,
-                default=poll_options.electricity_poll_interval_hours,
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=1,
-                    max=24,
-                    step=1,
-                    mode=selector.NumberSelectorMode.BOX,
-                    unit_of_measurement="h",
+                CONF_ELECTRICITY_POLL_INTERVAL,
+                default=_duration_from_poll(poll_options),
+            ): selector.DurationSelector(
+                selector.DurationSelectorConfig(
+                    enable_day=False,
                 )
             ),
             vol.Required(
@@ -446,6 +448,15 @@ def _maintenance_sensor_key(
     )
 
 
+def _safe_action_for_log(action: str) -> str:
+    """Return an options action name without embedding source identifiers."""
+    if action.startswith(ACTION_RESEED_PREFIX):
+        return "reseed"
+    if action.startswith(ACTION_REBUILD_PREFIX):
+        return "rebuild"
+    return action
+
+
 class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
     """Handle a config flow for SP Group."""
 
@@ -480,7 +491,9 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         """Handle the initial setup step."""
         if user_input is None:
             if _dev_auth_bypass_enabled():
+                _LOGGER.info("SP Group config flow using developer auth choice")
                 return await self.async_step_dev_auth_choice()
+            _LOGGER.debug("SP Group config flow showing credential step")
             return self._show_user_form()
 
         return await self._async_login_from_user_step(
@@ -496,14 +509,17 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         if not _dev_auth_bypass_enabled():
             return self._show_user_form()
         if user_input is None:
+            _LOGGER.debug("SP Group config flow showing developer auth choice")
             return self.async_show_form(
                 step_id="dev_auth_choice",
                 data_schema=STEP_DEV_AUTH_CHOICE_SCHEMA,
             )
         method = user_input.get(CONF_DEV_AUTH_METHOD)
         if method == DEV_AUTH_METHOD_PASSWORD:
+            _LOGGER.info("SP Group config flow developer choice: password_auth")
             return self._show_user_form()
         if method == DEV_AUTH_METHOD_CACHED_SESSION:
+            _LOGGER.info("SP Group config flow developer choice: cached_session")
             return await self.async_step_dev_session_confirm()
         return self.async_show_form(
             step_id="dev_auth_choice",
@@ -519,6 +535,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         if not _dev_auth_bypass_enabled():
             return self._show_user_form()
         if user_input is None:
+            _LOGGER.debug("SP Group config flow showing cached-session confirmation")
             return self.async_show_form(
                 step_id="dev_session_confirm",
                 data_schema=STEP_DEV_SESSION_CONFIRM_SCHEMA,
@@ -529,11 +546,13 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         if not user_input.get(CONF_DEV_SESSION_CONFIRM):
             return self.async_abort(reason="dev_session_not_confirmed")
         try:
+            _LOGGER.info("SP Group config flow loading cached developer session")
             session = await self.hass.async_add_executor_job(
                 _load_dev_cached_session,
                 _dev_session_file(),
             )
             session = await self._async_refresh_dev_session_if_needed(session)
+            _LOGGER.info("SP Group config flow cached developer session ready")
             return await self._async_finish_auth(session)
         except DevCachedSessionError as err:
             return self.async_show_form(
@@ -550,6 +569,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle the OOB one-time password step."""
         if user_input is None:
+            _LOGGER.debug("SP Group config flow showing OTP step")
             return self._show_otp_form()
 
         errors: dict[str, str] = {}
@@ -568,6 +588,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
                 self._mfa_oob_code,
                 str(user_input[CONF_OTP]),
             )
+            _LOGGER.info("SP Group config flow MFA completed")
             return await self._async_finish_auth(session)
         except SpGroupAuthError:
             errors["base"] = "invalid_auth"
@@ -618,6 +639,10 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             errors[CONF_PASSWORD] = "password_too_short"
             return self._show_form(form_step_id, errors)
         try:
+            _LOGGER.info(
+                "SP Group config flow authenticating: step=%s",
+                form_step_id,
+            )
             client = await _async_get_auth_client(self.hass)
             session = await client.attempt_password_realm_login(
                 str(user_input[CONF_USERNAME]),
@@ -626,6 +651,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             return await self._async_finish_auth(session)
         except MfaRequired as err:
             self._mfa_token = err.mfa_token
+            _LOGGER.info("SP Group config flow MFA required")
             try:
                 client = await _async_get_auth_client(self.hass)
                 await self._async_start_oob_mfa(client, err.mfa_token)
@@ -708,10 +734,12 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         """Refresh an expired cached developer session before setup continues."""
         _validate_dev_cached_session(session)
         if not session.expired:
+            _LOGGER.debug("SP Group config flow cached developer session not expired")
             return session
         if not session.refresh_token:
             raise DevCachedSessionError("dev_session_missing_refresh_token")
         try:
+            _LOGGER.info("SP Group config flow refreshing cached developer session")
             client = await _async_get_auth_client(self.hass)
             refreshed = await client.refresh_session(session)
         except SpGroupAuthError as err:
@@ -724,6 +752,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             _dev_session_file(),
             refreshed,
         )
+        _LOGGER.info("SP Group config flow cached developer session refreshed")
         return refreshed
 
     async def _async_finish_auth(self, session: MobileSession) -> ConfigFlowResult:
@@ -734,6 +763,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         account_id = identity.subject
 
         if self.source == SOURCE_REAUTH:
+            _LOGGER.info("SP Group config flow reauth finishing")
             await self.async_set_unique_id(account_id)
             self._abort_if_unique_id_mismatch(reason="wrong_account")
             return self.async_update_reload_and_abort(
@@ -760,6 +790,10 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             if allow_stale_flow_reset and err.reason == "already_in_progress":
                 stale_flow_ids = self._matching_stale_flow_ids(account_id)
                 if stale_flow_ids:
+                    _LOGGER.info(
+                        "SP Group config flow stale setup detected: flow_count=%d",
+                        len(stale_flow_ids),
+                    )
                     self._pending_stale_session = session
                     self._pending_stale_account_id = account_id
                     self._stale_flow_ids = stale_flow_ids
@@ -769,6 +803,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         self._session = session
         self._account_id = account_id
         try:
+            _LOGGER.info("SP Group config flow discovery started")
             yggdrasil_client, jarvis_client = await _async_get_discovery_clients(
                 self.hass
             )
@@ -788,6 +823,10 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             return self._show_user_form({"base": "unknown"})
         if not self._discovery_data.future_sensor_keys():
             return self.async_abort(reason="no_supported_utilities")
+        _LOGGER.info(
+            "SP Group config flow discovery completed: future_sensor_count=%d",
+            len(self._discovery_data.future_sensor_keys()),
+        )
         return await self.async_step_sources()
 
     def _matching_stale_flow_ids(self, account_id: str) -> list[str]:
@@ -814,6 +853,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         ):
             return self._show_user_form({"base": "unknown"})
         if user_input is None:
+            _LOGGER.debug("SP Group config flow showing stale-flow reset confirmation")
             return self.async_show_form(
                 step_id="stale_flow_reset_confirm",
                 data_schema=STEP_STALE_FLOW_RESET_CONFIRM_SCHEMA,
@@ -863,6 +903,10 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             for index, sensor_key in enumerate(sensor_keys, start=1)
         }
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group config flow showing sources step: future_sensor_count=%d",
+                len(sensor_keys),
+            )
             return self.async_show_form(
                 step_id="sources",
                 data_schema=_source_selection_schema(
@@ -872,6 +916,11 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
                 ),
             )
         self._selected_sensor_keys = _enabled_sensor_keys(sensor_keys, user_input)
+        _LOGGER.info(
+            "SP Group config flow sources selected: selected_count=%d total_count=%d",
+            len(self._selected_sensor_keys),
+            len(sensor_keys),
+        )
         if not self._selected_sensor_keys:
             return await self.async_step_no_sources_confirm()
         return await self.async_step_seed()
@@ -882,6 +931,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Confirm creating a discovery-only entry with no seeded utilities."""
         if user_input is None:
+            _LOGGER.debug("SP Group config flow showing no-source confirmation")
             return self.async_show_form(
                 step_id="no_sources_confirm",
                 data_schema=STEP_NO_SOURCES_CONFIRM_SCHEMA,
@@ -899,6 +949,11 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             return self._async_create_setup_entry()
         sensor_key = self._selected_sensor_keys[0]
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group config flow showing seed step: utility=%s remaining=%d",
+                sensor_key.utility_type,
+                len(self._selected_sensor_keys),
+            )
             return self.async_show_form(
                 step_id="seed",
                 data_schema=_seed_data_schema(sensor_key),
@@ -929,11 +984,21 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
         if not config.boundary_aligned:
+            _LOGGER.info(
+                "SP Group config flow seed requires approximate confirmation: "
+                "utility=%s",
+                sensor_key.utility_type,
+            )
             self._pending_approximate_config = config
             self._pending_approximate_sensor_key = sensor_key
             return await self.async_step_approximate_seed_confirm()
         self._source_configs[sensor_key.key] = config
         self._selected_sensor_keys.pop(0)
+        _LOGGER.info(
+            "SP Group config flow seed accepted: utility=%s remaining=%d",
+            sensor_key.utility_type,
+            len(self._selected_sensor_keys),
+        )
         return await self.async_step_seed()
 
     async def async_step_approximate_seed_confirm(
@@ -948,6 +1013,11 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             return await self.async_step_seed()
         sensor_key = self._pending_approximate_sensor_key
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group config flow showing approximate seed confirmation: "
+                "utility=%s",
+                sensor_key.utility_type,
+            )
             return self.async_show_form(
                 step_id="approximate_seed_confirm",
                 data_schema=STEP_APPROXIMATE_SEED_CONFIRM_SCHEMA,
@@ -966,6 +1036,11 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         self._pending_approximate_config = None
         self._pending_approximate_sensor_key = None
         self._selected_sensor_keys.pop(0)
+        _LOGGER.info(
+            "SP Group config flow approximate seed accepted: utility=%s remaining=%d",
+            sensor_key.utility_type,
+            len(self._selected_sensor_keys),
+        )
         return await self.async_step_seed()
 
     def _seed_placeholders(
@@ -989,6 +1064,10 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         """Create the config entry after optional seed collection."""
         if self._session is None or self._account_id is None:
             return self._show_user_form({"base": "unknown"})
+        _LOGGER.info(
+            "SP Group config flow creating entry: source_count=%d",
+            len(self._source_configs),
+        )
         return self.async_create_entry(
             title="SP Group",
             data={
@@ -1112,6 +1191,16 @@ def _write_dev_cached_session(path: Path, session: MobileSession) -> None:
     os.chmod(path, 0o600)
 
 
+def _duration_from_poll(poll_options: SpGroupPollingOptions) -> dict[str, float]:
+    """Convert polling options timedelta to DurationSelector default dict."""
+    seconds = int(poll_options.electricity_poll_interval.total_seconds())
+    return {
+        "hours": seconds // 3600,
+        "minutes": (seconds % 3600) // 60,
+        "seconds": seconds % 60,
+    }
+
+
 class OptionsFlowHandler(OptionsFlow):
     """Handle SP Group options for source configuration."""
 
@@ -1149,6 +1238,12 @@ class OptionsFlowHandler(OptionsFlow):
             for index, sensor_key in enumerate(sensor_keys, start=1)
         }
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group options flow showing init: future_sensor_count=%d "
+                "configured_source_count=%d",
+                len(sensor_keys),
+                len(self._source_configs),
+            )
             return self.async_show_form(
                 step_id="init",
                 data_schema=_maintenance_action_schema(
@@ -1159,7 +1254,19 @@ class OptionsFlowHandler(OptionsFlow):
                 ),
             )
         action = str(user_input.get(CONF_MAINTENANCE_ACTION, ACTION_NONE))
+        _LOGGER.info(
+            "SP Group options flow action selected: action=%s",
+            _safe_action_for_log(action),
+        )
         self._polling_options = {
+            CONF_ELECTRICITY_POLL_INTERVAL: user_input.get(
+                CONF_ELECTRICITY_POLL_INTERVAL,
+                {
+                    "hours": DEFAULT_ELECTRICITY_POLL_INTERVAL_HOURS,
+                    "minutes": 0,
+                    "seconds": 0,
+                },
+            ),
             CONF_ELECTRICITY_POLL_INTERVAL_HOURS: int(
                 user_input.get(
                     CONF_ELECTRICITY_POLL_INTERVAL_HOURS,
@@ -1175,18 +1282,24 @@ class OptionsFlowHandler(OptionsFlow):
         }
         if action == ACTION_REFRESH_DISCOVERY:
             return self._create_options_entry(reload=True)
-        if action == ACTION_RETRY_BACKFILL:
-            runtime = getattr(self._config_entry, "runtime_data", None)
-            if runtime is not None:
-                task = self.hass.async_create_task(
-                    async_run_backfill(self.hass, self._config_entry),
-                    name="sp_group_options_backfill",
-                )
-                backfill_tasks = getattr(runtime, "backfill_tasks", None)
-                if backfill_tasks is not None:
-                    backfill_tasks.add(task)
-                    task.add_done_callback(backfill_tasks.discard)
-            return self._create_options_entry()
+        if action == ACTION_RETRY_STATISTICS_BACKFILL:
+            status = async_schedule_statistics_backfill(
+                self.hass,
+                self._config_entry,
+                name="sp_group_options_statistics_backfill",
+                force=True,
+            )
+            _LOGGER.info(
+                "SP Group options flow statistics retry requested: status=%s",
+                status.value,
+            )
+            return self.async_abort(
+                reason=f"statistics_import_{status.value}",
+            )
+        if action == ACTION_RETRY_SOURCE_BACKFILL:
+            _LOGGER.info("SP Group options flow source backfill retry requested")
+            async_start_initial_backfill(self.hass, self._config_entry)
+            return self.async_abort(reason="source_backfill_scheduled")
         enabled_keys = _enabled_sensor_keys(sensor_keys, user_input)
         self._selected_sensor_keys = [
             sensor_key
@@ -1221,6 +1334,11 @@ class OptionsFlowHandler(OptionsFlow):
             self._pending_rebuild_sensor_key = rebuild_key
             return await self.async_step_rebuild_confirm()
         if not self._selected_sensor_keys:
+            _LOGGER.info(
+                "SP Group options flow updating options: source_count=%d reload=%s",
+                len(self._source_configs),
+                False,
+            )
             return self._create_options_entry()
         return await self.async_step_seed()
 
@@ -1233,6 +1351,11 @@ class OptionsFlowHandler(OptionsFlow):
             return self._create_options_entry()
         sensor_key = self._selected_sensor_keys[0]
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group options flow showing seed step: utility=%s remaining=%d",
+                sensor_key.utility_type,
+                len(self._selected_sensor_keys),
+            )
             return self.async_show_form(
                 step_id="seed",
                 data_schema=_seed_data_schema(sensor_key),
@@ -1263,6 +1386,11 @@ class OptionsFlowHandler(OptionsFlow):
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
         if not config.boundary_aligned:
+            _LOGGER.info(
+                "SP Group options flow seed requires approximate confirmation: "
+                "utility=%s",
+                sensor_key.utility_type,
+            )
             self._pending_approximate_config = config
             self._pending_approximate_sensor_key = sensor_key
             return await self.async_step_approximate_seed_confirm()
@@ -1280,6 +1408,11 @@ class OptionsFlowHandler(OptionsFlow):
             return await self.async_step_seed()
         sensor_key = self._pending_approximate_sensor_key
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group options flow showing approximate seed confirmation: "
+                "utility=%s",
+                sensor_key.utility_type,
+            )
             return self.async_show_form(
                 step_id="approximate_seed_confirm",
                 data_schema=STEP_APPROXIMATE_SEED_CONFIRM_SCHEMA,
@@ -1306,11 +1439,20 @@ class OptionsFlowHandler(OptionsFlow):
     ) -> ConfigFlowResult:
         """Accept a parsed options seed config or route through reset confirmation."""
         if self._is_lower_reseed(config):
+            _LOGGER.info(
+                "SP Group options flow seed requires reset confirmation: utility=%s",
+                sensor_key.utility_type,
+            )
             self._pending_reset_config = config
             self._pending_reset_sensor_key = sensor_key
             return await self.async_step_reset_confirm()
         self._source_configs[sensor_key.key] = config
         self._selected_sensor_keys.pop(0)
+        _LOGGER.info(
+            "SP Group options flow seed accepted: utility=%s remaining=%d",
+            sensor_key.utility_type,
+            len(self._selected_sensor_keys),
+        )
         return await self.async_step_seed()
 
     async def async_step_reset_confirm(
@@ -1322,6 +1464,10 @@ class OptionsFlowHandler(OptionsFlow):
             return await self.async_step_seed()
         sensor_key = self._pending_reset_sensor_key
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group options flow showing reset confirmation: utility=%s",
+                sensor_key.utility_type,
+            )
             return self.async_show_form(
                 step_id="reset_confirm",
                 data_schema=STEP_RESET_CONFIRM_SCHEMA,
@@ -1347,6 +1493,11 @@ class OptionsFlowHandler(OptionsFlow):
         )
         self._source_configs[sensor_key.key] = confirmed
         self._selected_sensor_keys.pop(0)
+        _LOGGER.info(
+            "SP Group options flow reset seed accepted: utility=%s remaining=%d",
+            sensor_key.utility_type,
+            len(self._selected_sensor_keys),
+        )
         self._pending_reset_config = None
         self._pending_reset_sensor_key = None
         return await self.async_step_seed()
@@ -1360,6 +1511,10 @@ class OptionsFlowHandler(OptionsFlow):
         if sensor_key is None:
             return self._create_options_entry()
         if user_input is None:
+            _LOGGER.debug(
+                "SP Group options flow showing rebuild confirmation: utility=%s",
+                sensor_key.utility_type,
+            )
             return self.async_show_form(
                 step_id="rebuild_confirm",
                 data_schema=STEP_REBUILD_CONFIRM_SCHEMA,
@@ -1374,6 +1529,10 @@ class OptionsFlowHandler(OptionsFlow):
         ledger_store = getattr(runtime, "ledger_store", None)
         config = self._source_configs.get(sensor_key.key)
         if ledger_store is not None and config is not None:
+            _LOGGER.info(
+                "SP Group options flow rebuilding ledger: utility=%s",
+                sensor_key.utility_type,
+            )
             await ledger_store.async_rebuild_sources(
                 {sensor_key.key: config},
                 sensor_keys={sensor_key.key},
@@ -1393,8 +1552,17 @@ class OptionsFlowHandler(OptionsFlow):
             }
         )
         if reload:
+            _LOGGER.info(
+                "SP Group options flow requesting reload: source_count=%d",
+                len(self._source_configs),
+            )
             self.hass.async_create_task(
                 self.hass.config_entries.async_reload(self._config_entry.entry_id)
+            )
+        else:
+            _LOGGER.info(
+                "SP Group options flow creating options entry: source_count=%d",
+                len(self._source_configs),
             )
         return self.async_create_entry(
             title="",

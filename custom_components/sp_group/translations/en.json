@@ -153,7 +153,7 @@
                 },
                 "data_description": {
                     "enabled_utilities": "Disabling a utility removes its source configuration. Enabling a skipped utility asks for a meter seed.",
-                    "maintenance_action": "Choose at most one refresh, backfill, reseed, or ledger rebuild action. Run options again for additional utilities.",
+                    "maintenance_action": "Choose at most one discovery refresh, source backfill retry, statistics import retry, reseed, or ledger rebuild action. Run options again for additional utilities.",
                     "electricity_poll_interval_hours": "How often to check electricity AMI buckets, in hours. The default is 1 hour.",
                     "water_poll_day": "Day of the month to check water monthly buckets. The default is day 1, with catch-up checks through day 7.",
                     "water_poll_time": "Local Singapore time for the monthly water poll."
@@ -217,7 +217,12 @@
         },
         "abort": {
             "no_discovery": "Discovery data is not available yet.",
-            "missing_entry": "The SP Group config entry is no longer available."
+            "missing_entry": "The SP Group config entry is no longer available.",
+            "statistics_import_scheduled": "SP Group statistics import was started in the background.",
+            "statistics_import_already_running": "SP Group statistics import is already running.",
+            "statistics_import_not_ready": "SP Group statistics import is not ready yet. Wait for source history and Home Assistant native statistics to be available, then retry.",
+            "statistics_import_blocked": "SP Group statistics import needs manual review before it can continue. Check Repairs for details.",
+            "source_backfill_scheduled": "SP Group source backfill retry was started in the background."
         }
     },
     "entity": {
@@ -251,6 +256,10 @@
         "backfill_failed": {
             "title": "SP Group historical data backfill failed",
             "description": "The initial backfill of historical SP Group data failed.\n\nError: {error}\n\nGo to the SP Group integration options to retry."
+        },
+        "statistics_backfill_conflict": {
+            "title": "SP Group statistics need manual review",
+            "description": "SP Group found existing Home Assistant statistics that conflict with the native-anchored backfill strategy.\n\nWarning: {warning}\n\nReview or reset the affected Home Assistant statistics, then retry from the SP Group integration options."
         }
     },
     "source_config": {

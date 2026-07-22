@@ -163,3 +163,7 @@ def test_error_abort_entity_and_repair_translation_coverage() -> None:
         "missing_entry"
         in translations["issues"]["malformed_ledger"]["fix_flow"]["abort"]
     )
+    assert {
+        "backfill_failed",
+        "statistics_backfill_conflict",
+    } <= set(translations["repair"])

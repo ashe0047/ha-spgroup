@@ -6,7 +6,8 @@ import asyncio
 import logging
 from datetime import datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from custom_components.sp_group import SpGroupRuntimeData
@@ -15,8 +16,11 @@ from custom_components.sp_group.coordinator import (
     SpGroupCoordinatorData,
     SpGroupDataUpdateCoordinator,
     SpGroupElectricityCoordinator,
+    SpGroupWaterCoordinator,
+    _ami_request_windows,
     _ami_rows,
     _water_history_observations,
+    _water_startup_catchup_needed,
 )
 from custom_components.sp_group.discovery import (
     SpGroupFutureSensorKey,
@@ -26,6 +30,7 @@ from custom_components.sp_group.discovery import (
 from custom_components.sp_group.ledger import SpGroupLedgerStore
 from custom_components.sp_group.sources import (
     SINGAPORE_TZ,
+    SOURCE_MANUAL_SEED_MONTHLY,
     build_source_config,
     source_options_payload,
 )
@@ -236,8 +241,8 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
     config = build_source_config(
         sensor_key=sensor_key,
         seed_value="100.0",
-        seed_observed_at="2026-07-14T01:00:00+08:00",
-        backfill_from="2026-07-14T01:00:00+08:00",
+        seed_observed_at="2026-07-10T01:00:00+08:00",
+        backfill_from="2026-07-10T01:00:00+08:00",
         now=datetime(2026, 7, 14, 2, 0, tzinfo=SINGAPORE_TZ),
     )
     calls: list[str] = []
@@ -288,19 +293,36 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
     coordinator = SpGroupElectricityCoordinator(hass, entry)  # type: ignore[arg-type]
     entry.runtime_data.electricity_coordinator = coordinator
 
-    with patch(
-        "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
-        AsyncMock(return_value=session),
+    with (
+        patch(
+            "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
+            AsyncMock(return_value=session),
+        ),
+        patch(
+            "custom_components.sp_group.backfill.async_schedule_statistics_backfill",
+        ) as schedule_stats_backfill,
+        patch(
+            "custom_components.sp_group.backfill.async_run_backfill",
+            new_callable=AsyncMock,
+        ) as source_backfill,
     ):
         await coordinator._async_update_data()
         assert ledger_store.snapshot.entries[sensor_key.key].latest_total == Decimal(
             "100.0"
         )
+        schedule_stats_backfill.assert_not_called()
         await coordinator._async_update_data()
 
     assert ledger_store.snapshot.entries[sensor_key.key].latest_total == Decimal(
         "101.25"
     )
+    schedule_stats_backfill.assert_called_once_with(
+        hass,
+        entry,
+        name="sp_group_poll_statistics_backfill",
+        force=True,
+    )
+    source_backfill.assert_not_awaited()
     assert "jarvis.get_ami_charts:day:electric" in calls
 
 
@@ -381,6 +403,115 @@ async def test_backfill_poll_uses_backfill_anchor_but_normal_poll_uses_seed(
     assert jarvis_client.ami_requests[0][0].isoformat() == "2026-07-14"
     assert jarvis_client.ami_requests[1][0].isoformat() == "2026-07-01"
 
+
+def test_ami_request_windows_are_bounded() -> None:
+    """Long AMI requests are split into bounded windows."""
+    windows = _ami_request_windows(
+        datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+        datetime(2026, 3, 10, tzinfo=SINGAPORE_TZ),
+    )
+
+    assert len(windows) == 3
+    assert windows[0][0] == datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    assert windows[-1][1] == datetime(2026, 3, 10, tzinfo=SINGAPORE_TZ)
+    assert all((end - start).days <= 31 for start, end in windows)
+
+
+async def test_electricity_normal_poll_uses_ledger_cursor(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Normal AMI polling starts from accepted cursor with overlap."""
+    hass.config.config_dir = str(tmp_path)
+    session = make_mobile_session("auth0|account-1")
+    sensor_key = SpGroupFutureSensorKey(
+        key="sp_group_premise_938f4ae4706115485aaa8512_electric",
+        premise_key="sp_group_premise_938f4ae4706115485aaa8512",
+        utility_type="electric",
+    )
+    config = build_source_config(
+        sensor_key=sensor_key,
+        seed_value="100.0",
+        seed_observed_at="2026-07-10T01:00:00+08:00",
+        backfill_from="2026-07-10T01:00:00+08:00",
+        now=datetime(2026, 7, 14, 2, 0, tzinfo=SINGAPORE_TZ),
+    )
+    ledger_store = SpGroupLedgerStore(hass, "entry-cursor-coordinator")
+    await ledger_store.async_load()
+    await ledger_store.async_initialize_sources({sensor_key.key: config})
+    observation = {
+        "unit": "kWh",
+        "history": [
+            {
+                "data": [
+                    {"date": "20260714150000", "consumption": "1.0"},
+                    {"date": "20260714153000", "consumption": "1.0"},
+                ]
+            }
+        ],
+    }
+    calls: list[str] = []
+    jarvis_client = FakeJarvisClient(calls)
+    jarvis_client.ami_payloads = [observation, observation, observation]
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="auth0|account-1",
+        data={CONF_ACCOUNT_ID: "auth0|account-1", CONF_SESSION: session.to_dict()},
+        options={"source_config": source_options_payload({sensor_key.key: config})},
+    )
+    entry.runtime_data = SpGroupRuntimeData(
+        auth_client=object(),  # type: ignore[arg-type]
+        jarvis_client=jarvis_client,  # type: ignore[arg-type]
+        yggdrasil_client=FakeYggdrasilClient(calls),  # type: ignore[arg-type]
+        profile_client=UtilityClientSentinel(),  # type: ignore[arg-type]
+        session=session,
+        account_id="auth0|account-1",
+        refresh_lock=asyncio.Lock(),
+        ledger_store=ledger_store,
+    )
+    discovery = SpGroupDataUpdateCoordinator(hass, entry)  # type: ignore[arg-type]
+    entry.runtime_data.coordinator = discovery
+    entry.runtime_data.discovery_coordinator = discovery
+    discovery.async_set_updated_data(
+        SpGroupCoordinatorData(
+            premises=(
+                SpGroupPremise(
+                    key=sensor_key.premise_key,
+                    active=True,
+                    signed_up=True,
+                    shared=False,
+                    contestable_type=None,
+                    accounts=(
+                        SpGroupUtilityAccount(
+                            key=sensor_key.key,
+                            premise_key=sensor_key.premise_key,
+                            utility_types=("ELECTRIC",),
+                        ),
+                    ),
+                    jarvis_premise_id="JARVIS-PREMISE-1",
+                ),
+            )
+        )
+    )
+    coordinator = SpGroupElectricityCoordinator(hass, entry)  # type: ignore[arg-type]
+    entry.runtime_data.electricity_coordinator = coordinator
+
+    with (
+        patch(
+            "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
+            AsyncMock(return_value=session),
+        ),
+        patch(
+            "custom_components.sp_group.backfill.async_schedule_statistics_backfill",
+        ),
+    ):
+        await coordinator.async_poll_now()
+        await coordinator.async_poll_now()
+        await coordinator.async_poll_now()
+
+    assert jarvis_client.ami_requests[0][0].isoformat() == "2026-07-10"
+    assert jarvis_client.ami_requests[-1][0].isoformat() == "2026-07-14"
+
 def test_water_history_observations_accepts_history_chart_water_section() -> None:
     """History chart water section parses to correct bucket observations."""
     observations = _water_history_observations(
@@ -415,6 +546,156 @@ def test_water_history_observations_accepts_history_chart_water_section() -> Non
     assert observations[0].end == datetime(2026, 7, 1, tzinfo=SINGAPORE_TZ)
     assert observations[1].start == datetime(2026, 7, 1, tzinfo=SINGAPORE_TZ)
     assert observations[1].end == datetime(2026, 8, 1, tzinfo=SINGAPORE_TZ)
+
+
+async def test_water_startup_catchup_needed_after_configured_time(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Startup catch-up runs when a ready month is missing after poll time."""
+    hass.config.config_dir = str(tmp_path)
+    session = make_mobile_session("auth0|account-1")
+    sensor_key = SpGroupFutureSensorKey(
+        key="sp_group_premise_938f4ae4706115485aaa8512_water",
+        premise_key="sp_group_premise_938f4ae4706115485aaa8512",
+        utility_type="water",
+    )
+    config = build_source_config(
+        sensor_key=sensor_key,
+        seed_value="100.0",
+        seed_observed_at="2026-06-01T00:00:00+08:00",
+        backfill_from="2026-06-01T00:00:00+08:00",
+        now=datetime(2026, 7, 10, tzinfo=SINGAPORE_TZ),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="auth0|account-1",
+        data={CONF_ACCOUNT_ID: "auth0|account-1", CONF_SESSION: session.to_dict()},
+        options={
+            "source_config": {
+                sensor_key.key: {
+                    **source_options_payload({sensor_key.key: config})[sensor_key.key],
+                    "source": SOURCE_MANUAL_SEED_MONTHLY,
+                }
+            }
+        },
+    )
+    ledger_store = SpGroupLedgerStore(hass, "entry-water-catchup")
+    await ledger_store.async_load()
+    await ledger_store.async_initialize_sources({sensor_key.key: config})
+    entry.runtime_data = SpGroupRuntimeData(
+        auth_client=object(),  # type: ignore[arg-type]
+        jarvis_client=FakeJarvisClient([]),  # type: ignore[arg-type]
+        yggdrasil_client=FakeYggdrasilClient([]),  # type: ignore[arg-type]
+        profile_client=UtilityClientSentinel(),  # type: ignore[arg-type]
+        session=session,
+        account_id="auth0|account-1",
+        refresh_lock=asyncio.Lock(),
+        ledger_store=ledger_store,
+    )
+    discovery = SpGroupDataUpdateCoordinator(hass, entry)  # type: ignore[arg-type]
+    entry.runtime_data.discovery_coordinator = discovery
+    discovery.async_set_updated_data(
+        SpGroupCoordinatorData(
+            premises=(
+                SpGroupPremise(
+                    key=sensor_key.premise_key,
+                    active=True,
+                    signed_up=True,
+                    shared=False,
+                    contestable_type=None,
+                    accounts=(
+                        SpGroupUtilityAccount(
+                            key=sensor_key.key,
+                            premise_key=sensor_key.premise_key,
+                            utility_types=("WATER",),
+                        ),
+                    ),
+                    jarvis_premise_id="JARVIS-PREMISE-1",
+                ),
+            )
+        )
+    )
+
+    assert _water_startup_catchup_needed(
+        entry, datetime(2026, 7, 5, 1, 0, tzinfo=SINGAPORE_TZ)
+    )
+    assert not _water_startup_catchup_needed(
+        entry, datetime(2026, 7, 1, 0, 0, tzinfo=SINGAPORE_TZ)
+    )
+
+
+async def test_water_startup_catchup_schedules_one_refresh_task(
+    hass: HomeAssistant,
+) -> None:
+    """Startup catch-up schedules exactly one active refresh task."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
+    entry.runtime_data = SimpleNamespace(backfill_tasks=set())
+    coordinator = SpGroupWaterCoordinator(hass, entry)  # type: ignore[arg-type]
+    release = asyncio.Event()
+    coordinator.async_request_refresh = AsyncMock(  # type: ignore[method-assign]
+        side_effect=release.wait
+    )
+
+    with patch(
+        "custom_components.sp_group.coordinator._water_startup_catchup_needed",
+        return_value=True,
+    ):
+        coordinator.async_start_startup_catchup()
+        coordinator.async_start_startup_catchup()
+        await asyncio.sleep(0)
+
+    assert len(entry.runtime_data.backfill_tasks) == 1
+    coordinator.async_request_refresh.assert_awaited_once()
+    release.set()
+    await hass.async_block_till_done()
+    assert entry.runtime_data.backfill_tasks == set()
+
+
+async def test_water_startup_catchup_cancel_stops_pending_task(
+    hass: HomeAssistant,
+) -> None:
+    """Canceling the water schedule also cancels startup catch-up."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
+    entry.runtime_data = SimpleNamespace(backfill_tasks=set())
+    coordinator = SpGroupWaterCoordinator(hass, entry)  # type: ignore[arg-type]
+    release = asyncio.Event()
+    coordinator.async_request_refresh = AsyncMock(  # type: ignore[method-assign]
+        side_effect=release.wait
+    )
+    unsub_timer = Mock()
+    coordinator._unsub_timer = unsub_timer
+
+    with patch(
+        "custom_components.sp_group.coordinator._water_startup_catchup_needed",
+        return_value=True,
+    ):
+        coordinator.async_start_startup_catchup()
+        await asyncio.sleep(0)
+
+    coordinator.async_cancel_schedule()
+    await hass.async_block_till_done()
+
+    unsub_timer.assert_called_once()
+    assert coordinator._startup_catchup_task is None
+    assert entry.runtime_data.backfill_tasks == set()
+
+
+def test_water_startup_catchup_skips_when_not_needed(
+    hass: HomeAssistant,
+) -> None:
+    """Starting before the catch-up window does not schedule work."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
+    entry.runtime_data = SimpleNamespace(backfill_tasks=set())
+    coordinator = SpGroupWaterCoordinator(hass, entry)  # type: ignore[arg-type]
+
+    with patch(
+        "custom_components.sp_group.coordinator._water_startup_catchup_needed",
+        return_value=False,
+    ):
+        coordinator.async_start_startup_catchup()
+
+    assert entry.runtime_data.backfill_tasks == set()
 
 
 def test_water_history_observations_empty_payload() -> None:
@@ -510,9 +791,18 @@ async def test_water_coordinator_calls_get_history_charts(
 
     jarvis.chart_payload = _water_history_payload("5.0")  # type: ignore[attr-defined]
 
-    with patch(
-        "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
-        AsyncMock(return_value=entry.runtime_data.session),
+    with (
+        patch(
+            "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
+            AsyncMock(return_value=entry.runtime_data.session),
+        ),
+        patch(
+            "custom_components.sp_group.backfill.async_schedule_statistics_backfill",
+        ) as schedule_stats_backfill,
+        patch(
+            "custom_components.sp_group.backfill.async_run_backfill",
+            new_callable=AsyncMock,
+        ) as source_backfill,
     ):
         await water_coordinator.async_poll_now()
         await hass.async_block_till_done()
@@ -520,6 +810,13 @@ async def test_water_coordinator_calls_get_history_charts(
     assert isinstance(jarvis, FakeJarvisClient)
     assert any("get_history_charts" in call for call in jarvis.calls)
     assert not any("get_ami_charts" in call for call in jarvis.calls)
+    schedule_stats_backfill.assert_called_once_with(
+        hass,
+        entry,
+        name="sp_group_poll_statistics_backfill",
+        force=True,
+    )
+    source_backfill.assert_not_awaited()
 
 
 

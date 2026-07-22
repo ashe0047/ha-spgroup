@@ -1,4 +1,5 @@
 """The SP Group integration."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -7,15 +8,19 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_RECORDER_HOURLY_STATISTICS_GENERATED, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_utils
 
 # Dev mode: vendor directory provides the SDK directly.
-# Production: vendor is not shipped; manifest.json requirements install spgroup from pip.
+# Production: vendor is not shipped; manifest.json requirements install spgroup.
 _VENDOR_PATH = str(Path(__file__).resolve().parent / "vendor")
 if _VENDOR_PATH not in sys.path:
     sys.path.insert(0, _VENDOR_PATH)
@@ -28,8 +33,8 @@ from spgroup.mobile import (
     YggdrasilClient,
 )
 
-from .auth import mobile_session_from_entry
-from .backfill import async_start_initial_backfill
+from .auth import async_load_session
+from .backfill import async_schedule_statistics_backfill, async_start_initial_backfill
 from .const import CONF_ACCOUNT_ID, DOMAIN
 from .coordinator import (
     SpGroupDataUpdateCoordinator,
@@ -37,11 +42,13 @@ from .coordinator import (
     SpGroupElectricityCoordinator,
     SpGroupWaterCoordinator,
 )
-from .ledger import SpGroupLedgerStore
+from .dev import async_register_dev_services
+from .ledger import STATISTICS_STRATEGY_NATIVE_OFFSET_V2, SpGroupLedgerStore
 from .polling_options import normalize_options
 from .sources import source_configs_for_data
 
 _PLATFORMS: list[Platform] = [Platform.SENSOR]
+_STATISTICS_RETRY_EVENT_DELAY_SECONDS = 1
 
 LOGGER = logging.getLogger(__name__)
 MALFORMED_LEDGER_REPAIR_ISSUE = "malformed_ledger"
@@ -63,6 +70,7 @@ class SpGroupRuntimeData:
     electricity_coordinator: SpGroupElectricityCoordinator | None = None
     water_coordinator: SpGroupWaterCoordinator | None = None
     backfill_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    session_store: Store[Any] | None = None
 
     @property
     def coordinator(self) -> SpGroupDiscoveryCoordinator | None:
@@ -80,10 +88,16 @@ type SpGroupConfigEntry = ConfigEntry[SpGroupRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: SpGroupConfigEntry) -> bool:
     """Set up SP Group from a config entry."""
-    session = mobile_session_from_entry(entry)
+    LOGGER.info("SP Group setup started")
+    async_register_dev_services(hass)
+    session, session_store = await async_load_session(hass, entry)
     aiohttp_session = async_get_clientsession(hass)
     ledger_store = SpGroupLedgerStore(hass, entry.entry_id)
     await ledger_store.async_load()
+    if hasattr(ledger_store, "async_mark_interrupted_source_backfills_failed"):
+        await ledger_store.async_mark_interrupted_source_backfills_failed(
+            failed_at=dt_utils.utcnow()
+        )
     if ledger_store.snapshot.malformed:
         _async_create_malformed_ledger_issue(hass, entry)
     else:
@@ -97,6 +111,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SpGroupConfigEntry) -> b
         account_id=entry.data.get(CONF_ACCOUNT_ID),
         refresh_lock=asyncio.Lock(),
         ledger_store=ledger_store,
+        session_store=session_store,
     )
     entry.runtime_data.backfill_tasks = set()
     discovery_coordinator = SpGroupDataUpdateCoordinator(hass, entry)
@@ -106,40 +121,184 @@ async def async_setup_entry(hass: HomeAssistant, entry: SpGroupConfigEntry) -> b
     entry.runtime_data.electricity_coordinator = electricity_coordinator
     entry.runtime_data.water_coordinator = water_coordinator
     await discovery_coordinator.async_config_entry_first_refresh()
+    LOGGER.info("SP Group setup discovery first refresh completed")
     discovery_data = getattr(discovery_coordinator, "data", None)
     if ledger_store.snapshot.malformed is False and discovery_data is not None:
+        source_configs = source_configs_for_data(discovery_data, entry.options)
         await ledger_store.async_initialize_sources(
-            source_configs_for_data(discovery_data, entry.options)
+            source_configs
+        )
+        LOGGER.debug(
+            "SP Group setup ledger sources initialized: source_count=%d",
+            len(source_configs),
         )
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
-    if hasattr(hass, "loop"):
+    LOGGER.info(
+        "SP Group setup platforms forwarded: platform_count=%d",
+        len(_PLATFORMS),
+    )
+    if not ledger_store.snapshot.malformed and hasattr(hass, "loop"):
         water_coordinator.async_start_schedule()
         entry.async_on_unload(water_coordinator.async_cancel_schedule)
-    # Skip backfill if all utilities have completed statistics import.
-    # The initial backfill is a one-time import that fetches historical API
-    # data.  On restart, regular polling handles incremental updates.
-    try:
-        _backfill_needed = _any_entry_missing_watermark(entry.runtime_data)
-    except (AttributeError, KeyError, TypeError):
-        LOGGER.warning(
-            "SP Group ledger state check failed, defaulting to backfill-needed",
-            exc_info=True,
-        )
-        _backfill_needed = True
+    # Source-history backfill is a one-shot provider fetch.  Statistics import
+    # may remain pending until HA creates a native reference row, but that must
+    # not cause repeated full-history API calls on restart.
+    if ledger_store.snapshot.malformed:
+        _backfill_needed = False
+    else:
+        try:
+            _backfill_needed = _any_entry_missing_source_backfill_attempt(
+                entry.runtime_data
+            )
+        except (AttributeError, KeyError, TypeError):
+            LOGGER.warning(
+                "SP Group ledger state check failed, defaulting to backfill-needed",
+                exc_info=True,
+            )
+            _backfill_needed = True
     if _backfill_needed and hasattr(hass, "loop"):
+        LOGGER.info("SP Group setup scheduling source-history backfill")
         async_start_initial_backfill(hass, entry)
+    else:
+        LOGGER.debug(
+            "SP Group setup source-history backfill not scheduled: "
+            "malformed=%s needed=%s",
+            ledger_store.snapshot.malformed,
+            _backfill_needed,
+        )
+    _async_register_statistics_retry_listener(hass, entry)
 
+    LOGGER.info("SP Group setup completed")
     return True
 
 
+def _async_register_statistics_retry_listener(
+    hass: HomeAssistant,
+    entry: SpGroupConfigEntry,
+) -> None:
+    """Register an hourly Recorder listener for pending statistics import."""
+    if not _any_entry_can_eventually_retry_statistics(entry.runtime_data):
+        LOGGER.debug("SP Group statistics retry listener skipped: complete_or_blocked")
+        return
+    LOGGER.info("SP Group statistics retry listener registered")
+
+    @callback
+    def _async_retry_statistics(_event: Event) -> None:
+        LOGGER.debug("SP Group Recorder hourly statistics event received")
+        if _any_entry_should_retry_statistics(entry.runtime_data):
+
+            @callback
+            def _async_delayed_retry(_now: object) -> None:
+                _schedule_hourly_statistics_backfill(hass, entry)
+
+            entry.async_on_unload(
+                async_call_later(
+                    hass,
+                    _STATISTICS_RETRY_EVENT_DELAY_SECONDS,
+                    _async_delayed_retry,
+                )
+            )
+        else:
+            LOGGER.debug("SP Group statistics retry skipped after event: not_ready")
+
+    entry.async_on_unload(
+        hass.bus.async_listen(
+            EVENT_RECORDER_HOURLY_STATISTICS_GENERATED,
+            _async_retry_statistics,
+        )
+    )
+
+
+@callback
+def _schedule_hourly_statistics_backfill(
+    hass: HomeAssistant,
+    entry: SpGroupConfigEntry,
+) -> None:
+    """Schedule statistics backfill from HA's event loop."""
+    async_schedule_statistics_backfill(hass, entry)
+
 
 def _any_entry_missing_watermark(runtime: SpGroupRuntimeData) -> bool:
-    """Return True if any seeded ledger entry has no completed statistics import."""
+    """Return True if any ledger entry has incomplete statistics import."""
     if runtime.ledger_store is None or runtime.ledger_store.snapshot.malformed:
         return True
     for _ledger_entry in runtime.ledger_store.snapshot.entries.values():
-        if _ledger_entry.statistics_imported_through is None:
+        if (
+            _ledger_entry.statistics_imported_through is None
+            or _ledger_entry.statistics_strategy_version
+            != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+        ):
+            return True
+    return False
+
+
+def _any_entry_can_eventually_retry_statistics(runtime: SpGroupRuntimeData) -> bool:
+    """Return True when any entry may later be retried by Recorder event."""
+    if runtime.ledger_store is None or runtime.ledger_store.snapshot.malformed:
+        return False
+    entries = getattr(runtime.ledger_store.snapshot, "entries", None)
+    if entries is None:
+        return False
+    for _ledger_entry in entries.values():
+        if _statistics_retry_blocked_by_warning(
+            _ledger_entry.statistics_warnings
+        ):
+            continue
+        if (
+            _ledger_entry.statistics_imported_through is None
+            or _ledger_entry.statistics_strategy_version
+            != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+        ):
+            return True
+    return False
+
+
+def _any_entry_should_retry_statistics(runtime: SpGroupRuntimeData) -> bool:
+    """Return True when hourly Recorder event should schedule stats import."""
+    if runtime.ledger_store is None or runtime.ledger_store.snapshot.malformed:
+        return False
+    entries = getattr(runtime.ledger_store.snapshot, "entries", None)
+    if entries is None:
+        return False
+    for _ledger_entry in entries.values():
+        if _ledger_entry.source_backfill_attempted_at is None:
+            continue
+        if _statistics_retry_blocked_by_warning(
+            _ledger_entry.statistics_warnings
+        ):
+            continue
+        if (
+            _ledger_entry.statistics_imported_through is None
+            or _ledger_entry.statistics_strategy_version
+            != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+        ):
+            return True
+    return False
+
+
+def _statistics_retry_blocked_by_warning(warnings: tuple[str, ...]) -> bool:
+    """Return True when warnings describe state requiring manual action."""
+    return any(
+        warning.startswith("statistics_existing_negative_delta:")
+        or warning.startswith("statistics_conflict:")
+        or warning == "statistics_legacy_rows_need_manual_rebuild"
+        for warning in warnings
+    )
+
+
+def _any_entry_missing_source_backfill_attempt(
+    runtime: SpGroupRuntimeData,
+) -> bool:
+    """Return True when any seeded utility has not attempted source backfill."""
+    if runtime.ledger_store is None or runtime.ledger_store.snapshot.malformed:
+        return True
+    for _ledger_entry in runtime.ledger_store.snapshot.entries.values():
+        status = getattr(_ledger_entry, "source_backfill_status", None)
+        if status in {"never_attempted", "failed"} or (
+            status is None
+            and getattr(_ledger_entry, "source_backfill_attempted_at", None) is None
+        ):
             return True
     return False
 
@@ -166,14 +325,24 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: SpGroupConfigEntry) -> bool:
     """Unload a config entry."""
+    LOGGER.info("SP Group unload started")
     runtime = getattr(entry, "runtime_data", None)
     if runtime is not None:
         water_coordinator = getattr(runtime, "water_coordinator", None)
         if water_coordinator is not None:
             water_coordinator.async_cancel_schedule()
-        for task in set(getattr(runtime, "backfill_tasks", set()) or set()):
+        tasks = set(getattr(runtime, "backfill_tasks", set()) or set())
+        for task in tasks:
             task.cancel()
-    return await hass.config_entries.async_unload_platforms(entry, _PLATFORMS)
+        if tasks:
+            LOGGER.info(
+                "SP Group unload cancelling background tasks: task_count=%d",
+                len(tasks),
+            )
+            await asyncio.gather(*tasks, return_exceptions=True)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, _PLATFORMS)
+    LOGGER.info("SP Group unload completed: unloaded=%s", unloaded)
+    return unloaded
 
 
 async def _async_update_listener(

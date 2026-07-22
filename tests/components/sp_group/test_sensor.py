@@ -164,6 +164,9 @@ def test_sensor_publishes_trusted_ledger_total(
     assert electricity.device_class == "energy"
     assert electricity.state_class == "total_increasing"
 
+    coordinator.last_update_success = False
+    assert not electricity.available
+
 
 def test_future_sensor_keys_are_derived_from_discovery_data() -> None:
     """Future sensor identity can be driven by coordinator discovery data."""

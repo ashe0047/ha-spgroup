@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from custom_components.sp_group.backfill import StatisticsBackfillScheduleStatus
 from custom_components.sp_group.config_flow import ConfigFlow, OptionsFlowHandler
 from custom_components.sp_group.const import (
     CONF_ACCOUNT_ID,
@@ -1396,6 +1397,112 @@ async def test_options_flow_confirms_lower_replacement() -> None:
     source_config = result["data"][CONF_SOURCE_CONFIG][sensor_key.key]
     assert source_config["seed_value"] == "50.0"
     assert source_config["reset_confirmed"] is True
+
+
+async def test_options_flow_retry_statistics_import_uses_persisted_ledger_only(
+    hass: HomeAssistant,
+) -> None:
+    """The options retry imports statistics without re-fetching provider history."""
+    data = _single_electric_discovery()
+    sensor_key = data.future_sensor_keys()[0]
+    existing_config = build_source_config(
+        sensor_key=sensor_key,
+        seed_value="100.0",
+        seed_observed_at="2026-07-14T13:00:00+08:00",
+        backfill_from="2026-07-14T13:00:00+08:00",
+        now=datetime(2026, 7, 14, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    backfill_tasks: set[Any] = set()
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="auth0|account-1",
+        options={CONF_SOURCE_CONFIG: {sensor_key.key: existing_config.to_dict()}},
+    )
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(data=data),
+        ledger_store=SimpleNamespace(snapshot=SpGroupLedgerSnapshot()),
+        backfill_tasks=backfill_tasks,
+    )
+    flow = OptionsFlowHandler(entry)
+    flow.hass = hass
+
+    with (
+        patch(
+            "custom_components.sp_group.config_flow.async_schedule_statistics_backfill",
+        ) as schedule_stats_backfill,
+        patch(
+            "custom_components.sp_group.backfill.async_run_backfill",
+            new_callable=AsyncMock,
+        ) as source_backfill,
+    ):
+        schedule_stats_backfill.return_value = (
+            StatisticsBackfillScheduleStatus.SCHEDULED
+        )
+        result = await flow.async_step_init(
+            {
+                CONF_ENABLED_UTILITIES: [sensor_key.key],
+                CONF_MAINTENANCE_ACTION: "retry_statistics_backfill",
+            }
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "statistics_import_scheduled"
+    schedule_stats_backfill.assert_called_once_with(
+        hass,
+        entry,
+        name="sp_group_options_statistics_backfill",
+        force=True,
+    )
+    source_backfill.assert_not_awaited()
+    assert backfill_tasks == set()
+
+
+async def test_options_flow_retry_source_backfill_schedules_source_path(
+    hass: HomeAssistant,
+) -> None:
+    """The source retry action schedules provider-history backfill."""
+    data = _single_electric_discovery()
+    sensor_key = data.future_sensor_keys()[0]
+    existing_config = build_source_config(
+        sensor_key=sensor_key,
+        seed_value="100.0",
+        seed_observed_at="2026-07-14T13:00:00+08:00",
+        backfill_from="2026-07-14T13:00:00+08:00",
+        now=datetime(2026, 7, 14, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="auth0|account-1",
+        options={CONF_SOURCE_CONFIG: {sensor_key.key: existing_config.to_dict()}},
+    )
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(data=data),
+        ledger_store=SimpleNamespace(snapshot=SpGroupLedgerSnapshot()),
+        backfill_tasks=set(),
+    )
+    flow = OptionsFlowHandler(entry)
+    flow.hass = hass
+
+    with (
+        patch(
+            "custom_components.sp_group.config_flow.async_start_initial_backfill",
+        ) as start_source_backfill,
+        patch(
+            "custom_components.sp_group.config_flow.async_schedule_statistics_backfill",
+        ) as schedule_stats_backfill,
+    ):
+        result = await flow.async_step_init(
+            {
+                CONF_ENABLED_UTILITIES: [sensor_key.key],
+                CONF_MAINTENANCE_ACTION: "retry_source_backfill",
+            }
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "source_backfill_scheduled"
+    start_source_backfill.assert_called_once_with(hass, entry)
+    schedule_stats_backfill.assert_not_called()
 
 
 async def test_options_flow_rebuilds_seeded_ledger() -> None:

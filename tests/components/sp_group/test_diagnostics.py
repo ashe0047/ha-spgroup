@@ -20,6 +20,7 @@ from custom_components.sp_group.discovery import (
     SpGroupUtilityAccount,
 )
 from custom_components.sp_group.electricity import SpGroupElectricityCandidate
+from custom_components.sp_group.ledger import SpGroupLedgerEntry, SpGroupLedgerSnapshot
 from custom_components.sp_group.water import SpGroupWaterCandidate
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -71,6 +72,7 @@ async def test_config_entry_diagnostics_are_bounded_summaries(
                 "pending_bucket_count": 0,
                 "warning_count": 0,
                 "statistics_warning_count": 0,
+                "source_backfill_statuses": {},
             },
         },
         "coordinators": {
@@ -179,9 +181,42 @@ async def test_diagnostics_handle_missing_runtime_data(hass: HomeAssistant) -> N
             "pending_bucket_count": 0,
             "warning_count": 0,
             "statistics_warning_count": 0,
+            "source_backfill_statuses": {},
         },
     }
     assert diagnostics["coordinator"]["data"] is None
+    _assert_sensitive_values_absent(diagnostics)
+
+
+async def test_diagnostics_include_bounded_source_backfill_status_histogram(
+    hass: HomeAssistant,
+) -> None:
+    """Diagnostics expose source status counts without raw ledger identifiers."""
+    entry = _diagnostics_entry()
+    ledger_entries = {
+        "raw-source-key-electric": SpGroupLedgerEntry.from_dict(
+            _ledger_payload("raw-source-key-electric", "electric", "succeeded")
+        ),
+        "raw-source-key-water": SpGroupLedgerEntry.from_dict(
+            _ledger_payload("raw-source-key-water", "water", "failed")
+        ),
+        "raw-source-key-water-2": SpGroupLedgerEntry.from_dict(
+            _ledger_payload("raw-source-key-water-2", "water", "never_attempted")
+        ),
+    }
+    entry.runtime_data.ledger_store = SimpleNamespace(
+        snapshot=SpGroupLedgerSnapshot(entries=ledger_entries)
+    )
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diagnostics["runtime"]["ledger"]["source_backfill_statuses"] == {
+        "failed": 1,
+        "never_attempted": 1,
+        "succeeded": 1,
+    }
+    rendered = repr(diagnostics)
+    assert "raw-source-key" not in rendered
     _assert_sensitive_values_absent(diagnostics)
 
 
@@ -275,6 +310,23 @@ def _diagnostics_entry() -> MockConfigEntry:
         water_coordinator=water_coordinator,  # type: ignore[arg-type]
     )
     return entry
+
+
+def _ledger_payload(sensor_key: str, utility_type: str, status: str) -> dict[str, Any]:
+    """Return a minimal ledger entry payload for diagnostics tests."""
+    return {
+        "sensor_key": sensor_key,
+        "source": "manual_seed_plus_ami_deltas",
+        "utility_type": utility_type,
+        "epoch_id": f"epoch-{sensor_key}",
+        "seed_value": "100",
+        "seed_effective_from": "2026-07-01T00:00:00+08:00",
+        "backfill_from": "2026-07-01T00:00:00+08:00",
+        "latest_total": "100",
+        "source_backfill_status": status,
+        "accepted": [],
+        "pending": [],
+    }
 
 
 def _assert_sensitive_values_absent(value: Any) -> None:

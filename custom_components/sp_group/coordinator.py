@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -38,6 +39,17 @@ _DISCOVERY_UPDATE_FAILED = "Error refreshing SP Group discovery data"
 _LEDGER_UPDATE_FAILED = "Error refreshing SP Group accumulation ledger"
 _UTILITY_UPDATE_FAILED = "Error refreshing SP Group utility evidence"
 _TIMEOUT_UPDATE_FAILED = "Timed out refreshing SP Group data"
+_ELECTRICITY_NORMAL_POLL_OVERLAP = timedelta(hours=2)
+_MAX_AMI_WINDOW_DAYS = 31
+
+
+@dataclass(frozen=True, slots=True)
+class SpGroupUtilityPollResult:
+    """Summary of one utility poll."""
+
+    request_count: int = 0
+    source_keys: frozenset[str] = frozenset()
+    accepted_delta: int = 0
 
 
 class SpGroupDiscoveryCoordinator(DataUpdateCoordinator[SpGroupCoordinatorData]):
@@ -123,9 +135,10 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
 
     async def _async_update_data(self) -> None:
         """Refresh this utility's ledger-backed source."""
+        LOGGER.info("SP Group %s poll started: mode=normal", self.utility_type)
         try:
             async with asyncio.timeout(DEFAULT_UPDATE_TIMEOUT_SECONDS):
-                await self._async_poll_sources(backfill=False)
+                result = await self._async_poll_sources(backfill=False)
         except ConfigEntryAuthFailed:
             raise
         except TimeoutError as err:
@@ -134,17 +147,25 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
             raise UpdateFailed(_LEDGER_UPDATE_FAILED) from err
         except SpGroupMobileError as err:
             raise UpdateFailed(_UTILITY_UPDATE_FAILED) from err
+        if result.accepted_delta > 0:
+            self._schedule_statistics_retry()
         return None
 
-    async def async_poll_now(self, *, backfill: bool = False) -> None:
+    async def async_poll_now(
+        self,
+        *,
+        backfill: bool = False,
+    ) -> SpGroupUtilityPollResult:
         """Run one immediate utility poll and notify listeners.
 
         This intentionally bypasses the coordinator request-refresh debouncer for
         controlled backfill paths that need consecutive sightings.
         """
+        mode = "backfill" if backfill else "manual"
+        LOGGER.info("SP Group %s poll started: mode=%s", self.utility_type, mode)
         try:
             async with asyncio.timeout(DEFAULT_UPDATE_TIMEOUT_SECONDS):
-                await self._async_poll_sources(backfill=backfill)
+                result = await self._async_poll_sources(backfill=backfill)
         except ConfigEntryAuthFailed:
             raise
         except TimeoutError as err:
@@ -154,15 +175,28 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
         except SpGroupMobileError as err:
             raise UpdateFailed(_UTILITY_UPDATE_FAILED) from err
         self.async_set_updated_data(None)
+        if result.accepted_delta > 0:
+            self._schedule_statistics_retry()
+        return result
 
-    async def _async_poll_sources(self, *, backfill: bool) -> int:
+    async def _async_poll_sources(self, *, backfill: bool) -> SpGroupUtilityPollResult:
         """Poll enabled source configs for this utility and return request count."""
         runtime = self.entry.runtime_data
         if runtime.ledger_store is None:
-            return 0
+            LOGGER.debug(
+                "SP Group %s poll skipped: mode=%s reason=no_ledger_store",
+                self.utility_type,
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult()
         data = _discovery_data(self.entry)
         if data is None:
-            return 0
+            LOGGER.debug(
+                "SP Group %s poll skipped: mode=%s reason=no_discovery_data",
+                self.utility_type,
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult()
         source_configs = _source_configs_for_utility(
             data,
             self.entry.options,
@@ -171,47 +205,125 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
         )
         await runtime.ledger_store.async_initialize_sources(source_configs)
         if not source_configs:
-            return 0
+            LOGGER.debug(
+                "SP Group %s poll skipped: mode=%s reason=no_sources",
+                self.utility_type,
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult()
 
         session = await async_refresh_runtime_session_if_needed(self.hass, self.entry)
         premise_by_key = {premise.key: premise for premise in data.premises}
         now = datetime.now(SINGAPORE_TZ)
+        mode = "backfill" if backfill else "normal"
         request_count = 0
+        observation_count = 0
+        accepted_before = _accepted_count(self.entry, self.utility_type)
+        pending_before = _pending_count(self.entry, self.utility_type)
+        polled_keys: set[str] = set()
+        LOGGER.debug(
+            "SP Group %s poll source phase started: mode=%s source_count=%d",
+            self.utility_type,
+            mode,
+            len(source_configs),
+        )
         for sensor_key, config in source_configs.items():
             premise = premise_by_key.get(config.premise_key)
             if premise is None or premise.jarvis_premise_id is None:
+                LOGGER.debug(
+                    "SP Group %s poll source skipped: mode=%s reason=no_premise",
+                    self.utility_type,
+                    mode,
+                )
                 continue
-            request_start = (
-                config.backfill_from if backfill else config.seed_effective_from
+            request_start = self._request_start(
+                sensor_key,
+                config,
+                backfill=backfill,
             )
-            payload = await runtime.jarvis_client.get_ami_charts(
-                session,
-                premise.jarvis_premise_id,
-                _date_for_api(request_start),
-                _date_for_api(now),
-                self.grouped_by,
-                self.api_utility_type,
+            windows = _ami_request_windows(request_start, now)
+            LOGGER.debug(
+                "SP Group %s poll request windows prepared: mode=%s "
+                "window_count=%d start=%s end=%s",
+                self.utility_type,
+                mode,
+                len(windows),
+                request_start.isoformat(),
+                now.isoformat(),
             )
-            request_count += 1
-            observations = self._observations(
-                payload,
-                backfill_from=request_start,
-                now=now,
-            )
+            observations: list[SpGroupBucketObservation] = []
+            for window_start, window_end in windows:
+                payload = await runtime.jarvis_client.get_ami_charts(
+                    session,
+                    premise.jarvis_premise_id,
+                    _date_for_api(window_start),
+                    _date_for_api(window_end),
+                    self.grouped_by,
+                    self.api_utility_type,
+                )
+                request_count += 1
+                observations.extend(
+                    self._observations(
+                        payload,
+                        backfill_from=request_start,
+                        now=now,
+                    )
+                )
+            observation_count += len(observations)
             await runtime.ledger_store.async_apply_observations(
                 sensor_key,
-                observations,
+                tuple(observations),
                 now=now,
                 require_two_sightings=self.require_two_sightings,
             )
-        LOGGER.debug(
-            "SP Group %s ledger source phase completed: request_count=%s "
-            "source_count=%s",
+            polled_keys.add(sensor_key)
+        accepted_after = _accepted_count(self.entry, self.utility_type)
+        pending_after = _pending_count(self.entry, self.utility_type)
+        LOGGER.info(
+            "SP Group %s poll completed: mode=%s request_count=%d "
+            "source_count=%d polled_count=%d observation_count=%d "
+            "accepted_delta=%d pending_delta=%d",
             self.utility_type,
+            mode,
             request_count,
             len(source_configs),
+            len(polled_keys),
+            observation_count,
+            max(0, accepted_after - accepted_before),
+            pending_after - pending_before,
         )
-        return request_count
+        return SpGroupUtilityPollResult(
+            request_count=request_count,
+            source_keys=frozenset(polled_keys),
+            accepted_delta=max(0, accepted_after - accepted_before),
+        )
+
+    def _request_start(
+        self,
+        sensor_key: str,
+        config: SpGroupSourceConfig,
+        *,
+        backfill: bool,
+    ) -> datetime:
+        """Return the request start for this source."""
+        del sensor_key
+        return config.backfill_from if backfill else config.seed_effective_from
+
+    def _schedule_statistics_retry(self) -> None:
+        """Schedule a statistics-only retry after accepted source buckets."""
+        from .backfill import async_schedule_statistics_backfill
+
+        status = async_schedule_statistics_backfill(
+            self.hass,
+            self.entry,
+            name="sp_group_poll_statistics_backfill",
+            force=True,
+        )
+        LOGGER.info(
+            "SP Group %s poll statistics retry requested: status=%s",
+            self.utility_type,
+            status.value,
+        )
 
     def _observations(
         self,
@@ -239,9 +351,7 @@ class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
             hass,
             entry,
             name=f"{DOMAIN}_electricity",
-            update_interval=timedelta(
-                hours=options.electricity_poll_interval_hours
-            ),
+            update_interval=options.electricity_poll_interval,
         )
 
     def _observations(
@@ -256,6 +366,24 @@ class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
             backfill_from=backfill_from,
             now=now,
         )
+
+    def _request_start(
+        self,
+        sensor_key: str,
+        config: SpGroupSourceConfig,
+        *,
+        backfill: bool,
+    ) -> datetime:
+        """Return AMI polling start from backfill anchor or ledger cursor."""
+        if backfill:
+            return config.backfill_from
+        ledger_store = self.entry.runtime_data.ledger_store
+        if ledger_store is None:
+            return config.seed_effective_from
+        entry = ledger_store.snapshot.entries.get(sensor_key)
+        if entry is None:
+            return config.seed_effective_from
+        return entry.source_poll_cursor_start(overlap=_ELECTRICITY_NORMAL_POLL_OVERLAP)
 
 
 class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
@@ -274,6 +402,7 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
             update_interval=None,
         )
         self._unsub_timer: CALLBACK_TYPE | None = None
+        self._startup_catchup_task: asyncio.Task[None] | None = None
         self._last_accepted_count = 0
 
     @callback
@@ -281,6 +410,7 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
         """Start the water monthly schedule."""
         self.async_cancel_schedule()
         self._schedule_next(datetime.now(SINGAPORE_TZ))
+        self.async_start_startup_catchup()
 
     @callback
     def async_cancel_schedule(self) -> None:
@@ -288,16 +418,66 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
         if self._unsub_timer is not None:
             self._unsub_timer()
             self._unsub_timer = None
+            LOGGER.debug("SP Group water schedule cancelled")
+        if self._startup_catchup_task is not None:
+            if hasattr(self.entry.runtime_data, "backfill_tasks"):
+                self.entry.runtime_data.backfill_tasks.discard(
+                    self._startup_catchup_task
+                )
+            self._startup_catchup_task.cancel()
+            self._startup_catchup_task = None
+            LOGGER.debug("SP Group water startup catch-up cancelled")
+
+    @callback
+    def async_start_startup_catchup(self) -> None:
+        """Schedule a one-shot water catch-up if the monthly window was missed."""
+        if (
+            self._startup_catchup_task is not None
+            and not self._startup_catchup_task.done()
+        ):
+            LOGGER.debug("SP Group water startup catch-up skipped: already_running")
+            return
+        now = datetime.now(SINGAPORE_TZ)
+        if not _water_startup_catchup_needed(self.entry, now):
+            try:
+                reason = _water_startup_catchup_reason(self.entry, now)
+            except AttributeError:
+                reason = "not_needed"
+            LOGGER.debug("SP Group water startup catch-up skipped: reason=%s", reason)
+            return
+        self._startup_catchup_task = self.hass.async_create_task(
+            self._async_startup_catchup(),
+            name="sp_group_water_startup_catchup",
+        )
+        LOGGER.info("SP Group water startup catch-up scheduled")
+        if hasattr(self.entry.runtime_data, "backfill_tasks"):
+            self.entry.runtime_data.backfill_tasks.add(self._startup_catchup_task)
+            self._startup_catchup_task.add_done_callback(
+                self.entry.runtime_data.backfill_tasks.discard
+            )
+
+    async def _async_startup_catchup(self) -> None:
+        """Run one coordinator refresh for missed water monthly data."""
+        try:
+            LOGGER.info("SP Group water startup catch-up started")
+            await self.async_request_refresh()
+        finally:
+            self._startup_catchup_task = None
+            LOGGER.info("SP Group water startup catch-up completed")
 
     def _schedule_next(self, now: datetime) -> None:
         next_run = next_water_run(now, self.entry.options)
+        LOGGER.info(
+            "SP Group water next scheduled poll: run_at=%s",
+            next_run.isoformat(),
+        )
         self._unsub_timer = async_track_point_in_time(
             self.hass,
             self._async_scheduled_refresh,
             next_run,
         )
 
-    async def _async_poll_sources(self, *, backfill: bool) -> int:
+    async def _async_poll_sources(self, *, backfill: bool) -> SpGroupUtilityPollResult:
         """Poll water sources via GET /jarvis/v4/charts/{premise_id}.
 
         Water is not a smart meter so AMI endpoints return invalid kWh data.
@@ -305,10 +485,18 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
         """
         runtime = self.entry.runtime_data
         if runtime.ledger_store is None:
-            return 0
+            LOGGER.debug(
+                "SP Group water poll skipped: mode=%s reason=no_ledger_store",
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult()
         data = _discovery_data(self.entry)
         if data is None:
-            return 0
+            LOGGER.debug(
+                "SP Group water poll skipped: mode=%s reason=no_discovery_data",
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult()
         source_configs = _source_configs_for_utility(
             data,
             self.entry.options,
@@ -317,18 +505,42 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
         )
         await runtime.ledger_store.async_initialize_sources(source_configs)
         if not source_configs:
-            return 0
+            LOGGER.debug(
+                "SP Group water poll skipped: mode=%s reason=no_sources",
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult()
 
         session = await async_refresh_runtime_session_if_needed(self.hass, self.entry)
         premise_by_key = {premise.key: premise for premise in data.premises}
         now = datetime.now(SINGAPORE_TZ)
+        mode = "backfill" if backfill else "normal"
         request_count = 0
+        observation_count = 0
+        accepted_before = _accepted_count(self.entry, self.utility_type)
+        pending_before = _pending_count(self.entry, self.utility_type)
+        polled_keys: set[str] = set()
+        LOGGER.debug(
+            "SP Group water poll source phase started: mode=%s source_count=%d",
+            mode,
+            len(source_configs),
+        )
         for sensor_key, config in source_configs.items():
             premise = premise_by_key.get(config.premise_key)
             if premise is None or premise.jarvis_premise_id is None:
+                LOGGER.debug(
+                    "SP Group water poll source skipped: mode=%s reason=no_premise",
+                    mode,
+                )
                 continue
             request_start = (
                 config.backfill_from if backfill else config.seed_effective_from
+            )
+            LOGGER.debug(
+                "SP Group water poll request prepared: mode=%s start=%s end=%s",
+                mode,
+                request_start.isoformat(),
+                now.isoformat(),
             )
             payload = await runtime.jarvis_client.get_history_charts(
                 session,
@@ -340,20 +552,34 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
                 backfill_from=request_start,
                 now=now,
             )
+            observation_count += len(observations)
             await runtime.ledger_store.async_apply_observations(
                 sensor_key,
                 observations,
                 now=now,
                 require_two_sightings=self.require_two_sightings,
             )
-        LOGGER.debug(
-            "SP Group %s ledger source phase completed: request_count=%s "
-            "source_count=%s",
+            polled_keys.add(sensor_key)
+        accepted_after = _accepted_count(self.entry, self.utility_type)
+        pending_after = _pending_count(self.entry, self.utility_type)
+        LOGGER.info(
+            "SP Group %s poll completed: mode=%s request_count=%d "
+            "source_count=%d polled_count=%d observation_count=%d "
+            "accepted_delta=%d pending_delta=%d",
             self.utility_type,
+            mode,
             request_count,
             len(source_configs),
+            len(polled_keys),
+            observation_count,
+            max(0, accepted_after - accepted_before),
+            pending_after - pending_before,
         )
-        return request_count
+        return SpGroupUtilityPollResult(
+            request_count=request_count,
+            source_keys=frozenset(polled_keys),
+            accepted_delta=max(0, accepted_after - accepted_before),
+        )
 
     async def _async_scheduled_refresh(self, now: datetime) -> None:
         before = _accepted_count(self.entry, self.utility_type)
@@ -363,12 +589,22 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
         local_now = now.astimezone(SINGAPORE_TZ)
         if after <= before and local_now.day < 7:
             retry_at = _next_day_at_configured_time(local_now, self.entry.options)
+            LOGGER.info(
+                "SP Group water scheduled poll retry queued: accepted_delta=%d "
+                "retry_at=%s",
+                max(0, after - before),
+                retry_at.isoformat(),
+            )
             self._unsub_timer = async_track_point_in_time(
                 self.hass,
                 self._async_scheduled_refresh,
                 retry_at,
             )
             return
+        LOGGER.debug(
+            "SP Group water scheduled poll completed: accepted_delta=%d",
+            max(0, after - before),
+        )
         self._schedule_next(local_now + timedelta(days=1))
 
 # Compatibility import for tests/modules that still refer to the old name.
@@ -392,6 +628,115 @@ def next_water_run(now: datetime, options: Mapping[str, Any]) -> datetime:
     return configured
 
 
+def _ami_request_windows(
+    start: datetime,
+    end: datetime,
+) -> tuple[tuple[datetime, datetime], ...]:
+    """Return bounded AMI request windows covering start through end."""
+    local_start = start.astimezone(SINGAPORE_TZ)
+    local_end = end.astimezone(SINGAPORE_TZ)
+    if local_start >= local_end:
+        return ()
+    windows: list[tuple[datetime, datetime]] = []
+    cursor = local_start
+    while cursor < local_end:
+        window_end = min(cursor + timedelta(days=_MAX_AMI_WINDOW_DAYS), local_end)
+        windows.append((cursor, window_end))
+        cursor = window_end
+    return tuple(windows)
+
+
+def _water_startup_catchup_needed(
+    entry: SpGroupConfigEntry,
+    now: datetime,
+) -> bool:
+    """Return whether a one-shot water catch-up should run after startup."""
+    return _water_startup_catchup_reason(entry, now) == "needed"
+
+
+def _water_startup_catchup_reason(
+    entry: SpGroupConfigEntry,
+    now: datetime,
+) -> str:
+    """Return a sanitized reason for water startup catch-up scheduling."""
+    data = _discovery_data(entry)
+    if data is None:
+        return "no_discovery_data"
+    source_configs = _source_configs_for_utility(
+        data,
+        entry.options,
+        source=SOURCE_MANUAL_SEED_MONTHLY,
+        utility_type="water",
+    )
+    if not source_configs:
+        return "no_sources"
+    local_now = now.astimezone(SINGAPORE_TZ)
+    options = polling_options(entry.options)
+    configured_this_month = datetime.combine(
+        local_now.date().replace(day=min(options.water_poll_day, 28)),
+        options.water_poll_time,
+        tzinfo=SINGAPORE_TZ,
+    )
+    if local_now < configured_this_month:
+        return "before_configured_time"
+    ledger_store = entry.runtime_data.ledger_store
+    if ledger_store is None or ledger_store.snapshot.malformed:
+        return "ledger_unavailable"
+    latest_closed_month_start = _latest_ready_month_start(local_now)
+    if latest_closed_month_start is None:
+        return "no_ready_month"
+    for sensor_key in source_configs:
+        ledger_entry = ledger_store.snapshot.entries.get(sensor_key)
+        if ledger_entry is None:
+            return "needed"
+        accepted_months = {
+            bucket.start.astimezone(SINGAPORE_TZ).replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            for bucket in ledger_entry.accepted
+        }
+        if (
+            latest_closed_month_start >= ledger_entry.seed_effective_from.replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            and latest_closed_month_start not in accepted_months
+        ):
+            return "needed"
+    return "already_current"
+
+
+def _latest_ready_month_start(now: datetime) -> datetime | None:
+    """Return the latest closed monthly bucket that passed the water grace period."""
+    local = now.astimezone(SINGAPORE_TZ)
+    current_month = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    previous_month = _previous_month(current_month)
+    if closed_month_ready(current_month, local):
+        return previous_month
+    older_month = _previous_month(previous_month)
+    return older_month if closed_month_ready(previous_month, local) else None
+
+
+def _previous_month(value: datetime) -> datetime:
+    local = value.astimezone(SINGAPORE_TZ).replace(
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if local.month == 1:
+        return local.replace(year=local.year - 1, month=12)
+    return local.replace(month=local.month - 1)
+
+
 def _next_day_at_configured_time(
     now: datetime,
     options: Mapping[str, Any],
@@ -406,7 +751,7 @@ def _next_day_at_configured_time(
 
 def _discovery_data(entry: SpGroupConfigEntry) -> SpGroupCoordinatorData | None:
     coordinator = entry.runtime_data.discovery_coordinator
-    return None if coordinator is None else coordinator.data
+    return None if coordinator is None else getattr(coordinator, "data", None)
 
 
 def _source_configs_for_utility(
@@ -429,6 +774,17 @@ def _accepted_count(entry: SpGroupConfigEntry, utility_type: str) -> int:
         return 0
     return sum(
         len(ledger_entry.accepted)
+        for ledger_entry in ledger_store.snapshot.entries.values()
+        if ledger_entry.utility_type == utility_type
+    )
+
+
+def _pending_count(entry: SpGroupConfigEntry, utility_type: str) -> int:
+    ledger_store = entry.runtime_data.ledger_store
+    if ledger_store is None:
+        return 0
+    return sum(
+        len(ledger_entry.pending)
         for ledger_entry in ledger_store.snapshot.entries.values()
         if ledger_entry.utility_type == utility_type
     )
@@ -636,7 +992,8 @@ def _ami_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         for j, row in enumerate(data):
             if not isinstance(row, dict):
                 LOGGER.warning(
-                    "SP Group %s: history[%d].data[%d] is %s, expected dict — skipping row",
+                    "SP Group %s: history[%d].data[%d] is %s, expected dict; "
+                    "skipping row",
                     _data_path,
                     i,
                     j,
@@ -654,7 +1011,8 @@ def _ami_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
             value = row.get("consumption", row.get("amount"))
             if value is None:
                 LOGGER.warning(
-                    "SP Group %s: history[%d].data[%d] has no 'consumption' or 'amount' — skipping row",
+                    "SP Group %s: history[%d].data[%d] has no 'consumption' "
+                    "or 'amount'; skipping row",
                     _data_path,
                     i,
                     j,
@@ -767,6 +1125,7 @@ __all__ = [
     "SpGroupDiscoveryCoordinator",
     "SpGroupElectricityCoordinator",
     "SpGroupUtilityCoordinator",
+    "SpGroupUtilityPollResult",
     "SpGroupWaterCoordinator",
     "next_water_run",
 ]

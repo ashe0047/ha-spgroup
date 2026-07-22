@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -9,12 +10,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from spgroup.mobile import MobileAuthClient, MobileSession, SpGroupAuthError
 
-from .const import CONF_ACCOUNT_ID, CONF_SESSION
+from .const import CONF_ACCOUNT_ID, CONF_SESSION, STORAGE_VERSION
 
 if TYPE_CHECKING:
     from . import SpGroupConfigEntry
+
+LOGGER = logging.getLogger(__name__)
 
 
 def mobile_session_from_entry(entry: ConfigEntry[Any]) -> MobileSession:
@@ -46,7 +50,34 @@ async def async_refresh_session_if_needed(
         entry,
         session=current_session,
         client=auth_client,
+        persist=True,
     )
+
+
+async def async_load_session(
+    hass: HomeAssistant,
+    entry: ConfigEntry[Any],
+) -> tuple[MobileSession, Store[dict[str, Any]]]:
+    """Load the runtime session from Store, migrating legacy entry data."""
+    store: Store[dict[str, Any]] = Store(
+        hass,
+        STORAGE_VERSION,
+        f"sp_group.session.{entry.entry_id}",
+    )
+    store_data = await store.async_load()
+    if isinstance(store_data, dict):
+        try:
+            return MobileSession.from_dict(store_data), store
+        except (KeyError, TypeError, ValueError):
+            LOGGER.warning(
+                "SP Group session Store is invalid; falling back to config entry data"
+            )
+
+    session = mobile_session_from_entry(entry)
+    if store_data is None:
+        await store.async_save(session.to_dict())
+        LOGGER.info("SP Group session migrated from config entry to HA Store")
+    return session, store
 
 
 async def async_refresh_runtime_session_if_needed(
@@ -55,6 +86,7 @@ async def async_refresh_runtime_session_if_needed(
 ) -> MobileSession:
     """Refresh and persist the runtime mobile session before API polling."""
     async with entry.runtime_data.refresh_lock:
+        original_token = entry.runtime_data.session.access_token
         refreshed = await _async_refresh_session_core(
             hass,
             entry,
@@ -66,7 +98,10 @@ async def async_refresh_runtime_session_if_needed(
             ),
         )
         entry.runtime_data.session = refreshed
-        return refreshed
+    # Persist outside the refresh lock — only if session was actually refreshed
+    if refreshed.access_token != original_token:
+        await async_persist_session(hass, entry, refreshed)
+    return refreshed
 
 
 async def _async_refresh_session_core(
@@ -76,8 +111,9 @@ async def _async_refresh_session_core(
     session: MobileSession,
     client: MobileAuthClient,
     on_refreshed: Callable[[MobileSession], Awaitable[None] | None] | None = None,
+    persist: bool = False,
 ) -> MobileSession:
-    """Shared refresh and persistence path."""
+    """Shared refresh path."""
     if not session.expired:
         return session
 
@@ -92,23 +128,40 @@ async def _async_refresh_session_core(
     if not _is_usable_refreshed_session(refreshed):
         raise ConfigEntryAuthFailed("SP Group session refresh returned unusable tokens")
 
-    account_id = entry.data.get(CONF_ACCOUNT_ID)
-    if refreshed.identity_metadata is not None:
-        account_id = refreshed.identity_metadata.subject
+    if persist:
+        account_id = entry.data.get(CONF_ACCOUNT_ID)
+        if refreshed.identity_metadata is not None:
+            account_id = refreshed.identity_metadata.subject
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_ACCOUNT_ID: account_id,
+                CONF_SESSION: refreshed.to_dict(),
+            },
+        )
 
-    hass.config_entries.async_update_entry(
-        entry,
-        data={
-            **entry.data,
-            CONF_ACCOUNT_ID: account_id,
-            CONF_SESSION: refreshed.to_dict(),
-        },
-    )
     if on_refreshed is not None:
         result = on_refreshed(refreshed)
         if result is not None:
             await result
     return refreshed
+
+async def async_persist_session(
+    hass: HomeAssistant,
+    entry: SpGroupConfigEntry,
+    session: MobileSession,
+) -> None:
+    """Persist a refreshed session to the HA Store for restart durability."""
+    store = getattr(entry.runtime_data, "session_store", None)
+    if store is None:
+        try:
+            store = Store(hass, STORAGE_VERSION, f"sp_group.session.{entry.entry_id}")
+            entry.runtime_data.session_store = store
+        except (AttributeError, KeyError):
+            # Store not available (e.g., test context without full HA infra)
+            return
+    await store.async_save(session.to_dict())
 
 
 def _is_usable_refreshed_session(session: MobileSession) -> bool:

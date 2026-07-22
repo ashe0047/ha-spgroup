@@ -18,9 +18,25 @@ from .sources import SINGAPORE_TZ, SpGroupSourceConfig
 _STORE_VERSION = 1
 _STORE_MINOR_VERSION = 1
 _WATER_GRACE_DAYS = 3
+STATISTICS_STRATEGY_NATIVE_ANCHORED_V1 = "native_anchored_v1"
+STATISTICS_STRATEGY_NATIVE_OFFSET_V2 = "native_offset_v2"
 WARNING_REPAIR_REBUILT_MALFORMED_LEDGER = "repair_rebuilt_malformed_ledger"
 WARNING_USER_REBUILT_LEDGER = "user_rebuilt_ledger"
 WARNING_LEGACY_BACKFILL_FROM_DEFAULTED = "legacy_backfill_from_defaulted"
+WARNING_LEGACY_STATISTICS_STRATEGY_MIGRATED = "legacy_statistics_strategy_migrated"
+SOURCE_BACKFILL_NEVER_ATTEMPTED = "never_attempted"
+SOURCE_BACKFILL_RUNNING = "running"
+SOURCE_BACKFILL_SUCCEEDED = "succeeded"
+SOURCE_BACKFILL_FAILED = "failed"
+SOURCE_BACKFILL_STATUSES = frozenset(
+    {
+        SOURCE_BACKFILL_NEVER_ATTEMPTED,
+        SOURCE_BACKFILL_RUNNING,
+        SOURCE_BACKFILL_SUCCEEDED,
+        SOURCE_BACKFILL_FAILED,
+    }
+)
+WARNING_SOURCE_BACKFILL_INTERRUPTED = "source_backfill_interrupted"
 
 
 class LedgerError(ValueError):
@@ -116,7 +132,16 @@ class SpGroupLedgerEntry:
     accepted: tuple[SpGroupAcceptedBucket, ...] = field(default_factory=tuple)
     pending: tuple[SpGroupPendingBucket, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    source_backfill_attempted_at: datetime | None = None
+    source_backfill_status: str = SOURCE_BACKFILL_NEVER_ATTEMPTED
+    source_backfill_started_at: datetime | None = None
+    source_backfill_succeeded_at: datetime | None = None
+    source_backfill_failed_at: datetime | None = None
+    last_source_poll_succeeded_at: datetime | None = None
     statistics_imported_through: datetime | None = None
+    statistics_reference_start: datetime | None = None
+    statistics_reference_sum_offset: Decimal | None = None
+    statistics_strategy_version: str | None = None
     statistics_warnings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -143,11 +168,48 @@ class SpGroupLedgerEntry:
             "accepted": [bucket.to_dict() for bucket in self.accepted],
             "pending": [bucket.to_dict() for bucket in self.pending],
             "warnings": list(self.warnings),
+            "source_backfill_attempted_at": (
+                self.source_backfill_attempted_at.isoformat()
+                if self.source_backfill_attempted_at is not None
+                else None
+            ),
+            "source_backfill_status": self.source_backfill_status,
+            "source_backfill_started_at": (
+                self.source_backfill_started_at.isoformat()
+                if self.source_backfill_started_at is not None
+                else None
+            ),
+            "source_backfill_succeeded_at": (
+                self.source_backfill_succeeded_at.isoformat()
+                if self.source_backfill_succeeded_at is not None
+                else None
+            ),
+            "source_backfill_failed_at": (
+                self.source_backfill_failed_at.isoformat()
+                if self.source_backfill_failed_at is not None
+                else None
+            ),
+            "last_source_poll_succeeded_at": (
+                self.last_source_poll_succeeded_at.isoformat()
+                if self.last_source_poll_succeeded_at is not None
+                else None
+            ),
             "statistics_imported_through": (
                 self.statistics_imported_through.isoformat()
                 if self.statistics_imported_through is not None
                 else None
             ),
+            "statistics_reference_start": (
+                self.statistics_reference_start.isoformat()
+                if self.statistics_reference_start is not None
+                else None
+            ),
+            "statistics_reference_sum_offset": (
+                str(self.statistics_reference_sum_offset)
+                if self.statistics_reference_sum_offset is not None
+                else None
+            ),
+            "statistics_strategy_version": self.statistics_strategy_version,
             "statistics_warnings": list(self.statistics_warnings),
         }
 
@@ -156,10 +218,69 @@ class SpGroupLedgerEntry:
         """Deserialize a ledger entry."""
         accepted = payload.get("accepted", [])
         pending = payload.get("pending", [])
+        accepted_tuple = tuple(
+            SpGroupAcceptedBucket.from_dict(bucket)
+            for bucket in accepted
+            if isinstance(bucket, dict)
+        )
+        pending_tuple = tuple(
+            SpGroupPendingBucket.from_dict(bucket)
+            for bucket in pending
+            if isinstance(bucket, dict)
+        )
         latest_accepted = payload.get("latest_accepted_at")
+        source_backfill_attempted = payload.get("source_backfill_attempted_at")
         seed_effective_from = _parse_datetime(
             _required_string(payload, "seed_effective_from")
         )
+        statistics_imported_through = (
+            _parse_datetime(statistics_imported_through_value)
+            if isinstance(
+                statistics_imported_through_value := payload.get(
+                    "statistics_imported_through"
+                ),
+                str,
+            )
+            else None
+        )
+        statistics_reference_start = (
+            _parse_datetime(statistics_reference_start_value)
+            if isinstance(
+                statistics_reference_start_value := payload.get(
+                    "statistics_reference_start"
+                ),
+                str,
+            )
+            else None
+        )
+        statistics_reference_sum_offset = (
+            _parse_decimal(statistics_reference_sum_offset_value)
+            if isinstance(
+                statistics_reference_sum_offset_value := payload.get(
+                    "statistics_reference_sum_offset"
+                ),
+                str,
+            )
+            else None
+        )
+        statistics_strategy_version = payload.get("statistics_strategy_version")
+        raw_statistics_warnings = tuple(
+            warning
+            for warning in payload.get("statistics_warnings", [])
+            if isinstance(warning, str)
+        )
+        if (
+            statistics_imported_through is not None
+            and statistics_strategy_version != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+        ):
+            raw_statistics_warnings = tuple(
+                dict.fromkeys(
+                    (
+                        *raw_statistics_warnings,
+                        WARNING_LEGACY_STATISTICS_STRATEGY_MIGRATED,
+                    )
+                )
+            )
         raw_warnings = tuple(
             warning
             for warning in payload.get("warnings", [])
@@ -175,6 +296,38 @@ class SpGroupLedgerEntry:
                     (*raw_warnings, WARNING_LEGACY_BACKFILL_FROM_DEFAULTED)
                 )
             )
+        source_backfill_status = payload.get("source_backfill_status")
+        if source_backfill_status not in SOURCE_BACKFILL_STATUSES:
+            source_backfill_status = (
+                SOURCE_BACKFILL_SUCCEEDED
+                if (
+                    isinstance(source_backfill_attempted, str)
+                    and (accepted_tuple or statistics_imported_through is not None)
+                )
+                else SOURCE_BACKFILL_NEVER_ATTEMPTED
+            )
+        source_backfill_started_at = _optional_datetime(
+            payload.get("source_backfill_started_at")
+        )
+        source_backfill_succeeded_at = _optional_datetime(
+            payload.get("source_backfill_succeeded_at")
+        )
+        source_backfill_failed_at = _optional_datetime(
+            payload.get("source_backfill_failed_at")
+        )
+        last_source_poll_succeeded_at = _optional_datetime(
+            payload.get("last_source_poll_succeeded_at")
+        )
+        legacy_attempted_at = _optional_datetime(source_backfill_attempted)
+        if source_backfill_status == SOURCE_BACKFILL_SUCCEEDED:
+            source_backfill_succeeded_at = (
+                source_backfill_succeeded_at
+                or legacy_attempted_at
+                or statistics_imported_through
+            )
+            last_source_poll_succeeded_at = (
+                last_source_poll_succeeded_at or source_backfill_succeeded_at
+            )
         return cls(
             sensor_key=_required_string(payload, "sensor_key"),
             source=_required_string(payload, "source"),
@@ -189,33 +342,41 @@ class SpGroupLedgerEntry:
                 if isinstance(latest_accepted, str)
                 else None
             ),
-            accepted=tuple(
-                SpGroupAcceptedBucket.from_dict(bucket)
-                for bucket in accepted
-                if isinstance(bucket, dict)
-            ),
-            pending=tuple(
-                SpGroupPendingBucket.from_dict(bucket)
-                for bucket in pending
-                if isinstance(bucket, dict)
-            ),
+            accepted=accepted_tuple,
+            pending=pending_tuple,
             warnings=warnings,
+            source_backfill_attempted_at=(
+                legacy_attempted_at
+                or source_backfill_succeeded_at
+                or statistics_imported_through
+            ),
+            source_backfill_status=source_backfill_status,
+            source_backfill_started_at=source_backfill_started_at,
+            source_backfill_succeeded_at=source_backfill_succeeded_at,
+            source_backfill_failed_at=source_backfill_failed_at,
+            last_source_poll_succeeded_at=last_source_poll_succeeded_at,
             statistics_imported_through=(
-                _parse_datetime(statistics_imported_through)
-                if isinstance(
-                    statistics_imported_through := payload.get(
-                        "statistics_imported_through"
-                    ),
-                    str,
-                )
+                statistics_imported_through
+            ),
+            statistics_reference_start=statistics_reference_start,
+            statistics_reference_sum_offset=statistics_reference_sum_offset,
+            statistics_strategy_version=(
+                statistics_strategy_version
+                if isinstance(statistics_strategy_version, str)
                 else None
             ),
-            statistics_warnings=tuple(
-                warning
-                for warning in payload.get("statistics_warnings", [])
-                if isinstance(warning, str)
-            ),
+            statistics_warnings=raw_statistics_warnings,
         )
+
+    def source_poll_cursor_start(self, *, overlap: timedelta) -> datetime:
+        """Return the earliest normal poll start needed to catch up safely."""
+        pending_start = min((bucket.start for bucket in self.pending), default=None)
+        if pending_start is not None:
+            return max(self.seed_effective_from, pending_start - overlap)
+        accepted_end = max((bucket.end for bucket in self.accepted), default=None)
+        if accepted_end is not None:
+            return max(self.seed_effective_from, accepted_end - overlap)
+        return self.seed_effective_from
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,6 +558,9 @@ class SpGroupLedgerStore:
         sensor_key: str,
         *,
         imported_through: datetime | None = None,
+        reference_start: datetime | None = None,
+        reference_sum_offset: Decimal | None = None,
+        strategy_version: str | None = None,
         warnings: tuple[str, ...] = (),
     ) -> SpGroupLedgerSnapshot:
         """Update statistics import metadata for a ledger entry."""
@@ -404,9 +568,6 @@ class SpGroupLedgerStore:
             entry = self._snapshot.entries.get(sensor_key)
             if entry is None or self._snapshot.malformed:
                 return self._snapshot
-            merged_warnings = tuple(
-                dict.fromkeys((*entry.statistics_warnings, *warnings))
-            )
             updated = SpGroupLedgerEntry(
                 sensor_key=entry.sensor_key,
                 source=entry.source,
@@ -420,17 +581,186 @@ class SpGroupLedgerStore:
                 accepted=entry.accepted,
                 pending=entry.pending,
                 warnings=entry.warnings,
+                source_backfill_attempted_at=entry.source_backfill_attempted_at,
+                source_backfill_status=entry.source_backfill_status,
+                source_backfill_started_at=entry.source_backfill_started_at,
+                source_backfill_succeeded_at=entry.source_backfill_succeeded_at,
+                source_backfill_failed_at=entry.source_backfill_failed_at,
+                last_source_poll_succeeded_at=entry.last_source_poll_succeeded_at,
                 statistics_imported_through=(
                     imported_through
                     if imported_through is not None
                     else entry.statistics_imported_through
                 ),
-                statistics_warnings=merged_warnings,
+                statistics_reference_start=(
+                    reference_start
+                    if reference_start is not None
+                    else entry.statistics_reference_start
+                ),
+                statistics_reference_sum_offset=(
+                    reference_sum_offset
+                    if reference_sum_offset is not None
+                    else entry.statistics_reference_sum_offset
+                ),
+                statistics_strategy_version=(
+                    strategy_version
+                    if strategy_version is not None
+                    else entry.statistics_strategy_version
+                ),
+                statistics_warnings=tuple(dict.fromkeys(warnings)),
             )
             if updated == entry:
                 return self._snapshot
             entries = dict(self._snapshot.entries)
             entries[sensor_key] = updated
+            next_snapshot = SpGroupLedgerSnapshot(entries=entries)
+            await self._store.async_save(next_snapshot.to_dict())
+            self._snapshot = next_snapshot
+            return self._snapshot
+
+    async def async_mark_source_backfill_running(
+        self,
+        *,
+        sensor_keys: set[str],
+        started_at: datetime,
+    ) -> SpGroupLedgerSnapshot:
+        """Mark source backfill as running for selected entries."""
+        return await self._async_update_source_backfill_status(
+            sensor_keys,
+            SOURCE_BACKFILL_RUNNING,
+            timestamp=started_at,
+        )
+
+    async def async_mark_source_backfill_succeeded(
+        self,
+        *,
+        sensor_keys: set[str],
+        succeeded_at: datetime,
+    ) -> SpGroupLedgerSnapshot:
+        """Mark source backfill/poll success for selected entries."""
+        return await self._async_update_source_backfill_status(
+            sensor_keys,
+            SOURCE_BACKFILL_SUCCEEDED,
+            timestamp=succeeded_at,
+        )
+
+    async def async_mark_source_backfill_failed(
+        self,
+        *,
+        sensor_keys: set[str],
+        failed_at: datetime,
+        warning: str | None = None,
+    ) -> SpGroupLedgerSnapshot:
+        """Mark source backfill as failed for selected entries."""
+        return await self._async_update_source_backfill_status(
+            sensor_keys,
+            SOURCE_BACKFILL_FAILED,
+            timestamp=failed_at,
+            warning=warning,
+        )
+
+    async def async_mark_interrupted_source_backfills_failed(
+        self,
+        *,
+        failed_at: datetime,
+    ) -> SpGroupLedgerSnapshot:
+        """Convert persisted running backfills from a previous HA run to failed."""
+        sensor_keys = {
+            key
+            for key, entry in self._snapshot.entries.items()
+            if entry.source_backfill_status == SOURCE_BACKFILL_RUNNING
+        }
+        if not sensor_keys:
+            return self._snapshot
+        return await self.async_mark_source_backfill_failed(
+            sensor_keys=sensor_keys,
+            failed_at=failed_at,
+            warning=WARNING_SOURCE_BACKFILL_INTERRUPTED,
+        )
+
+    async def async_mark_source_backfill_attempted(
+        self,
+        *,
+        attempted_at: datetime,
+    ) -> SpGroupLedgerSnapshot:
+        """Legacy compatibility wrapper for marking source backfill succeeded."""
+        return await self.async_mark_source_backfill_succeeded(
+            sensor_keys=set(self._snapshot.entries),
+            succeeded_at=attempted_at,
+        )
+
+    async def _async_update_source_backfill_status(
+        self,
+        sensor_keys: set[str],
+        status: str,
+        *,
+        timestamp: datetime,
+        warning: str | None = None,
+    ) -> SpGroupLedgerSnapshot:
+        """Update source backfill status for selected entries."""
+        async with self._lock:
+            if self._snapshot.malformed:
+                return self._snapshot
+            entries: dict[str, SpGroupLedgerEntry] = {}
+            changed = False
+            for sensor_key, entry in self._snapshot.entries.items():
+                if sensor_key not in sensor_keys:
+                    entries[sensor_key] = entry
+                    continue
+                local_timestamp = timestamp.astimezone(SINGAPORE_TZ)
+                warnings = entry.warnings
+                if warning is not None and warning not in warnings:
+                    warnings = (*warnings, warning)
+                entries[sensor_key] = SpGroupLedgerEntry(
+                    sensor_key=entry.sensor_key,
+                    source=entry.source,
+                    utility_type=entry.utility_type,
+                    epoch_id=entry.epoch_id,
+                    seed_value=entry.seed_value,
+                    seed_effective_from=entry.seed_effective_from,
+                    backfill_from=entry.backfill_from,
+                    latest_total=entry.latest_total,
+                    latest_accepted_at=entry.latest_accepted_at,
+                    accepted=entry.accepted,
+                    pending=entry.pending,
+                    warnings=warnings,
+                    source_backfill_attempted_at=(
+                        local_timestamp
+                        if status == SOURCE_BACKFILL_SUCCEEDED
+                        else entry.source_backfill_attempted_at
+                    ),
+                    source_backfill_status=status,
+                    source_backfill_started_at=(
+                        local_timestamp
+                        if status == SOURCE_BACKFILL_RUNNING
+                        else entry.source_backfill_started_at
+                    ),
+                    source_backfill_succeeded_at=(
+                        local_timestamp
+                        if status == SOURCE_BACKFILL_SUCCEEDED
+                        else entry.source_backfill_succeeded_at
+                    ),
+                    source_backfill_failed_at=(
+                        local_timestamp
+                        if status == SOURCE_BACKFILL_FAILED
+                        else entry.source_backfill_failed_at
+                    ),
+                    last_source_poll_succeeded_at=(
+                        local_timestamp
+                        if status == SOURCE_BACKFILL_SUCCEEDED
+                        else entry.last_source_poll_succeeded_at
+                    ),
+                    statistics_imported_through=entry.statistics_imported_through,
+                    statistics_reference_start=entry.statistics_reference_start,
+                    statistics_reference_sum_offset=(
+                        entry.statistics_reference_sum_offset
+                    ),
+                    statistics_strategy_version=entry.statistics_strategy_version,
+                    statistics_warnings=entry.statistics_warnings,
+                )
+                changed = True
+            if not changed:
+                return self._snapshot
             next_snapshot = SpGroupLedgerSnapshot(entries=entries)
             await self._store.async_save(next_snapshot.to_dict())
             self._snapshot = next_snapshot
@@ -544,7 +874,16 @@ def _apply_observations_to_entry(
         accepted=tuple(sorted(accepted, key=lambda item: item.start)),
         pending=tuple(sorted(pending, key=lambda item: item.start)),
         warnings=tuple(warnings),
+        source_backfill_attempted_at=entry.source_backfill_attempted_at,
+        source_backfill_status=entry.source_backfill_status,
+        source_backfill_started_at=entry.source_backfill_started_at,
+        source_backfill_succeeded_at=entry.source_backfill_succeeded_at,
+        source_backfill_failed_at=entry.source_backfill_failed_at,
+        last_source_poll_succeeded_at=entry.last_source_poll_succeeded_at,
         statistics_imported_through=entry.statistics_imported_through,
+        statistics_reference_start=entry.statistics_reference_start,
+        statistics_reference_sum_offset=entry.statistics_reference_sum_offset,
+        statistics_strategy_version=entry.statistics_strategy_version,
         statistics_warnings=entry.statistics_warnings,
     )
     return updated if changed or updated.latest_total != entry.latest_total else entry
@@ -567,7 +906,16 @@ def _copy_entry_with_warnings(
         accepted=entry.accepted,
         pending=entry.pending,
         warnings=warnings,
+        source_backfill_attempted_at=entry.source_backfill_attempted_at,
+        source_backfill_status=entry.source_backfill_status,
+        source_backfill_started_at=entry.source_backfill_started_at,
+        source_backfill_succeeded_at=entry.source_backfill_succeeded_at,
+        source_backfill_failed_at=entry.source_backfill_failed_at,
+        last_source_poll_succeeded_at=entry.last_source_poll_succeeded_at,
         statistics_imported_through=entry.statistics_imported_through,
+        statistics_reference_start=entry.statistics_reference_start,
+        statistics_reference_sum_offset=entry.statistics_reference_sum_offset,
+        statistics_strategy_version=entry.statistics_strategy_version,
         statistics_warnings=entry.statistics_warnings,
     )
 
@@ -632,6 +980,12 @@ def _parse_datetime(value: str) -> datetime:
     return parsed.astimezone(SINGAPORE_TZ)
 
 
+def _optional_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return _parse_datetime(value)
+
+
 def _parse_decimal(value: str) -> Decimal:
     try:
         parsed = Decimal(value)
@@ -673,6 +1027,11 @@ __all__ = [
     "WARNING_REPAIR_REBUILT_MALFORMED_LEDGER",
     "WARNING_LEGACY_BACKFILL_FROM_DEFAULTED",
     "WARNING_USER_REBUILT_LEDGER",
+    "SOURCE_BACKFILL_FAILED",
+    "SOURCE_BACKFILL_NEVER_ATTEMPTED",
+    "SOURCE_BACKFILL_RUNNING",
+    "SOURCE_BACKFILL_SUCCEEDED",
+    "WARNING_SOURCE_BACKFILL_INTERRUPTED",
     "closed_month_ready",
     "historical_state_at",
 ]
