@@ -1882,3 +1882,1227 @@ requiring Python 3.14.2+.
 
 All 19 Python files (6013 lines) compile cleanly on Python 3.14.2. No deprecated
 HA APIs were in use.
+
+## 2026-07-19 21:35:15 +08 — Investigation: negative Energy Dashboard consumption after update
+
+Observed behavior under investigation: first-time setup/backfill produced correct
+SP Group Energy Dashboard graphs, but after a later data update the graph showed
+negative consumption again. The suspected trigger is an update/poll after
+backfill, but that is not yet confirmed.
+
+Investigation approach locked for this pass:
+
+- Inspect `.runtime/ha-config/home-assistant_v2.db` recorder/statistics rows
+  before changing code.
+- Compare statistics metadata, short-term/hourly statistics rows, and current
+  sensor states against the integration ledger store.
+- Determine whether the negative value is caused by a newly inserted Recorder row,
+  statistics import projection, unit/sum metadata, or HA's derived Energy
+  Dashboard aggregation.
+- Report root cause only after DB evidence supports it.
+
+Findings:
+
+- The active entity IDs are `sensor.electricity_consumption` and
+  `sensor.water_consumption`.
+- Imported hourly long-term statistics were correct after initial backfill:
+  electricity reached `sum=977.655` and water reached `sum=244.4`.
+- On `2026-07-19 13:47:39 +08`, HA Recorder inserted/compiled new rows after
+  the imported backfill range with `sum=0.0` for both sensors. This created the
+  exact negative deltas shown by the Energy Dashboard:
+  `977.655 -> 0.0` for electricity and `244.4 -> 0.0` for water at
+  `2026-07-18 19:00:00 +08`.
+- The ledger store remains sane: latest totals are still `1000.0`, accepted
+  bucket totals are `977.655` electricity and `244.4` water, pending buckets are
+  zero, and ledger/statistics warnings are empty.
+- Root cause: `async_import_statistics()` imports hourly long-term statistics,
+  but HA's normal sensor statistics compiler continues from
+  `statistics_short_term`. The SP Group sensors' short-term statistics rows all
+  have `sum=0.0`, so the first post-backfill HA-compiled hourly rows reset the
+  long-term `sum` to zero even though imported historical hourly rows used the
+  correct sum offset.
+
+Design direction recommended after grounding against HA docs/source:
+
+- Do not continue mixing SP Group imported historical statistics and HA-generated
+  entity statistics for the same `sensor.*` statistic ID.
+- HA docs/model: entity-derived statistics use `statistics_short_term` snapshots
+  and hourly `statistics`; external statistics use colon-delimited statistic IDs.
+- HA 2026.7.2 source confirms sensor `compile_statistics()` seeds `sum` from the
+  latest short-term statistics, not from manually imported hourly long-term rows.
+- Recommended fix: publish dashboard data as SP Group-owned external statistics
+  with IDs such as `sp_group:<opaque_key>_electricity` and
+  `sp_group:<opaque_key>_water`, using `async_add_external_statistics()` for both
+  historical and ongoing hourly rows. Keep entity sensors as live/current state
+  surfaces, but avoid making them the Energy Dashboard statistics source.
+- Avoid direct writes to `statistics_short_term`; that would rely on private DB
+  internals and fight HA's recorder lifecycle/purge model.
+
+### 2026-07-19 23:41 +08 - Native Statistics Baseline Recheck
+
+Question: is there a reliable HA-native way to import historical backfill into a
+sensor's entity statistics and have HA continue from that imported baseline?
+
+Grounded conclusion:
+
+- For public/stable APIs, no. HA's public statistics import APIs write hourly
+  long-term rows into `statistics`; they do not seed the sensor compiler's
+  `statistics_short_term` continuation state.
+- HA 2026.7.2 source confirms `sensor.recorder.compile_statistics()` resumes a
+  sensor's `sum` from `get_latest_short_term_statistics_with_session(...)`.
+  Imported hourly rows are not consulted as the next native entity-statistics
+  baseline.
+- HA docs say total/total_increasing sensors use the first compiled value as the
+  zero point, while historical/imported statistics are modeled separately as
+  imported long-term statistics.
+- Directly manipulating `statistics_short_term`, racing HA's hourly compiler, or
+  reshaping the live sensor state to encode a historical offset would be
+  implementation-specific and fragile, not HA-aligned.
+
+Decision: keep the recommended direction of moving Energy Dashboard history to
+SP Group-owned external statistics if preserving pre-HA history is required.
+
+### 2026-07-19 23:48 +08 - Historical Sensor-State Backfill Feasibility
+
+Question: can SP Group backfill historical sensor state rows, then let HA's
+native sensor statistics compiler build the Energy Dashboard timeline normally?
+
+Findings:
+
+- HA's native sensor compiler does read recorded entity state history for each
+  compile window, so the idea is conceptually coherent.
+- The supported integration-facing entity path (`async_write_ha_state()`) writes
+  the entity's current state with the current timestamp. It does not expose a
+  stable way for a custom integration to emit arbitrary historical state changes.
+- `hass.states.async_set_internal(..., timestamp=...)` exists but is explicitly
+  marked as core-internal and not a stable integration API.
+- Directly inserting historical rows into Recorder's `states` tables would need
+  private schema knowledge, event/state metadata consistency, recorder lifecycle
+  coordination, and later missing-statistics compilation. It is also constrained
+  by Recorder purge behavior for states and short-term statistics.
+- Therefore historical sensor-state backfill is only a private-DB workaround, not
+  a reliable HA-aligned integration design.
+
+Decision: do not backfill HA entity state rows for Energy Dashboard history.
+Use HA's public statistics import path for historical dashboard data.
+
+### 2026-07-20 10:01 +08 - Spook Statistics Import Check
+
+Question: Spook reportedly allows importing existing statistics data; verify
+whether this changes the SP Group statistics design.
+
+Findings:
+
+- Spook docs confirm it adds a `recorder.import_statistics` action that manually
+  imports long-term statistics into HA Recorder.
+- Spook source implements the action as a thin wrapper around HA public APIs:
+  `async_import_statistics()` when `statistic_id` is a valid entity ID, and
+  `async_add_external_statistics()` otherwise.
+- Spook does not backfill Recorder `states` rows and does not seed
+  `statistics_short_term`.
+- The docs warn that direct recorder/statistics manipulation can skew data and
+  should be used with caution.
+
+Decision impact:
+
+- Spook validates that importing historical long-term statistics is feasible and
+  commonly used.
+- It does not provide a supported mechanism for HA's native entity statistics
+  compiler to continue from imported history. The previous recommendation still
+  stands: if SP Group needs guaranteed historical continuity, own the statistics
+  timeline through HA's public import APIs.
+
+### 2026-07-20 10:12 +08 - klausj1/homeassistant-statistics Check
+
+Question: does `klausj1/homeassistant-statistics` provide a better pattern for
+historical import than Spook, and does it solve native continuation?
+
+Findings:
+
+- The project provides actions only; no entities or dashboard cards. It imports
+  and exports long-term statistics from CSV/TSV/JSON.
+- It routes internal statistics (`sensor.name`, source `recorder`) through
+  `async_import_statistics()` and external statistics (`domain:name`) through
+  `async_add_external_statistics()`.
+- It validates that internal recorder statistics point to an existing entity and
+  that units match both the entity and existing `statistics_meta`.
+- It has a useful delta import mode: given hourly deltas, it queries existing
+  long-term statistics references and converts deltas into absolute `sum` and
+  `state`. It supports forward conversion from an older reference and backward
+  reconstruction from a newer reference.
+- Its docs explain HA's normal flow (`states` -> `statistics_short_term` ->
+  `statistics`) and state that the Energy Dashboard uses `sum`.
+- It does not backfill Recorder `states`, does not seed `statistics_short_term`,
+  and does not make HA's native entity compiler continue from imported history.
+
+Decision impact:
+
+- Its delta/reference design is relevant to SP Group's overlap math and supports
+  the idea of anchoring imported rows from trusted references.
+- It does not change the ownership conclusion: for automated SP Group backfill
+  plus ongoing dashboard continuity, the integration should own the imported
+  statistics timeline rather than mix one-time entity imports with native
+  compiler continuation for the same statistic ID.
+
+### 2026-07-20 10:31 +08 - Newer-Reference Import Feasibility For Native Continuation
+
+Question: can SP Group borrow `homeassistant-statistics` newer-reference delta
+conversion to prevent the negative boundary when HA later updates long-term
+statistics from sensor state?
+
+Findings:
+
+- `homeassistant-statistics` avoids counter boundary jumps only when imported
+  deltas are converted relative to an existing statistics reference. For a newer
+  reference, it reconstructs older rows by subtracting deltas backwards and adds
+  a connection row at the reference timestamp.
+- SP Group's current implementation does not use HA's native statistics row as a
+  reference. It computes imported `sum` from the first imported ledger bucket
+  forward, so the latest imported historical row can end at the full backfill
+  total while HA's native sensor compiler later starts from `sum=0`.
+- A native-continuation design is theoretically possible:
+  1. Let HA's sensor compiler establish the native reference row for the live
+     sensor, usually `sum=0` at/after the first trusted sensor state.
+  2. Import only historical rows before that reference.
+  3. Compute imported `sum` by subtracting accepted deltas backward from the HA
+     reference `sum`, while keeping `state` as the absolute reconstructed meter
+     reading.
+  4. Abort or defer if no matching HA reference exists, units mismatch, the
+     reference state does not match the ledger-derived state, or the bridge is
+     incomplete.
+- This would mean pre-reference imported `sum` values may be zero or negative
+  relative to HA's native zero point. That is how backward anchoring preserves
+  positive deltas while connecting to native future rows.
+- This approach preserves HA native future compilation, but delays/retries
+  backfill until a reliable native reference exists and is more fragile than
+  owning an external statistics timeline.
+
+Decision impact:
+
+- Newer-reference anchoring is a valid alternative to investigate if preserving
+  native entity-derived future statistics is prioritized over integration-owned
+  statistics.
+- It needs a dedicated plan and tests around reference discovery, boundary
+  connection, negative pre-reference sums, idempotency, and HA restart timing.
+
+### 2026-07-20 11:09 +08 - Native-Anchored Statistics Backfill Implemented
+
+Implemented the native-anchored statistics backfill retrofit:
+
+- Split source-history attempt tracking from statistics import completion so HA
+  restarts do not repeatedly re-fetch full provider history while statistics are
+  waiting for a native reference row.
+- Removed the synthetic current-hour continuation row from the statistics import
+  path. Imported historical rows now require a validated HA-native reference row
+  and are summed backward from that reference.
+- Added a `native_anchored_v1` statistics strategy marker to the ledger. Legacy
+  ledgers with older `statistics_imported_through` values are treated as not
+  complete for the new strategy and receive a migration warning instead of
+  silently suppressing the corrected importer.
+- Added repair issues for two user-actionable states: waiting for HA to create a
+  native statistics reference and existing statistics conflicts that require
+  manual review/reset before retry.
+- Added Recorder/statistics regression coverage for backward anchoring,
+  positive Energy-style deltas, water final-month-hour projection, conflict
+  skipping, and HA 2026.7 five-minute statistics task behavior.
+
+### 2026-07-20 11:19 +08 - Mise Python Install Task Fixed
+
+Fixed `mise run python:install` after discovering `.venv/bin/pip` still pointed
+at the old `/apps/energy-monitoring/.venv/bin/python` interpreter.
+
+- The install task now recreates `.venv` with `python -m venv --clear .venv`.
+- It calls `.venv/bin/python -m pip` instead of `.venv/bin/pip`, avoiding stale
+  console-script shebangs.
+- It installs the HA 2026.7.2 dependency set plus the pytest custom-component
+  harness support packages, then installs
+  `pytest-homeassistant-custom-component==0.13.346` with `--no-deps` so the
+  harness cannot downgrade Home Assistant.
+- Verification: `mise run python:install`, `.venv/bin/python -m pytest
+  tests/components/sp_group/test_recorder_statistics.py -q`, `mise run
+  python:test`, `mise run python:lint`, and `mise run ha:check` all passed.
+
+### 2026-07-20 12:07 +08 - Statistics Retry UX Tightened
+
+Refined native-anchored statistics backfill behavior after reviewing HA
+Recorder cadence and repair UX:
+
+- HA Recorder short-term statistics are queued every five minutes at the
+  scheduled `:00/:05/... +10s` ticks. The installed HA 2026.7.2 source compiles
+  hourly long-term rows when the five-minute statistics start time has
+  `minute == 55`, then fires `recorder_hourly_statistics_generated`.
+- Waiting for the first HA-native long-term reference row is a normal timing
+  state, not a user-actionable failure. The integration now records the
+  `statistics_waiting_for_native_reference` ledger warning but clears any stale
+  waiting repair issue instead of creating one.
+- The options-flow retry action now runs `async_run_statistics_backfill()` only,
+  using persisted ledger buckets. It no longer re-fetches full provider history
+  just to retry HA statistics import.
+- User-actionable repair issues remain reserved for failed source/history
+  backfill and statistics conflicts that require manual review/reset.
+
+### 2026-07-20 12:19 +08 - Automatic Statistics Retry Feasibility
+
+Evaluated whether SP Group can automatically retry statistics import after HA
+creates the native long-term statistics reference row.
+
+- HA developer docs support integrations listening for Home Assistant events
+  through event helpers or the event bus, with cancellable listeners registered
+  and removed as part of integration lifecycle.
+- The installed HA 2026.7.2 Recorder source exports
+  `EVENT_RECORDER_HOURLY_STATISTICS_GENERATED`, fires it after hourly
+  statistics compilation, and queues short-term statistics every five minutes.
+- Supported direction: register an unload-safe listener for
+  `EVENT_RECORDER_HOURLY_STATISTICS_GENERATED` and schedule a non-blocking
+  statistics-only retry for entries that have completed source backfill and are
+  still waiting for the native reference row.
+- Unsupported/risky direction: call Recorder's internal `compile_statistics`
+  directly to force native row creation. That would couple the integration to
+  Recorder internals and could race Recorder's own database worker.
+- Decision: keep the manual options retry as a fallback, but implement automatic
+  event-driven statistics-only retry as the normal UX path.
+
+### 2026-07-20 12:31 +08 - Automatic Statistics Retry Implemented
+
+Implemented the event-driven native-reference retry path:
+
+- Added a shared statistics-only scheduler with single-flight protection so
+  hourly Recorder events and manual options retry cannot overlap.
+- Registered an unload-safe listener for
+  `EVENT_RECORDER_HOURLY_STATISTICS_GENERATED`. The listener schedules
+  statistics import only after source-history backfill has been attempted and
+  native-anchored statistics remain incomplete.
+- Kept the hourly event path provider-safe: it calls the statistics-only retry
+  and never calls full source-history backfill or utility backfill polling.
+- Added gating for manual-review states such as statistics conflicts, legacy
+  rows needing rebuild, and missing bridge warnings.
+- Added tests for delayed eligibility after source backfill, conflict gating,
+  and single-flight scheduling.
+
+### 2026-07-20 13:05 +08 - Robust Statistics Retry Fix Implemented
+
+Hardened the native-anchored statistics retry path after manual retry showed no
+visible import progress despite valid ledger and native reference rows.
+
+- Replaced the silent task/`None` scheduler contract with explicit statuses for
+  scheduled, already-running, not-ready, and blocked states.
+- Changed options-flow statistics retry into an action-only translated abort
+  result so retry does not rewrite options or reload the config entry.
+- Added durable `statistics_reference_start` ledger metadata so a validated
+  native reference row is frozen and reused across retries.
+- Refactored statistics projection through an indexed prefix calculator and HA
+  executor jobs so large backfill planning does not block the event loop.
+- Stopped treating `statistics_missing_bridge:*` as a hard retry blocker;
+  conflicts, negative existing statistics deltas, and legacy rows still require
+  manual review.
+- Updated tests for action-only retry, force rechecking, missing-bridge retry,
+  frozen reference metadata, and existing Recorder row idempotency.
+
+### 2026-07-20 13:20 +08 - Statistics Retry RCA Completed
+
+Investigated why submitting Options Flow "Retry statistics import" still did
+not update Recorder or ledger metadata after the robust retry refactor.
+
+- Live state showed the source ledger and Recorder native reference rows were
+  valid: offline replay against `.runtime/ha-config` planned importable rows for
+  electricity and water.
+- Live HA logs and unchanged ledger metadata showed the retry action was not
+  reaching the active importer task.
+- Root cause: the scheduler trusted the `ConfigEntry` object passed by the
+  Options Flow. In HA runtime this can be a detached flow entry object without
+  the loaded integration `runtime_data`, while the canonical loaded entry in
+  `hass.config_entries` has the actual ledger/runtime state.
+- Fix: `async_schedule_statistics_backfill()` now resolves HA's canonical
+  loaded config entry by `entry_id` before readiness checks, single-flight
+  checks, task creation, and task tracking.
+- Regression: added a test where a detached entry schedules against a loaded
+  canonical entry with runtime data.
+- Earlier related fix remains required: the Recorder hourly event listener uses
+  `hass.add_job(...)` before scheduling so event callbacks from non-event-loop
+  threads do not call `hass.async_create_task` unsafely.
+
+### 2026-07-20 13:34 +08 - Statistics Retry Live Root Cause Confirmed
+
+Completed the live retry investigation against the running HA dev instance.
+
+- The options action scheduled the statistics-only task, and the canonical-entry
+  scheduler fix allowed the active runtime ledger to be reached.
+- Live Recorder rows from `statistics_during_period()` exposed the remaining
+  defect: HA returned row `start` values as Unix timestamp numbers, while the
+  importer only accepted `datetime` objects when selecting and validating the
+  native reference row and when checking existing-row conflicts.
+- Because of that shape mismatch, valid native reference rows were rejected with
+  `reason=no_start`, leaving `planned=0` and preserving
+  `statistics_waiting_for_native_reference`.
+- Fix: normalize Recorder row starts from either timezone-aware `datetime` or
+  Unix timestamp before reference selection, validation, decreasing-sum checks,
+  and conflict filtering.
+- Live verification after restarting HA and submitting `Retry statistics import`
+  imported 13,572 electricity rows and 12 water rows from persisted ledger data;
+  Recorder totals became 13,574 electricity rows and 14 water rows including the
+  two native rows already present.
+- Regression coverage now mocks Recorder reference rows with Unix timestamps for
+  both electricity and water statistics import tests.
+
+### 2026-07-20 13:55 +08 - Dev-Only Recorder Statistics Accelerator
+
+Added a local development shortcut for full config-flow and Energy Dashboard
+validation without waiting for the next natural Recorder hourly statistics
+event.
+
+- Production behavior remains unchanged: SP Group waits for HA Recorder's
+  hourly statistics event, validates the native reference row, then imports
+  historical statistics from persisted ledger buckets.
+- The dev runner now sets `SPGROUP_HA_DEV_TOOLS=1`, which enables a hidden
+  SP Group service only inside local `ha:dev` instances.
+- New mise task: `mise run ha:dev:force-statistics`.
+- The helper waits for any in-flight one-shot source-history backfill and queues
+  Recorder statistics tasks only.
+- SP Group statistics import remains owned by the existing
+  `EVENT_RECORDER_HOURLY_STATISTICS_GENERATED` listener; the dev helper does
+  not directly schedule the SP Group import path.
+- The helper does not call SP Group provider history endpoints and should be
+  used only in disposable `.runtime/ha-config` validation loops.
+
+### 2026-07-20 15:22 +08 - Forced Recorder Event Thread-Safety Fix
+
+Validated the dev Recorder accelerator after a fresh reset/config-flow run.
+
+- The forced Recorder task fired `EVENT_RECORDER_HOURLY_STATISTICS_GENERATED`,
+  but the SP Group listener scheduled `_schedule_hourly_statistics_backfill`
+  through `hass.add_job()` with an undecorated sync function.
+- HA treated that undecorated function as executor work; the executor then
+  called `hass.async_create_task()`, triggering HA's thread-safety guard.
+- Fix: mark `_schedule_hourly_statistics_backfill` with HA's `@callback` so
+  `hass.add_job()` schedules it onto the event loop instead of the executor.
+- The dev CLI still only queues Recorder work. It now passively waits for the
+  listener-driven import metadata before printing evidence, which avoids a
+  misleading early "not started" report.
+
+### 2026-07-20 15:57 +08 - Downtime Catch-Up Behavior Inspection
+
+Reviewed whether normal polling fills data gaps after Home Assistant is down.
+
+- Electricity normal polling requests AMI data from each utility seed anchor to
+  now, not only the latest bucket. The ledger dedupes accepted buckets and uses
+  a two-sighting rule before accepting electricity observations, so post-seed
+  downtime can be caught up after provider data appears in two matching polls.
+- The catch-up guarantee is bounded by provider/API retention and timeout
+  behavior. If the AMI endpoint no longer returns a missed interval, the
+  integration cannot reconstruct it from normal polling.
+- Water monthly polling fetches the history chart when its schedule fires, and
+  the parser accepts all closed months from the seed anchor. However, startup
+  scheduling currently computes the next configured month only; if HA starts
+  after the configured water poll day/time, it does not perform an immediate
+  startup catch-up poll and will wait until the next scheduled monthly run.
+- The one-shot source-history backfill intentionally does not rerun on every
+  restart; downtime catch-up is therefore a normal utility polling concern, not
+  a full historical backfill rerun.
+
+### 2026-07-20 16:11 +08 - Robust Polling Recommendation
+
+Assessed what is needed to make post-setup polling robust across downtime and
+provider lag.
+
+- Current electricity polling can catch up missed AMI buckets in the ledger
+  because normal polls request from the seed anchor to now and the ledger dedupes
+  accepted buckets, but this is inefficient and still depends on the provider
+  returning the missed AMI range.
+- Current water polling can parse all closed monthly history rows when it runs,
+  but startup scheduling can skip an immediate catch-up when HA starts after the
+  configured monthly window.
+- Ledger catch-up is not the same as Energy Dashboard catch-up. The
+  native-anchored statistics importer currently imports projected rows before the
+  HA-native reference boundary; post-reference downtime buckets may be absorbed
+  by HA as a later cumulative jump instead of being placed into their source
+  periods.
+- Recommended direction: add per-utility polling cursors and gap state, run a
+  non-blocking startup catch-up planner, fetch bounded windows from the earliest
+  unresolved cursor with overlap, import accepted missed-bucket statistics for
+  closed gaps using the same idempotent/conflict-safe Recorder import path, and
+  surface unrecoverable provider-retention gaps as Repairs.
+
+### 2026-07-20 16:16 +08 - Robust Polling Second-Pass Reconciliation
+
+Ran a second code-grounded pass over setup, backfill, coordinators, ledger,
+sensors, statistics import, options, and tests.
+
+- Confirmed previous gaps: electricity normal polling can catch up provider
+  buckets returned from seed-to-now; water startup scheduling can miss an
+  immediate catch-up; statistics import only plans rows before the native
+  reference, so post-reference downtime bucket placement is not guaranteed.
+- Added gaps: source backfill is marked attempted before utility fetch success;
+  accepted bucket corrections are warning-only and never reprocess affected
+  ledger/statistics rows; utility sensors do not include `super().available`
+  in their custom availability property; no explicit provider-retention or
+  unresolved-gap repair state exists.
+- Test coverage does not currently model HA-down intervals across utility
+  poll cycles plus Recorder statistics placement, nor failed first source
+  backfill followed by restart recovery.
+
+### 2026-07-20 16:19 +08 - Robust Polling Complexity Review
+
+Re-evaluated the robust polling recommendation against Home Assistant polling
+patterns.
+
+- The earlier "full recovery subsystem" framing is heavier than necessary for
+  the next step. HA conventions favor `DataUpdateCoordinator` for periodic
+  polling, event helpers for targeted callbacks, `UpdateFailed`/coordinator
+  availability for transient provider failures, and Repairs for user-actionable
+  states.
+- Updated approach: keep recovery coordinator-centered and add only minimal
+  persisted per-utility cursor/status fields required to avoid repeated
+  seed-to-now fetches, detect missed water schedules, retry failed initial
+  source backfill accurately, and schedule statistics-only import after accepted
+  missed buckets.
+- Defer complex provider-retention gap registries until real endpoint behavior
+  proves they are needed; initially surface bounded warnings/Repairs only for
+  confirmed unrecoverable gaps or accepted-bucket corrections.
+
+### 2026-07-20 16:47 +08 - Coordinator-Centered Polling Refactor Implementation
+
+Implemented the coordinator-centered robustness refactor.
+
+- Added per-ledger source backfill state (`never_attempted`, `running`,
+  `succeeded`, `failed`) plus source backfill timestamps and interrupted-running
+  recovery on setup.
+- Kept normal catch-up inside the utility `DataUpdateCoordinator` path:
+  electricity derives its poll cursor from pending/accepted ledger buckets with
+  a bounded overlap and splits long AMI windows; water keeps its monthly
+  scheduler and adds one unload-cancelled startup catch-up task when HA starts
+  after a possibly missed monthly poll window.
+- Source retry and statistics retry are now separate options actions.
+  Statistics retry remains persisted-ledger only and single-flight; source retry
+  reruns only retryable source-history entries.
+- Threaded `force=True` through statistics retry and fixed forced
+  post-reference planning so missing deterministic rows after a HA-native
+  reference import with cumulative sums that produce positive Energy Dashboard
+  deltas.
+- Updated sensor availability to include coordinator availability via
+  `super().available`, matching Home Assistant transient-failure behavior.
+
+### 2026-07-20 17:12 +08 - Polling Robustness Coverage Closure
+
+Closed the remaining test coverage gaps for the coordinator-centered polling
+refactor.
+
+- Added focused source-backfill orchestration tests covering mixed
+  electricity/water success and failure, utility-specific ledger status
+  transitions, and Repair creation only on real source failure.
+- Added setup/restart tests for failed and interrupted source backfill states,
+  plus a malformed-ledger assertion that keeps malformed state on the Repair
+  path instead of scheduling healthy source/statistics backfill.
+- Added water startup catch-up task lifecycle tests for scheduling,
+  de-duplication, refresh invocation, cancellation, and no-op behavior.
+- Strengthened normal polling tests so accepted electricity/water buckets
+  schedule statistics-only forced retry, while first-sighting/pending buckets do
+  not.
+- Added statistics scheduler branch tests for blocked and non-blocking warnings,
+  expanded forced import regression to cover multiple post-reference missed
+  rows, and added diagnostics coverage for non-empty source-backfill status
+  histograms.
+- New tests exposed two implementation defects that were fixed: malformed
+  ledgers were still scheduling healthy backfill/schedules, and cancelled water
+  startup catch-up tasks stayed in runtime tracking until callback cleanup.
+
+### 2026-07-20 17:19 +08 - Dev Session Refresh Command
+
+Added a dev-only `mise run ha:dev:refresh-session` helper to refresh
+`.runtime/mobile-session.json` without starting Home Assistant or opening the
+SP Group config flow.
+
+- The helper reuses the SDK `MobileAuthClient.refresh_session()` path and the
+  same serialized `MobileSession` shape used by the cached-session config-flow
+  bypass.
+- It defaults to `SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json`,
+  supports `--session-file` for explicit overrides, writes refreshed tokens
+  atomically with owner-only permissions, and prints only sanitized metadata.
+- This keeps repeated post-auth config-flow testing from requiring fresh
+  username/password/OTP attempts when a valid refresh token is already cached.
+
+### 2026-07-20 19:54 +08 - Statistics Backfill Test-First Hardening
+
+Added test-first coverage for the remaining water negative-consumption bug in
+native-anchored historical statistics import.
+
+- Added reusable Energy Dashboard-style delta assertions that normalize Recorder
+  row starts, use an explicit pre-window sum, include native reference rows, and
+  fail on negative visible consumption deltas rather than negative absolute
+  pre-reference sums.
+- Replaced the old water monthly projection expectation that accepted a visible
+  negative baseline with tests for monthly source values, the live Aug 2025 to
+  Jun 2026 water fixture, and a real Recorder-backed import/query regression.
+- Added baseline idempotency/conflict coverage and a forced post-reference water
+  retry test.
+- Verification is intentionally red against current implementation:
+  `tests/components/sp_group/test_recorder_statistics.py` reports 13 passed and
+  4 failed. The failures identify visible water baseline deltas of `-10.0` and
+  `-244.4`, plus a forced water retry/reference gap.
+
+### 2026-07-20 20:09 +08 - Statistics Backfill Coverage Gap Reassessment
+
+Reassessed the test-first hardening after identifying that electricity can hide
+the same negative-baseline bug when the test starts its visible window after the
+synthetic baseline row.
+
+- Root cause: the helper accepted caller-supplied `pre_window_sum`, allowing an
+  electricity test to skip the imported baseline row and therefore pass without
+  proving the broader Energy Dashboard invariant.
+- Delegated two read-only reviews to subagents: one focused on HA
+  statistics/dashboard semantics, and one focused on code execution-path
+  coverage. Both independently identified the electricity baseline-visible gap
+  and recommended a coverage matrix rather than scenario-only tests.
+- Added `docs/plans/statistics-backfill-full-coverage-hardening.md` with the
+  corrected oracle, required red tests for electricity and water, cross-utility
+  paths, force-mode parity, real Recorder-backed regressions, and a final gate
+  requiring every matrix row to be tested or explicitly marked unreachable.
+
+### 2026-07-20 20:15 +08 - Water Statistics Backfill Branch Tests
+
+Added isolated water-focused tests for statistics backfill branch coverage in
+`tests/components/sp_group/test_statistics_backfill_water_invariants.py`.
+
+- Covered persisted native reference reuse for both datetime-shaped and
+  timestamp-shaped Recorder rows.
+- Covered exact water row idempotency, conflicting water row handling,
+  decreasing existing water sums creating a conflict Repair, and missing
+  pre-seed/post-seed monthly bridge warnings.
+- Strengthened the Aug 2025 through Jun 2026 live water fixture so every
+  expected monthly dashboard delta is asserted, not only selected months.
+- Added a matching real Recorder-backed live-fixture regression through HA's
+  public statistics import/query APIs.
+- Verification is intentionally red against current implementation:
+  `test_statistics_backfill_water_invariants.py` reports 7 passed and 2 failed.
+  The failures are the mocked and real-Recorder live fixture both detecting the
+  visible `2025-07-31T23:00+08:00` delta of `-244.4`.
+
+### 2026-07-20 20:16 +08 - Electricity Statistics Invariant Red Tests
+
+Added a disjoint test-only electricity invariant file for native-anchored
+historical statistics backfill.
+
+- New coverage lives in
+  `tests/components/sp_group/test_statistics_backfill_electricity_invariants.py`
+  and does not edit production code.
+- The tests assert Energy Dashboard-style visible `sum` deltas over windows that
+  include the synthetic baseline row, instead of starting after it with a
+  favorable pre-window sum.
+- Focused verification is intentionally red against current production code:
+  the mocked single-hour case exposes `-2.0`, the live-like multi-hour case
+  exposes `-5.75`, and the real Recorder-backed regression exposes `-4.5` as
+  first-visible electricity deltas.
+
+### 2026-07-20 20:17 +08 - Water Statistics Invariant And Cross-Utility Tests
+
+Added the remaining test-first coverage slices for statistics backfill.
+
+- `tests/components/sp_group/test_statistics_backfill_water_invariants.py`
+  covers water persisted native reference row shapes, exact-row idempotency,
+  conflict Repairs, existing decreasing sums, missing pre/post-seed monthly
+  bridges, the full Aug 2025-Jun 2026 live fixture, and a real Recorder-backed
+  live-fixture regression.
+- `tests/components/sp_group/test_statistics_backfill_cross_utility.py` covers
+  no-Recorder no-op behavior, missing entity handling, one utility waiting for a
+  native reference while another imports, and one utility conflicting without
+  corrupting another utility's metadata.
+- Focused verification of the three new invariant files is intentionally red
+  with 11 passing and 5 failing tests. The failures are the expected generalized
+  negative-delta catchers: electricity `-2.0`, electricity live-like `-5.75`,
+  electricity real Recorder `-4.5`, water live fixture `-244.4`, and water real
+  Recorder `-244.4`.
+
+### 2026-07-20 21:10 +08 - Native-Offset Statistics Backfill Fix
+
+Implemented the `native_offset_v2` statistics import strategy to close the
+remaining Energy Dashboard negative-consumption bug.
+
+- Historical rows now start from a zero-sum baseline and advance positively by
+  accepted source bucket deltas. `state` remains the absolute reconstructed
+  ledger meter total.
+- When a validated HA-native reference row exists, the importer applies the
+  missing cumulative history offset from that reference onward through
+  Recorder's `async_adjust_statistics()` API before importing deterministic
+  historical rows.
+- Ledger metadata now persists `statistics_reference_sum_offset` and marks
+  successful imports with `native_offset_v2`; older `native_anchored_v1`
+  metadata remains legacy/possibly contaminated rather than being treated as
+  complete.
+- Forced statistics retry now continues from the adjusted reference sum and
+  re-checks Recorder rows without fetching provider history.
+- Water state validation now treats monthly buckets as effective at bucket end,
+  so monthly source history validates against native rows after the closed
+  month is represented.
+- Regression tests were updated to verify visible Energy Dashboard-style
+  consecutive `sum` deltas, offset calls, exact-row idempotency, conflicts,
+  water live-bug shape, electricity parity, and real Recorder-backed behavior.
+- Verification passed:
+  `mise exec -- python -m pytest tests/components/sp_group/test_recorder_statistics.py tests/components/sp_group/test_statistics_backfill_electricity_invariants.py tests/components/sp_group/test_statistics_backfill_water_invariants.py tests/components/sp_group/test_statistics_backfill_cross_utility.py -q`,
+  `mise exec -- python -m pytest tests/components/sp_group/test_init.py tests/components/sp_group/test_coordinator.py -q`,
+  `mise exec -- python -m pytest tests/components/sp_group -q`,
+  `mise run python:test`, `mise run python:lint`, and `mise run ha:check`.
+
+### 2026-07-20 21:16 +08 - Dev Console Logging Visibility Assessment
+
+Assessed the current local HA dev mode and integration logging surfaces for
+manual debugging/verification.
+
+- Current dev runner sets `SPGROUP_HA_DEV_TOOLS=1` and exposes the
+  dev-only force-statistics service, but the generated HA config does not
+  include a `logger:` section. HA's logger docs say messages below the
+  configured level are ignored, so existing `DEBUG` phase logs are not visible
+  by default in the dev console.
+- Existing useful logs:
+  - discovery coordinator has debug summaries for auth refresh, discovery, and
+    normalization counts;
+  - utility coordinators have debug summaries after ledger source polling;
+  - backfill/statistics orchestration logs scheduled/started/finished/failed
+    states at info/warning/error;
+  - statistics import logs existing row counts, reference rejection reasons,
+    planned/importable/processed/warning counts, and conflict/waiting outcomes;
+  - dev force-statistics helper logs Recorder task queuing and source-backfill
+    wait behavior.
+- Main visibility gaps to close in a logging pass:
+  - explicit dev logger configuration for `custom_components.sp_group`;
+  - setup/unload/options action lifecycle;
+  - poll start/end, mode, request window count, observation count, accepted and
+    pending deltas, and stats-retry schedule status;
+  - water monthly schedule/catch-up decisions;
+  - source-backfill per-utility start/end/failure and retryability;
+  - statistics offset application details and per-utility final metadata;
+  - config-flow step transitions and dev cached-session path, with no secrets
+    or raw provider IDs.
+- Recommended severity split: `INFO` for dev-visible lifecycle and phase
+  summaries, `DEBUG` for detailed sanitized counts/windows/status reasons,
+  `WARNING` for retryable degraded states, and `ERROR/exception` only for task
+  failures or integrity blockers.
+
+### 2026-07-20 21:24 +08 - Dev Console Logging Implementation
+
+Added sanitized dev-visible logging for the SP Group HA integration.
+
+- The local HA dev runner now writes a `logger:` section that keeps the default
+  HA log level at `info` while enabling `debug` for
+  `custom_components.sp_group`, so `mise run ha:dev*` exposes integration
+  diagnostics without globally noisy logs.
+- Setup, discovery, platform forwarding, backfill scheduling, Recorder hourly
+  listener registration, unload, and background-task cancellation now emit
+  concise lifecycle logs.
+- Utility polling now logs start/end phase summaries with mode, request/window
+  counts, observation counts, accepted/pending deltas, and statistics retry
+  schedule status. Water monthly scheduling also logs next run, startup
+  catch-up decisions, retry queueing, cancellation, and completion.
+- Source-history backfill and statistics-only backfill now log scheduling
+  status, per-utility start/end/failure, skipped retry reasons, native-offset
+  adjustment, and final metadata counts.
+- Config flow and options flow now log sanitized step transitions, dev cached
+  session path, selected action type, and retry scheduling outcomes without
+  logging tokens, OTPs, account IDs, source keys, provider IDs, addresses, or
+  raw API payloads.
+- Verification passed:
+  `mise exec -- python -m pytest tests/components/sp_group/test_coordinator.py tests/components/sp_group/test_runtime_privacy.py tests/components/sp_group/test_config_flow.py tests/components/sp_group/test_init.py -q --tb=short`,
+  `mise exec -- python -m pytest tests/components/sp_group -q`,
+  `mise run python:test`, `mise run python:lint`, and `mise run ha:check`.
+
+### 2026-07-20 22:36 +08 - Live Sensor State Investigation
+
+- Confirmed from the running HA Recorder database and the persisted SP Group
+  ledger that both live entity states currently equal their manual seed totals:
+  electricity is `1000.0 kWh` and water is `1000.0 m3`.
+- This is not caused by the historical backfill. Ledger semantics intentionally
+  retain the seed as the current meter anchor and add only accepted source
+  buckets at or after `seed_effective_from`; pre-seed history is used solely to
+  reconstruct historical statistics and must not inflate the live meter state.
+- Electricity has no accepted or pending post-seed bucket. The only scheduled
+  electricity poll after the seed began at 22:26 local time, but an entry reload
+  began before it completed, so no ledger update was applied. The reloaded
+  hourly coordinator will make its next normal attempt one hour after the new
+  coordinator was created.
+- Water is expected to remain at its July seed until the provider exposes and
+  the integration accepts a closed post-seed monthly bucket. The current month
+  is not a completed monthly source period.
+
+### 2026-07-21 22:20 +08 - Polling Update and Two-Sighting Rule Evaluation
+
+- Set electricity polling interval to 5 minutes via DurationSelector for testing.
+- First poll (22:05:46): 50 observations went to pending (two-sighting rule).
+- Second poll (22:11:02): 50 promoted to accepted, sensor jumped from 1000.0 to 1017.374.
+- Verified `latest_total = seed + post_seed_sum`: 1000.0 + 17.374 = 1017.374 ✅
+- Sensor jumps in one batch because two-sighting rule accumulates pending data and promotes it all at once on the next matching poll.
+- The one-shot jump is expected behavior with `require_two_sightings=True`.
+- Decision: Two-sighting rule removal deferred for now. Will revisit if the 5-minute delay on post-seed data is undesirable.
+- Auth refresh reload cycle fix confirmed working: no recurring unload/reload after multiple poll cycles.
+
+### 2026-07-21 22:45 +08 - Statistics Import vs Sensor Jump Investigation
+
+Investigated the one-shot sensor jump (1000 → 1017.374) when post-seed polling
+data is accepted.
+
+Key findings:
+- Pre-seed data (27,162 buckets): projected into HA long-term statistics via
+  `statistics_backfill.py`. History panel shows "Long-term statistics" with
+  correct stepped graph across 18 months. Sensor `latest_total` stays at seed
+  value (1000.0) throughout because pre-seed buckets do not affect it.
+- Post-seed data (52 buckets accepted in one batch): `latest_total` jumps from
+  1000.0 to 1017.374 in a single update. Statistics import is blocked by
+  `statistics_waiting_for_native_reference` (`projected=13606`, `existing=13599`,
+  only 7 new rows needed). History panel shows "History" instead of
+  "Long-term statistics" for the post-seed period.
+- The root cause of the one-shot sensor jump is `latest_total = seed_value +
+  sum(all_post_seed_accepted)`, which sums all 52 buckets spanning 25 hours
+  into a single value without time projection.
+- The pre-seed data DID cause an identical jump pattern? Actually pre-seed does
+  not affect latest_total at all — the stepped graph the user sees in the
+  History panel is purely from statistics, not from sensor state changes.
+- Conclusion: the statistics import needs to be unblocked for post-seed data
+  so the Energy Dashboard/History panel shows the correct stepped graph. The
+  sensor value jump to 1017.374 is mathematically correct for
+  `total_increasing`, but the time projection into statistics is what produces
+  the stepped display.
+
+### 2026-07-21 23:55 +08 - Complete HA Statistics/Sensor/Polling Investigation
+
+Investigated and documented the full interaction between HA's three data
+stores (states, statistics, statistics_short_term), SP Group's polling/ledger
+flow, and the statistics backfill pipeline.
+
+Key findings documented in docs/references/ha-statistics-sensor-interaction.md:
+
+1. Sensor `latest_total = seed + sum(post_seed_accepted)` jumps when
+   multiple buckets are accepted at once — correct math but abrupt display.
+2. Statistics import (`async_import_statistics`) is blocked by
+   `_validated_reference` because the HA-compiled row's state (1017.374)
+   doesn't match the ledger's projected state at the reference hour.
+3. At 23:36: existing=13600 projected=13607 (7 rows needed), blocked by
+   `statistics_missing_bridge` + `statistics_waiting_for_native_reference`.
+4. The `_any_entry_should_retry_statistics` function doesn't detect that
+   new buckets have been accepted after `statistics_imported_through` — it
+   only checks strategy version, not bucket watermark.
+5. Full fix requires polling window fix (remove overlap) AND statistics
+   retry check update (compare against newest accepted bucket, not just
+   strategy metadata).
+
+### 2026-07-22 - Native Sensor and Statistics Cause Revalidated
+
+Re-grounded the post-seed one-shot and statistics-import behavior against the
+current SP Group implementation, the installed Home Assistant Recorder source,
+and the official sensor/statistics guidance.
+
+- `SpGroupUtilitySensor.native_value` publishes the ledger's single
+  `latest_total`; ledger application calculates it as `seed_value + sum(all
+  accepted buckets at or after seed_effective_from)`. A poll that accepts many
+  provider buckets therefore produces one current state update containing the
+  final total. The provider bucket timestamps are not passed to the HA state
+  machine.
+- HA's sensor Recorder platform obtains the entity's recorded states from
+  Recorder history and computes `total_increasing` sum from consecutive
+  observed states. Its state timestamps are the HA state-update timestamps, not
+  the source bucket timestamps. HA does not reconstruct historical state rows
+  from a later cumulative state.
+- HA's hourly compiler takes the latest five-minute statistic in each hour and
+  inserts that as the hourly row. The native reference row is therefore valid
+  for the sensor history HA actually observed, even when it cannot represent
+  the provider's older buckets returned in the same poll.
+- `async_import_statistics` is the supported path for supplying timestamped
+  historical hourly statistics. It validates top-of-hour timestamps and queues
+  the import in Recorder; it is not a second native sensor-state update path.
+- Consequently, the probable cause is confirmed with an important
+  qualification: the native reference is not inherently faulty. The problem
+  is the integration's attempt to reconcile one current-time native state
+  jump with multiple provider buckets whose usage belongs to earlier hours.
+  Native compilation is sufficient only for data observed as live state at the
+  time it occurs. A delayed/outage catch-up requires statistics import (or an
+  equivalent timestamped source) to preserve historical bucket placement.
+
+### 2026-07-22 - Clarified Post-Seed Sensor Projection Proposal
+
+The requested design is to apply multiple post-seed provider buckets
+chronologically to the cumulative sensor value, so native HA statistics can
+derive the hourly progression from sensor states rather than importing those
+post-seed rows directly.
+
+- This is valid for future/live buckets if each value is written when its
+  bucket becomes current.
+- It does not retroactively create correctly timestamped sensor history when
+  a later poll returns already-closed buckets. Replaying those values in one
+  event-loop turn gives them current HA timestamps; replaying them hourly
+  delays recovery and still does not recreate the original timestamps.
+- Directly injecting old timestamps into the state machine would bypass the
+  normal entity path and is not an acceptable integration pattern.
+- Therefore the robust split remains: native sensor updates for live data;
+  timestamped statistics import for delayed/outage catch-up. The sensor may
+  still move to the latest cumulative total in one current-time state update
+  after catch-up, while the Energy Dashboard statistics remain time-projected.
+
+### 2026-07-22 - Delayed Provider Data Pattern Re-researched
+
+Compared SP Group with HA's documented sensor/statistics behavior, installed
+Recorder source, the public statistics API, and the `klausj1/homeassistant-
+statistics` implementation.
+
+- HA integrations normally expose the latest provider value through a sensor;
+  HA records that value at the time the entity writes it.
+- When an API supplies historical intervals whose source timestamps must be
+  preserved, the supported representation is timestamped Recorder statistics,
+  using `async_import_statistics` for an existing entity statistic ID or
+  `async_add_external_statistics` for a separate external statistic ID.
+- `homeassistant-statistics` explicitly has no entities and imports directly
+  into long-term statistics. Its documentation distinguishes internal
+  `sensor.domain` IDs from external `domain:name` IDs and accepts hourly
+  counter rows or deltas.
+- This confirms that replaying delayed provider intervals through sensor state
+  updates is not the usual HA solution for historical time placement. The
+  sensor path is for current/live state; the statistics API is the historical
+  time-series path.
+
+### 2026-07-22 - Qualification on Historical Sensor Timestamps
+
+Clarified that HA's state machine technically accepts an optional timestamp on
+`StateMachine.async_set`, but the entity write path used by integrations writes
+the current time and calls the internal state setter. Historical state replay
+would therefore require bypassing the normal entity API and directly mutating
+the state machine, which is marked as an unstable core-internal API and would
+not update the entity/coordinator lifecycle safely.
+
+- Precise conclusion: historical sensor states are technically possible through
+  low-level state-machine manipulation, but not a supported or reliable custom
+  integration backfill pattern.
+- The supported historical representation remains timestamped Recorder
+  statistics import; native entity states remain the live path.
+
+### 2026-07-22 - Core Integration Comparison for Delayed API History
+
+Inspected Home Assistant Core integrations that receive delayed or historical
+utility data:
+
+- Opower explicitly notes that usage arrives days late, fetches the delayed
+  readings, and imports timestamped external statistics. Its sensors expose
+  forecasts, dates, and freshness metadata rather than pretending delayed
+  readings are live meter states.
+- Elvia fetches hourly historical meter values, uses the provider timestamps,
+  resumes from the last stored statistic, and builds cumulative `sum` rows via
+  `async_add_external_statistics`.
+- Suez Water fetches daily history since the last statistic and builds daily
+  timestamped cumulative statistics; its sensor exposes an aggregated current
+  value rather than replaying each historical day through entity state.
+- Anglian Water uses the provider `read_at` timestamp, shifts the statistic
+  hour to match the meter reading semantics, and imports provider cumulative
+  readings as `sum` plus interval consumption as `state`.
+- Ista EcoTrend exposes current values through coordinator sensors and imports
+  monthly historical data separately through external statistics.
+- Tibber's realtime sensor uses the source timestamp for reset detection only;
+  it writes the latest value through the normal entity path, so HA records it
+  at the update time rather than backdating the state.
+
+Locked finding: Core integrations do not normally replay delayed provider
+  buckets as historical entity states. They either expose a current/latest
+  sensor value or a non-meter period value, and preserve historical placement
+  through Recorder statistics APIs. SP Group's ledger plus timestamped
+  statistics importer follows this split; the remaining correctness burden is
+  to make imported `state`/`sum` rows coherent with the native statistic ID,
+  not to synthesize past entity-state writes.
+
+### 2026-07-22 - Qualification on HA Entity Timestamp Support
+
+Second-pass source verification refined the earlier wording. The HA state
+machine has an optional explicit timestamp, but `Entity.async_write_ha_state`
+captures the current write time and passes it through the normal entity path.
+The lower-level `StateMachine.async_set_internal` timestamp path is explicitly
+documented in source as core-internal, unstable, and not for integrations.
+
+Therefore, delayed sensor-state replay is technically possible at a lower
+level, but there is no supported public SensorEntity workflow for an
+integration to backdate a sequence of historical states. The supported design
+remains current/latest entity state plus timestamped Recorder statistics for
+historical buckets. This is a deliberate separation of live entity state from
+historical time-series import, not an assertion that HA lacks all timestamp
+support.
+
+### 2026-07-22 - Proposed Direction for Unpredictable Provider Lag
+
+Provider lag means no fixed polling interval can make native sensor-derived
+statistics temporally authoritative. A poll may return several older buckets,
+and HA cannot infer their provider timestamps from one latest sensor-state
+write.
+
+Proposed direction, not yet locked: treat accepted provider buckets and their
+timestamps as the source of truth for historical statistics. Keep the sensor
+state as the latest trusted cumulative total, and use timestamped Recorder
+statistics for every delayed or recovered bucket. Native HA compilation remains
+useful for genuinely live sensor observations, but must not be relied on to
+reconstruct late provider history.
+
+Two implementation strategies remain to be evaluated before any change:
+
+- preserve the existing entity statistic ID and maintain a careful native
+  handoff/reconciliation boundary; or
+- use a dedicated external statistic ID, matching Core integrations such as
+  Opower, Elvia, Suez Water, and Anglian Water, to isolate provider history
+  from native entity compilation. The latter requires an explicit migration
+  plan for existing Energy Dashboard selections.
+
+### 2026-07-22 - Provider-Owned External Statistics Decision
+
+Decision accepted: SP Group's authoritative historical electricity and water
+series will use stable provider-owned external statistic IDs through
+`async_add_external_statistics()`. The sensor remains the latest trusted
+cumulative entity state; it is not used to replay delayed provider buckets.
+
+Current-code grounding:
+
+- `sensor.py` publishes `ledger_entry.latest_total` with
+  `TOTAL_INCREASING`.
+- `coordinator.py` applies provider observations to the ledger and schedules
+  statistics retry after accepted buckets.
+- `statistics_backfill.py` currently uses entity IDs with
+  `async_import_statistics()`, then coordinates with native reference and
+  native-offset logic. This is the path being replaced for new imports.
+- HA Energy preferences store statistic IDs, so external statistics can be
+  selected as the dashboard source. Existing dashboard preferences will not be
+  silently mutated.
+
+ADR added: `docs/adr/adr-provider-owned-external-statistics.md`.
+Implementation plan added: `docs/plans/provider-owned-external-statistics.md`.
+Legacy entity-backed rows remain immutable; migration rebuilds a new external
+series from accepted ledger buckets and provides explicit dashboard migration
+guidance.
+
+### 2026-07-22 - Adversarial Review of Provider-Owned Statistics Plan
+
+Review outcome: the external-statistics direction is compatible with HA's
+Recorder and Energy models, but the plan needs stronger implementation gates
+before it is safe to execute. The highest-risk gaps are external statistic ID
+ownership/collision handling, queued Recorder write acknowledgement, late
+bucket suffix reconciliation beyond a single watermark, and explicit migration
+of existing Energy Dashboard source IDs. The plan also needs a settled
+`StatisticData.state` contract, accepted-bucket correction handling, source-vs-
+statistics concurrency control, stable-ID behavior when discovery/account
+identity changes, and bounded Recorder read/query costs. These are review
+findings only; no production or plan changes were made.
+
+### 2026-07-22 - Provider-Owned Statistics Plan Grounding Resolved
+
+The plan was updated after grounding the review findings against the installed
+HA Recorder and Energy source. Recorder external imports are queued writes;
+the implementation will await Recorder commit visibility, reread the affected
+rows, and conditionally advance ledger metadata using a source fingerprint and
+epoch. The external statistic ID is now a hard ownership boundary, not a
+warning-only collision check. Late buckets use a persisted dirty boundary and
+deterministic suffix reconciliation rather than relying on
+`statistics_imported_through` alone.
+
+The external row contract is explicit: `state` is represented provider-period
+usage and `sum` is the positive cumulative external series; the live sensor
+continues to expose the absolute ledger total. Accepted provider corrections
+block reconciliation pending user action. The plan also now covers bounded
+Recorder reads, source/statistics races, disabled sensors, legacy strategy
+shutdown before migration, and explicit Energy Dashboard source-switch
+acknowledgement.
+
+### 2026-07-22 - Native-ID Post-Seed Alignment Evaluation
+
+Reusing the pre-seed timestamped planner for post-seed accepted buckets is
+possible at the statistics-row level, but it would not backdate the sensor
+state history. The current sensor publishes only the latest ledger total, while
+the current native-ID importer and HA compiler both write the same entity
+statistic ID. Extending this approach post-seed therefore creates a two-writer
+handoff that must reconcile poll-time native rows, provider-time imported rows,
+late suffix changes, and native sum offsets. It is a viable alternative only as
+a deliberately scoped native-ID handoff design, not as a simple reuse of the
+pre-seed function.
+
+### 2026-07-22 - External Statistics Recommendation
+
+Recommendation: proceed with provider-owned external statistics for the
+authoritative Energy Dashboard and long-term statistics series. This best
+matches the requirement for provider-timestamped delayed history while avoiding
+two writers competing over one entity statistic ID. The recommendation does
+not claim to retroactively step the sensor History graph, and it remains subject
+to explicit user acceptance of the Energy Dashboard statistic-ID migration.
+
+### 2026-07-22 - HA-Owned Versus Integration-Owned Statistics Implications
+
+HA-owned statistics use the `TOTAL_INCREASING` sensor state as the source and
+let Recorder compile sums from state transitions. This preserves the native
+entity/statistics relationship with less integration-owned reconciliation, but
+cannot assign past provider buckets to their original timestamps when delayed
+data arrives in one poll. Integration-owned external statistics remain in the
+same Recorder long-term statistics system, but use provider timestamps and
+explicit cumulative sums; this improves delayed-history correctness at the
+cost of a separate statistic ID, migration UX, and reconciliation ownership.
+
+### 2026-07-22 - External Statistics Necessity Re-evaluation
+
+The external-statistics direction is not technically mandatory. A native-ID
+alternative remains possible, but it would require the integration to import
+historical rows into the entity statistic ID and coordinate a durable handoff
+with HA's native compiler. That preserves one Energy statistic ID but makes the
+integration and HA co-owners of one cumulative series, including repeated
+offset/suffix reconciliation whenever delayed buckets arrive. Pure HA-owned
+statistics cannot satisfy provider-time backfill because sensor state writes
+are timestamped when HA observes them. No final reversal of the accepted ADR
+was made; the trade-off remains open for explicit confirmation before coding.
+
+External-statistics trade-offs confirmed: Energy consumption remains supported,
+but external sources cannot use an entity or fixed-number price unless a
+separate external cost statistic is configured. External statistics also do not
+retroactively populate sensor History, and they introduce a second statistic
+identity plus integration-owned reconciliation. Native sensor state, Recorder
+storage, and ordinary live polling remain unchanged.
+
+### 2026-07-22 19:22 +08 - Worktree Commit Strategy Before External Statistics
+
+The current worktree is a large accumulated change set, not a single coherent
+external-statistics implementation. It contains 31 modified tracked files and
+16 untracked project files, with approximately 6,100 added lines before the
+untracked files are counted. The focused integration suite currently passes:
+275 passed, 1 skipped. `git diff --check` is clean, and no generated cache files
+are part of the reported worktree changes.
+
+The changes divide into these semantic groups:
+
+1. Ledger/source-backfill state, coordinator polling/catch-up, statistics retry
+   scheduling, and lifecycle handling. These runtime changes are coupled across
+   `__init__.py`, `backfill.py`, `coordinator.py`, and `ledger.py` and should be
+   committed as coherent runtime slices with their matching tests.
+2. Native-offset statistics projection and Recorder reconciliation in
+   `statistics_backfill.py`, with the electricity/water invariant and
+   cross-utility tests. This is the currently validated native-ID checkpoint,
+   not the future provider-owned external-statistics implementation.
+3. Granular polling options, translations, diagnostics, and sensor availability.
+4. Developer services, force-statistics/session-refresh helpers, debug logging,
+   mise tasks, and runtime validation documentation.
+5. Auth Store migration documentation and partial implementation.
+
+The auth Store change is not commit-ready as a completed refactor: setup still
+loads the session only from `entry.data`, does not initialize/load a Store into
+runtime data, and `async_refresh_session_if_needed()` still calls
+`async_update_entry()` through its `persist=True` path. It must either be
+completed and tested as its own commit or excluded from the final commit set;
+it must not be presented as a finished Store-only migration.
+
+Proposed commit order:
+
+1. `feat: harden ledger source backfill and polling lifecycle` — ledger state
+   migration, cursor/catch-up behavior, coordinator orchestration, lifecycle
+   tests, and only the related runtime wiring.
+2. `feat: harden native statistics backfill` — native-offset projection,
+   Recorder reconciliation, retry semantics, repair translations, and all
+   statistics regression tests. Keep this explicitly as the pre-external
+   checkpoint.
+3. `feat: add granular polling configuration` — duration parsing/validation,
+   option migration, translations, and config-flow tests.
+4. `fix: persist runtime sessions through HA Store` — only after setup loading,
+   migration fallback, runtime persistence, and the remaining
+   `async_update_entry` scope are made internally consistent.
+5. `chore: add development diagnostics and runtime helpers` — dev-only
+   services/scripts, mise tasks, debug logging, and their documentation/tests.
+6. `docs: record architecture decisions and validation procedures` — ADRs,
+   issue reports, plans, references, developer guidance, and the context
+   tracker entries that describe the completed checkpoints.
+7. Implement provider-owned external statistics in separate commits, beginning
+   with the external statistic identity/ledger contract, then projection and
+   Recorder reconciliation, then runtime migration/dashboard UX, each with
+   independently verifiable tests. Do not mix that migration into the native
+   statistics checkpoint.
+
+Before committing, use selective staging (`git add -p`) for files shared by
+multiple groups, especially `__init__.py`, `backfill.py`, `coordinator.py`,
+`ledger.py`, and the large statistics test module. No destructive cleanup or
+reset is authorized; unrelated user changes remain untouched.
+
+### 2026-07-22 19:27 +08 - HA Store Runtime Evidence Recheck
+
+The earlier assessment needs a precise qualification. The HA Store is not
+absent: `.runtime/ha-config/.storage/sp_group.session.01KXZTM9SAFC9PV3247D7MV38Q`
+exists with Store version 1 and the expected session fields. Its modification
+time is 19:16, matching the successful runtime poll and statistics retry. The
+Store token metadata is newer and has a different fingerprint from the token
+metadata in `core.config_entries`, proving that the runtime refresh path did
+persist a refreshed session to Store without rewriting the config entry.
+
+The remaining implementation gap is that `async_setup_entry()` still calls
+`mobile_session_from_entry(entry)` before constructing `SpGroupRuntimeData`;
+there is no setup-time `Store.async_load()` or Store-first migration path. A
+restart therefore does not use the newer Store session as its source of truth.
+The generic `async_refresh_session_if_needed()` helper also retains an
+`async_update_entry()` path, although the production coordinators use
+`async_refresh_runtime_session_if_needed()` and the observed Store write comes
+from that runtime path.
+
+Conclusion: Store persistence is partially and demonstrably implemented, but
+the Store-only auth refactor is not complete until setup reads Store first,
+migrates the legacy entry-data session safely, and the remaining
+`async_update_entry()` behavior is explicitly scoped or removed. The commit
+plan must label this as a partial runtime persistence checkpoint rather than
+claiming the full refactor is already absent or complete.
+
+### 2026-07-22 19:33 +08 - HA Store Startup Fix Implemented And Reviewed
+
+Implemented the missing restart path from `docs/plans/auth-store-refactor.md`.
+`async_setup_entry()` now uses a Store-first loader, attaches the loaded Store
+to runtime data, migrates a legacy `entry.data` session when no Store payload
+exists, and falls back to legacy entry data when the Store payload is invalid
+without silently overwriting the corrupt Store.
+
+Added setup regressions for Store precedence, first-run migration, and invalid
+Store fallback. The existing runtime persistence behavior remains Store-backed
+and only writes when the refreshed token changes. The generic
+`async_refresh_session_if_needed()` compatibility helper still retains its
+`async_update_entry()` path exactly as scoped by the plan; production
+coordinators use `async_refresh_runtime_session_if_needed()` and do not invoke
+that path.
+
+Verification: `278 passed, 1 skipped`; `mise run python:lint` passed Ruff and
+mypy; `mise run ha:check` passed compileall; `git diff --check` remains clean.
+The auth-store plan is now implemented for the production runtime path, with
+the compatibility helper exception explicitly documented rather than treated
+as an accidental second persistence path.
+
+### 2026-07-22 19:34 +08 - Revised Commit Plan After Store Fix
+
+The worktree remains uncommitted on `main` at `fdfc841`. It now contains 32
+modified tracked files plus 16 untracked project files, approximately 6,368
+added lines and 429 removed lines. `.runtime/` is ignored and is not part of
+the commit set. The current verification checkpoint remains 278 passed and 1
+skipped, with Ruff, mypy, compileall, and `git diff --check` passing.
+
+Recommended commit sequence:
+
+1. `feat: harden source ledger and polling lifecycle` — source-backfill state
+   migration, cursor derivation, bounded polling windows, water startup
+   catch-up, coordinator availability, source retry orchestration, and their
+   ledger/coordinator/backfill lifecycle tests. Stage the related runtime
+   hunks from `__init__.py`, `backfill.py`, `coordinator.py`, and `ledger.py`
+   together because these modules form one executable polling contract.
+2. `feat: harden native statistics backfill` — native-offset projection,
+   Recorder reconciliation, forced retry behavior, conflict/repair handling,
+   statistics metadata, translations, and the electricity/water/cross-utility
+   Recorder tests. This is a validated transitional native-ID checkpoint and
+   must not be described as the provider-owned external-statistics solution.
+3. `fix: use HA Store as the runtime session source` — the completed
+   Store-first setup loader, legacy migration, runtime persistence, auth tests,
+   setup precedence/fallback tests, and the sanitized-log test boundary. Stage
+   only the auth/session hunks from `__init__.py` and `auth.py`; keep config
+   entry option migration in the later options/runtime commit if needed.
+4. `feat: add granular polling and maintenance options` — DurationSelector
+   parsing/normalization, source/statistics retry actions, sensor availability,
+   diagnostics, translations, and config-flow/options/sensor tests.
+5. `chore: add developer runtime helpers and observability` — dev-only service
+   registration, `services.yaml`, force-statistics/session-refresh scripts,
+   mise tasks, Python 3.14 tool configuration, debug logging, and runtime
+   validation guidance.
+6. `docs: record architecture decisions and implementation plans` — the
+   polling-window ADR, provider-owned-statistics ADR and plan, auth issue and
+   plan, statistics coverage plan, reference material, developer guidelines,
+   and the context tracker.
+7. Implement provider-owned external statistics in new commits after this
+   checkpoint: external statistic identity/ledger contract, pure projection,
+   Recorder reconciliation, migration/dashboard UX, and runtime rollout. Do
+   not amend the native-ID checkpoint with external-statistics code.
+
+Shared-file staging must be selective (`git add -p`) and each commit should be
+verified before the next is staged. Suggested gates are: polling/lifecycle
+tests after commit 1; Recorder statistics tests after commit 2; auth/init tests
+after commit 3; config-flow/sensor/diagnostic tests after commit 4; lint,
+compileall, and dev-script checks after commit 5. No reset, checkout, or
+destructive cleanup is authorized.
