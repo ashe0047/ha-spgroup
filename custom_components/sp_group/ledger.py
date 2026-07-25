@@ -1,9 +1,10 @@
 """Persistent accumulation ledger for SP Group dashboard sensors."""
 
 from __future__ import annotations
+import logging
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -13,10 +14,17 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
+from .sources import SINGAPORE_TZ, SpGroupSourceConfig, UTILITY_ELECTRIC
+from .external_statistics import (
+    EXTERNAL_STATISTICS_STRATEGY,
+    external_identity_fingerprint,
+    external_statistic_id,
+)
+LOGGER = logging.getLogger(__name__)
 from .sources import SINGAPORE_TZ, SpGroupSourceConfig
 
 _STORE_VERSION = 1
-_STORE_MINOR_VERSION = 1
+_STORE_MINOR_VERSION = 2
 _WATER_GRACE_DAYS = 3
 STATISTICS_STRATEGY_NATIVE_ANCHORED_V1 = "native_anchored_v1"
 STATISTICS_STRATEGY_NATIVE_OFFSET_V2 = "native_offset_v2"
@@ -37,6 +45,21 @@ SOURCE_BACKFILL_STATUSES = frozenset(
     }
 )
 WARNING_SOURCE_BACKFILL_INTERRUPTED = "source_backfill_interrupted"
+SOURCE_COVERAGE_UNKNOWN = "unknown"
+SOURCE_COVERAGE_COVERED = "covered"
+SOURCE_COVERAGE_LAGGING = "lagging"
+SOURCE_COVERAGE_MALFORMED = "malformed"
+SOURCE_COVERAGE_RETENTION_EXCEEDED = "retention_exceeded"
+SOURCE_COVERAGE_STATUSES = frozenset(
+    {
+        SOURCE_COVERAGE_UNKNOWN,
+        SOURCE_COVERAGE_COVERED,
+        SOURCE_COVERAGE_LAGGING,
+        SOURCE_COVERAGE_MALFORMED,
+        SOURCE_COVERAGE_RETENTION_EXCEEDED,
+    }
+)
+_MAX_CORRECTION_RECORDS = 32
 
 
 class LedgerError(ValueError):
@@ -117,6 +140,81 @@ class SpGroupPendingBucket:
 
 
 @dataclass(frozen=True, slots=True)
+class SpGroupUnresolvedRange:
+    """A provider-proven range of missing source buckets."""
+
+    cadence: str
+    start: datetime
+    end: datetime
+    reason: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the unresolved range."""
+        return {
+            "cadence": self.cadence,
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "reason": self.reason,
+            "first_seen_at": self.first_seen_at.isoformat(),
+            "last_seen_at": self.last_seen_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> SpGroupUnresolvedRange:
+        """Deserialize an unresolved range."""
+        return cls(
+            cadence=_required_string(payload, "cadence"),
+            start=_parse_datetime(_required_string(payload, "start")),
+            end=_parse_datetime(_required_string(payload, "end")),
+            reason=_required_string(payload, "reason"),
+            first_seen_at=_parse_datetime(
+                _required_string(payload, "first_seen_at")
+            ),
+            last_seen_at=_parse_datetime(
+                _required_string(payload, "last_seen_at")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SpGroupCorrection:
+    """A detected provider correction awaiting explicit user review."""
+
+    bucket_key: str
+    start: datetime
+    previous_value: Decimal
+    candidate_value: Decimal
+    detected_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the correction record."""
+        return {
+            "bucket_key": self.bucket_key,
+            "start": self.start.isoformat(),
+            "previous_value": str(self.previous_value),
+            "candidate_value": str(self.candidate_value),
+            "detected_at": self.detected_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> SpGroupCorrection:
+        """Deserialize a correction record."""
+        return cls(
+            bucket_key=_required_string(payload, "bucket_key"),
+            start=_parse_datetime(_required_string(payload, "start")),
+            previous_value=_parse_decimal(
+                _required_string(payload, "previous_value")
+            ),
+            candidate_value=_parse_decimal(
+                _required_string(payload, "candidate_value")
+            ),
+            detected_at=_parse_datetime(_required_string(payload, "detected_at")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SpGroupLedgerEntry:
     """Ledger state for a seeded utility sensor."""
 
@@ -131,6 +229,11 @@ class SpGroupLedgerEntry:
     latest_accepted_at: datetime | None = None
     accepted: tuple[SpGroupAcceptedBucket, ...] = field(default_factory=tuple)
     pending: tuple[SpGroupPendingBucket, ...] = field(default_factory=tuple)
+    unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = field(default_factory=tuple)
+    source_coverage_status: str = SOURCE_COVERAGE_UNKNOWN
+    source_coverage_start: datetime | None = None
+    source_coverage_end: datetime | None = None
+    corrections: tuple[SpGroupCorrection, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     source_backfill_attempted_at: datetime | None = None
     source_backfill_status: str = SOURCE_BACKFILL_NEVER_ATTEMPTED
@@ -143,6 +246,12 @@ class SpGroupLedgerEntry:
     statistics_reference_sum_offset: Decimal | None = None
     statistics_strategy_version: str | None = None
     statistics_warnings: tuple[str, ...] = field(default_factory=tuple)
+    external_statistic_id: str | None = None
+    external_identity_fingerprint: str | None = None
+    statistics_dirty_from: datetime | None = None
+    statistics_source_fingerprint: str | None = None
+    external_migration_status: str | None = None
+    statistics_last_verified_at: datetime | None = None
 
     @property
     def has_trusted_total(self) -> bool:
@@ -167,6 +276,21 @@ class SpGroupLedgerEntry:
             ),
             "accepted": [bucket.to_dict() for bucket in self.accepted],
             "pending": [bucket.to_dict() for bucket in self.pending],
+            "unresolved_ranges": [
+                item.to_dict() for item in self.unresolved_ranges
+            ],
+            "source_coverage_status": self.source_coverage_status,
+            "source_coverage_start": (
+                self.source_coverage_start.isoformat()
+                if self.source_coverage_start is not None
+                else None
+            ),
+            "source_coverage_end": (
+                self.source_coverage_end.isoformat()
+                if self.source_coverage_end is not None
+                else None
+            ),
+            "corrections": [item.to_dict() for item in self.corrections],
             "warnings": list(self.warnings),
             "source_backfill_attempted_at": (
                 self.source_backfill_attempted_at.isoformat()
@@ -211,6 +335,20 @@ class SpGroupLedgerEntry:
             ),
             "statistics_strategy_version": self.statistics_strategy_version,
             "statistics_warnings": list(self.statistics_warnings),
+            "external_statistic_id": self.external_statistic_id,
+            "external_identity_fingerprint": self.external_identity_fingerprint,
+            "statistics_dirty_from": (
+                self.statistics_dirty_from.isoformat()
+                if self.statistics_dirty_from is not None
+                else None
+            ),
+            "statistics_source_fingerprint": self.statistics_source_fingerprint,
+            "external_migration_status": self.external_migration_status,
+            "statistics_last_verified_at": (
+                self.statistics_last_verified_at.isoformat()
+                if self.statistics_last_verified_at is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -228,6 +366,25 @@ class SpGroupLedgerEntry:
             for bucket in pending
             if isinstance(bucket, dict)
         )
+        unresolved_ranges = tuple(
+            SpGroupUnresolvedRange.from_dict(item)
+            for item in payload.get("unresolved_ranges", [])
+            if isinstance(item, dict)
+        )
+        source_coverage_status = payload.get(
+            "source_coverage_status", SOURCE_COVERAGE_UNKNOWN
+        )
+        if source_coverage_status not in SOURCE_COVERAGE_STATUSES:
+            source_coverage_status = SOURCE_COVERAGE_UNKNOWN
+        source_coverage_start = _optional_datetime(
+            payload.get("source_coverage_start")
+        )
+        source_coverage_end = _optional_datetime(payload.get("source_coverage_end"))
+        corrections = tuple(
+            SpGroupCorrection.from_dict(item)
+            for item in payload.get("corrections", [])
+            if isinstance(item, dict)
+        )[-_MAX_CORRECTION_RECORDS:]
         latest_accepted = payload.get("latest_accepted_at")
         source_backfill_attempted = payload.get("source_backfill_attempted_at")
         seed_effective_from = _parse_datetime(
@@ -264,6 +421,16 @@ class SpGroupLedgerEntry:
             else None
         )
         statistics_strategy_version = payload.get("statistics_strategy_version")
+        external_statistic_id_value = payload.get("external_statistic_id")
+        external_identity_fingerprint_value = payload.get(
+            "external_identity_fingerprint"
+        )
+        statistics_dirty_from = _optional_datetime(payload.get("statistics_dirty_from"))
+        statistics_source_fingerprint = payload.get("statistics_source_fingerprint")
+        external_migration_status = payload.get("external_migration_status")
+        statistics_last_verified_at = _optional_datetime(
+            payload.get("statistics_last_verified_at")
+        )
         raw_statistics_warnings = tuple(
             warning
             for warning in payload.get("statistics_warnings", [])
@@ -271,7 +438,8 @@ class SpGroupLedgerEntry:
         )
         if (
             statistics_imported_through is not None
-            and statistics_strategy_version != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
+            and statistics_strategy_version
+            not in {STATISTICS_STRATEGY_NATIVE_OFFSET_V2, EXTERNAL_STATISTICS_STRATEGY}
         ):
             raw_statistics_warnings = tuple(
                 dict.fromkeys(
@@ -344,6 +512,11 @@ class SpGroupLedgerEntry:
             ),
             accepted=accepted_tuple,
             pending=pending_tuple,
+            unresolved_ranges=unresolved_ranges,
+            source_coverage_status=source_coverage_status,
+            source_coverage_start=source_coverage_start,
+            source_coverage_end=source_coverage_end,
+            corrections=corrections,
             warnings=warnings,
             source_backfill_attempted_at=(
                 legacy_attempted_at
@@ -366,16 +539,44 @@ class SpGroupLedgerEntry:
                 else None
             ),
             statistics_warnings=raw_statistics_warnings,
+            external_statistic_id=(
+                external_statistic_id_value
+                if isinstance(external_statistic_id_value, str)
+                else None
+            ),
+            external_identity_fingerprint=(
+                external_identity_fingerprint_value
+                if isinstance(external_identity_fingerprint_value, str)
+                else None
+            ),
+            statistics_dirty_from=statistics_dirty_from,
+            statistics_source_fingerprint=(
+                statistics_source_fingerprint
+                if isinstance(statistics_source_fingerprint, str)
+                else None
+            ),
+            external_migration_status=(
+                external_migration_status
+                if isinstance(external_migration_status, str)
+                else None
+            ),
+            statistics_last_verified_at=statistics_last_verified_at,
         )
 
-    def source_poll_cursor_start(self, *, overlap: timedelta) -> datetime:
-        """Return the earliest normal poll start needed to catch up safely."""
+    def source_poll_cursor_start(self) -> datetime:
+        """Return the cursor start anchored to the last proven data boundary."""
+        unresolved_start = min(
+            (item.start for item in self.unresolved_ranges),
+            default=None,
+        )
+        if unresolved_start is not None:
+            return unresolved_start
         pending_start = min((bucket.start for bucket in self.pending), default=None)
         if pending_start is not None:
-            return max(self.seed_effective_from, pending_start - overlap)
+            return pending_start
         accepted_end = max((bucket.end for bucket in self.accepted), default=None)
         if accepted_end is not None:
-            return max(self.seed_effective_from, accepted_end - overlap)
+            return accepted_end
         return self.seed_effective_from
 
 
@@ -423,6 +624,23 @@ class SpGroupBucketObservation:
     value: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class SpGroupSourceCoverage:
+    """Coverage evidence returned alongside normalized observations."""
+
+    status: str = SOURCE_COVERAGE_UNKNOWN
+    start: datetime | None = None
+    end: datetime | None = None
+    unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        """Validate coverage status at the adapter boundary."""
+        if self.status not in SOURCE_COVERAGE_STATUSES:
+            raise ValueError("invalid_source_coverage_status")
+
+
 class SpGroupLedgerStore:
     """Versioned HA storage wrapper for accumulation state."""
 
@@ -447,6 +665,21 @@ class SpGroupLedgerStore:
         async with self._lock:
             raw_payload = await self._store.async_load()
             self._snapshot = SpGroupLedgerSnapshot.from_dict(raw_payload)
+            # Clear legacy pending buckets for electric entries
+            # (require_two_sightings is now False, legacy pending would stall cursor)
+            cleaned = False
+            for entry_key, entry in list(self._snapshot.entries.items()):
+                if entry.utility_type == UTILITY_ELECTRIC and entry.pending:
+                    LOGGER.info(
+                        "SP Group clearing %d legacy pending buckets for %s",
+                        len(entry.pending), entry_key,
+                    )
+                    entries = dict(self._snapshot.entries)
+                    entries[entry_key] = replace(entry, pending=())
+                    self._snapshot = SpGroupLedgerSnapshot(entries=entries)
+                    cleaned = True
+            if cleaned:
+                await self._store.async_save(self._snapshot.to_dict())
             return self._snapshot
 
     async def async_initialize_sources(
@@ -504,6 +737,7 @@ class SpGroupLedgerStore:
         *,
         now: datetime,
         require_two_sightings: bool,
+        coverage: SpGroupSourceCoverage | None = None,
     ) -> SpGroupLedgerSnapshot:
         """Apply normalized bucket observations to one ledger entry."""
         async with self._lock:
@@ -515,6 +749,7 @@ class SpGroupLedgerStore:
                 observations,
                 now=now.astimezone(SINGAPORE_TZ),
                 require_two_sightings=require_two_sightings,
+                coverage=coverage,
             )
             if updated == entry:
                 return self._snapshot
@@ -562,31 +797,18 @@ class SpGroupLedgerStore:
         reference_sum_offset: Decimal | None = None,
         strategy_version: str | None = None,
         warnings: tuple[str, ...] = (),
+        statistics_dirty_from: datetime | None = None,
+        statistics_source_fingerprint: str | None = None,
+        statistics_last_verified_at: datetime | None = None,
+        clear_dirty: bool = False,
     ) -> SpGroupLedgerSnapshot:
         """Update statistics import metadata for a ledger entry."""
         async with self._lock:
             entry = self._snapshot.entries.get(sensor_key)
             if entry is None or self._snapshot.malformed:
                 return self._snapshot
-            updated = SpGroupLedgerEntry(
-                sensor_key=entry.sensor_key,
-                source=entry.source,
-                utility_type=entry.utility_type,
-                epoch_id=entry.epoch_id,
-                seed_value=entry.seed_value,
-                seed_effective_from=entry.seed_effective_from,
-                backfill_from=entry.backfill_from,
-                latest_total=entry.latest_total,
-                latest_accepted_at=entry.latest_accepted_at,
-                accepted=entry.accepted,
-                pending=entry.pending,
-                warnings=entry.warnings,
-                source_backfill_attempted_at=entry.source_backfill_attempted_at,
-                source_backfill_status=entry.source_backfill_status,
-                source_backfill_started_at=entry.source_backfill_started_at,
-                source_backfill_succeeded_at=entry.source_backfill_succeeded_at,
-                source_backfill_failed_at=entry.source_backfill_failed_at,
-                last_source_poll_succeeded_at=entry.last_source_poll_succeeded_at,
+            updated = replace(
+                entry,
                 statistics_imported_through=(
                     imported_through
                     if imported_through is not None
@@ -608,6 +830,25 @@ class SpGroupLedgerStore:
                     else entry.statistics_strategy_version
                 ),
                 statistics_warnings=tuple(dict.fromkeys(warnings)),
+                statistics_dirty_from=(
+                    None
+                    if clear_dirty
+                    else (
+                        statistics_dirty_from
+                        if statistics_dirty_from is not None
+                        else entry.statistics_dirty_from
+                    )
+                ),
+                statistics_source_fingerprint=(
+                    statistics_source_fingerprint
+                    if statistics_source_fingerprint is not None
+                    else entry.statistics_source_fingerprint
+                ),
+                statistics_last_verified_at=(
+                    statistics_last_verified_at
+                    if statistics_last_verified_at is not None
+                    else entry.statistics_last_verified_at
+                ),
             )
             if updated == entry:
                 return self._snapshot
@@ -617,6 +858,58 @@ class SpGroupLedgerStore:
             await self._store.async_save(next_snapshot.to_dict())
             self._snapshot = next_snapshot
             return self._snapshot
+
+    async def async_update_external_statistics_metadata(
+        self,
+        sensor_key: str,
+        *,
+        imported_through: datetime | None,
+        source_fingerprint: str,
+        verified_at: datetime | None,
+        warnings: tuple[str, ...] = (),
+        dirty_from: datetime | None = None,
+        clear_dirty: bool = False,
+        external_status: str | None = None,
+        expected_epoch_id: str | None = None,
+    ) -> bool:
+        """Persist external progress only if the ledger epoch is unchanged."""
+        async with self._lock:
+            entry = self._snapshot.entries.get(sensor_key)
+            if entry is None or self._snapshot.malformed:
+                return False
+            if expected_epoch_id is not None and entry.epoch_id != expected_epoch_id:
+                return False
+            if _accepted_source_fingerprint(entry) != source_fingerprint:
+                return False
+            updated = replace(
+                entry,
+                statistics_imported_through=imported_through,
+                statistics_strategy_version=EXTERNAL_STATISTICS_STRATEGY,
+                statistics_source_fingerprint=source_fingerprint,
+                statistics_last_verified_at=(
+                    verified_at
+                    if verified_at is not None
+                    else entry.statistics_last_verified_at
+                ),
+                statistics_dirty_from=(
+                    None
+                    if clear_dirty
+                    else dirty_from
+                    if dirty_from is not None
+                    else entry.statistics_dirty_from
+                ),
+                statistics_warnings=tuple(dict.fromkeys(warnings)),
+                external_migration_status=external_status
+                or ("complete" if clear_dirty and not warnings else "pending"),
+            )
+            if updated == entry:
+                return True
+            entries = dict(self._snapshot.entries)
+            entries[sensor_key] = updated
+            next_snapshot = SpGroupLedgerSnapshot(entries=entries)
+            await self._store.async_save(next_snapshot.to_dict())
+            self._snapshot = next_snapshot
+            return True
 
     async def async_mark_source_backfill_running(
         self,
@@ -711,18 +1004,8 @@ class SpGroupLedgerStore:
                 warnings = entry.warnings
                 if warning is not None and warning not in warnings:
                     warnings = (*warnings, warning)
-                entries[sensor_key] = SpGroupLedgerEntry(
-                    sensor_key=entry.sensor_key,
-                    source=entry.source,
-                    utility_type=entry.utility_type,
-                    epoch_id=entry.epoch_id,
-                    seed_value=entry.seed_value,
-                    seed_effective_from=entry.seed_effective_from,
-                    backfill_from=entry.backfill_from,
-                    latest_total=entry.latest_total,
-                    latest_accepted_at=entry.latest_accepted_at,
-                    accepted=entry.accepted,
-                    pending=entry.pending,
+                entries[sensor_key] = replace(
+                    entry,
                     warnings=warnings,
                     source_backfill_attempted_at=(
                         local_timestamp
@@ -750,13 +1033,6 @@ class SpGroupLedgerStore:
                         if status == SOURCE_BACKFILL_SUCCEEDED
                         else entry.last_source_poll_succeeded_at
                     ),
-                    statistics_imported_through=entry.statistics_imported_through,
-                    statistics_reference_start=entry.statistics_reference_start,
-                    statistics_reference_sum_offset=(
-                        entry.statistics_reference_sum_offset
-                    ),
-                    statistics_strategy_version=entry.statistics_strategy_version,
-                    statistics_warnings=entry.statistics_warnings,
                 )
                 changed = True
             if not changed:
@@ -773,6 +1049,7 @@ def _apply_observations_to_entry(
     *,
     now: datetime,
     require_two_sightings: bool,
+    coverage: SpGroupSourceCoverage | None = None,
 ) -> SpGroupLedgerEntry:
     accepted_by_key = {bucket.bucket_key: bucket for bucket in entry.accepted}
     pending_by_key = {bucket.bucket_key: bucket for bucket in entry.pending}
@@ -780,6 +1057,7 @@ def _apply_observations_to_entry(
     accepted = list(entry.accepted)
     pending: list[SpGroupPendingBucket] = []
     changed = False
+    corrections = entry.corrections
     seen_observation_keys: set[str] = set()
 
     for observation in sorted(observations, key=lambda item: item.start):
@@ -798,6 +1076,15 @@ def _apply_observations_to_entry(
                 if warning not in warnings:
                     warnings.append(warning)
                     changed = True
+                correction = SpGroupCorrection(
+                    bucket_key=observation.bucket_key,
+                    start=observation.start,
+                    previous_value=accepted_bucket.value,
+                    candidate_value=observation.value,
+                    detected_at=now,
+                )
+                corrections = _append_correction(entry.corrections, correction)
+                changed = changed or corrections != entry.corrections
             continue
         current_pending = pending_by_key.pop(observation.bucket_key, None)
         if (
@@ -861,63 +1148,118 @@ def _apply_observations_to_entry(
         Decimal("0"),
     )
     latest_accepted_at = max((bucket.end for bucket in accepted), default=None)
-    updated = SpGroupLedgerEntry(
-        sensor_key=entry.sensor_key,
-        source=entry.source,
-        utility_type=entry.utility_type,
-        epoch_id=entry.epoch_id,
-        seed_value=entry.seed_value,
-        seed_effective_from=entry.seed_effective_from,
-        backfill_from=entry.backfill_from,
+    accepted_keys = {item.bucket_key for item in entry.accepted}
+    new_accepted_starts = tuple(
+        bucket.start
+        for bucket in accepted
+        if bucket.bucket_key not in accepted_keys
+    )
+    unresolved_ranges = _merge_unresolved_ranges(
+        entry.unresolved_ranges,
+        coverage.unresolved_ranges if coverage is not None else (),
+        now=now,
+        accepted=accepted,
+    )
+    resolved_ranges = _resolve_unresolved_ranges(unresolved_ranges, accepted)
+    coverage_start = entry.source_coverage_start
+    coverage_end = entry.source_coverage_end
+    if coverage is not None:
+        coverage_start = coverage.start or coverage_start
+        coverage_end = coverage.end or coverage_end
+    updated = replace(
+        entry,
         latest_total=latest_total,
         latest_accepted_at=latest_accepted_at,
         accepted=tuple(sorted(accepted, key=lambda item: item.start)),
         pending=tuple(sorted(pending, key=lambda item: item.start)),
+        unresolved_ranges=resolved_ranges,
+        source_coverage_status=(
+            coverage.status if coverage is not None else entry.source_coverage_status
+        ),
+        source_coverage_start=(
+            coverage_start
+        ),
+        source_coverage_end=(
+            coverage_end
+        ),
+        last_source_poll_succeeded_at=(
+            now
+            if coverage is not None
+            and coverage.status != SOURCE_COVERAGE_MALFORMED
+            else entry.last_source_poll_succeeded_at
+        ),
+        corrections=corrections,
         warnings=tuple(warnings),
-        source_backfill_attempted_at=entry.source_backfill_attempted_at,
-        source_backfill_status=entry.source_backfill_status,
-        source_backfill_started_at=entry.source_backfill_started_at,
-        source_backfill_succeeded_at=entry.source_backfill_succeeded_at,
-        source_backfill_failed_at=entry.source_backfill_failed_at,
-        last_source_poll_succeeded_at=entry.last_source_poll_succeeded_at,
-        statistics_imported_through=entry.statistics_imported_through,
-        statistics_reference_start=entry.statistics_reference_start,
-        statistics_reference_sum_offset=entry.statistics_reference_sum_offset,
-        statistics_strategy_version=entry.statistics_strategy_version,
-        statistics_warnings=entry.statistics_warnings,
+        statistics_dirty_from=(
+            min(
+                new_accepted_starts,
+                default=entry.statistics_dirty_from,
+            )
+            if accepted
+            else entry.statistics_dirty_from
+        ),
     )
-    return updated if changed or updated.latest_total != entry.latest_total else entry
+    return updated if updated != entry else entry
+
+
+def _append_correction(
+    existing: tuple[SpGroupCorrection, ...],
+    correction: SpGroupCorrection,
+) -> tuple[SpGroupCorrection, ...]:
+    """Keep one latest correction per bucket within the bounded record set."""
+    by_key = {item.bucket_key: item for item in existing}
+    by_key[correction.bucket_key] = correction
+    return tuple(
+        sorted(by_key.values(), key=lambda item: item.detected_at)
+    )[-_MAX_CORRECTION_RECORDS:]
+
+
+def _merge_unresolved_ranges(
+    existing: tuple[SpGroupUnresolvedRange, ...],
+    discovered: tuple[SpGroupUnresolvedRange, ...],
+    *,
+    now: datetime,
+    accepted: list[SpGroupAcceptedBucket],
+) -> tuple[SpGroupUnresolvedRange, ...]:
+    """Merge adapter-proven gaps and preserve their first-seen timestamp."""
+    merged: dict[tuple[str, datetime, datetime], SpGroupUnresolvedRange] = {
+        (item.cadence, item.start, item.end): item for item in existing
+    }
+    for item in discovered:
+        key = (item.cadence, item.start, item.end)
+        previous = merged.get(key)
+        merged[key] = SpGroupUnresolvedRange(
+            cadence=item.cadence,
+            start=item.start,
+            end=item.end,
+            reason=item.reason,
+            first_seen_at=previous.first_seen_at if previous else now,
+            last_seen_at=now,
+        )
+    return tuple(sorted(merged.values(), key=lambda item: item.start))
+
+
+def _resolve_unresolved_ranges(
+    ranges: tuple[SpGroupUnresolvedRange, ...],
+    accepted: list[SpGroupAcceptedBucket],
+) -> tuple[SpGroupUnresolvedRange, ...]:
+    """Remove a gap only after its exact bucket has been accepted."""
+    accepted_spans = {(item.start, item.end) for item in accepted}
+    return tuple(
+        item
+        for item in ranges
+        if not any(
+            start == item.start and end == item.end
+            for start, end in accepted_spans
+        )
+    )
 
 
 def _copy_entry_with_warnings(
     entry: SpGroupLedgerEntry,
     warnings: tuple[str, ...],
 ) -> SpGroupLedgerEntry:
-    return SpGroupLedgerEntry(
-        sensor_key=entry.sensor_key,
-        source=entry.source,
-        utility_type=entry.utility_type,
-        epoch_id=entry.epoch_id,
-        seed_value=entry.seed_value,
-        seed_effective_from=entry.seed_effective_from,
-        backfill_from=entry.backfill_from,
-        latest_total=entry.latest_total,
-        latest_accepted_at=entry.latest_accepted_at,
-        accepted=entry.accepted,
-        pending=entry.pending,
-        warnings=warnings,
-        source_backfill_attempted_at=entry.source_backfill_attempted_at,
-        source_backfill_status=entry.source_backfill_status,
-        source_backfill_started_at=entry.source_backfill_started_at,
-        source_backfill_succeeded_at=entry.source_backfill_succeeded_at,
-        source_backfill_failed_at=entry.source_backfill_failed_at,
-        last_source_poll_succeeded_at=entry.last_source_poll_succeeded_at,
-        statistics_imported_through=entry.statistics_imported_through,
-        statistics_reference_start=entry.statistics_reference_start,
-        statistics_reference_sum_offset=entry.statistics_reference_sum_offset,
-        statistics_strategy_version=entry.statistics_strategy_version,
-        statistics_warnings=entry.statistics_warnings,
-    )
+    return replace(entry, warnings=warnings)
 
 
 def _entry_from_config(
@@ -936,6 +1278,13 @@ def _entry_from_config(
         backfill_from=config.backfill_from,
         latest_total=config.seed_value,
         warnings=warnings,
+        external_statistic_id=external_statistic_id(sensor_key),
+        external_identity_fingerprint=external_identity_fingerprint(
+            sensor_key, config.utility_type
+        ),
+        external_migration_status="pending",
+        statistics_strategy_version=EXTERNAL_STATISTICS_STRATEGY,
+        statistics_dirty_from=config.backfill_from,
     )
 
 
@@ -994,6 +1343,15 @@ def _parse_decimal(value: str) -> Decimal:
     if not parsed.is_finite():
         raise LedgerError("invalid_decimal")
     return parsed
+
+
+def _accepted_source_fingerprint(entry: SpGroupLedgerEntry) -> str:
+    """Return the persisted fingerprint used for conditional stats updates."""
+    material = "|".join(
+        f"{bucket.bucket_key}:{bucket.start.isoformat()}:{bucket.end.isoformat()}:{bucket.value}"
+        for bucket in sorted(entry.accepted, key=lambda item: item.start)
+    )
+    return sha256(material.encode()).hexdigest()[:16]
 
 
 def _required_string(payload: dict[str, Any], key: str) -> str:

@@ -99,12 +99,40 @@ def _ledger_summary(runtime: Any) -> dict[str, Any]:
         "pending_bucket_count": sum(
             len(getattr(entry, "pending", ())) for entry in entries.values()
         ),
+        "unresolved_range_count": sum(
+            len(getattr(entry, "unresolved_ranges", ())) for entry in entries.values()
+        ),
+        "source_coverage_statuses": dict(
+            Counter(
+                str(getattr(entry, "source_coverage_status", "unknown"))
+                for entry in entries.values()
+            )
+        ),
+        "correction_record_count": sum(
+            len(getattr(entry, "corrections", ())) for entry in entries.values()
+        ),
         "warning_count": sum(
             len(getattr(entry, "warnings", ())) for entry in entries.values()
         ),
         "statistics_warning_count": sum(
             len(getattr(entry, "statistics_warnings", ()))
             for entry in entries.values()
+        ),
+        "statistics_strategy_counts": dict(
+            Counter(
+                str(getattr(entry, "statistics_strategy_version", "unknown"))
+                for entry in entries.values()
+            )
+        ),
+        "statistics_dirty_entry_count": sum(
+            getattr(entry, "statistics_dirty_from", None) is not None
+            for entry in entries.values()
+        ),
+        "external_migration_statuses": dict(
+            Counter(
+                str(getattr(entry, "external_migration_status", "none"))
+                for entry in entries.values()
+            )
         ),
         "source_backfill_statuses": dict(
             Counter(

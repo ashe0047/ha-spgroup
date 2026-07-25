@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_utils
 
 from .const import DOMAIN
+from .external_statistics import EXTERNAL_STATISTICS_STRATEGY
 from .statistics_backfill import async_backfill_statistics
 
 if TYPE_CHECKING:
@@ -161,6 +162,21 @@ def _statistics_backfill_ready(entry: SpGroupConfigEntry, *, force: bool) -> boo
             continue
         if force:
             return True
+        if getattr(ledger_entry, "external_statistic_id", None) is not None:
+            if (
+                not getattr(ledger_entry, "accepted", ())
+                and getattr(ledger_entry, "external_migration_status", None)
+                == "complete"
+            ):
+                continue
+            if (
+                getattr(ledger_entry, "statistics_imported_through", None) is None
+                or getattr(ledger_entry, "statistics_dirty_from", None) is not None
+                or getattr(ledger_entry, "statistics_strategy_version", None)
+                != EXTERNAL_STATISTICS_STRATEGY
+            ):
+                return True
+            continue
         if (
             getattr(ledger_entry, "statistics_imported_through", None) is None
             or getattr(ledger_entry, "statistics_strategy_version", None)
@@ -178,11 +194,13 @@ def _statistics_backfill_blocked(entry: SpGroupConfigEntry) -> bool:
     if snapshot is None or getattr(snapshot, "malformed", False):
         return False
     for ledger_entry in getattr(snapshot, "entries", {}).values():
-        for warning in getattr(ledger_entry, "statistics_warnings", ()) or ():
+        statistics_warnings = getattr(ledger_entry, "statistics_warnings", ()) or ()
+        entry_warnings = getattr(ledger_entry, "warnings", ()) or ()
+        for warning in (*statistics_warnings, *entry_warnings):
             if warning in _HARD_STATISTICS_WARNINGS or any(
                 warning.startswith(prefix)
                 for prefix in _HARD_STATISTICS_WARNING_PREFIXES
-            ):
+            ) or warning.startswith("corrected_bucket:"):
                 return True
     return False
 
@@ -238,7 +256,11 @@ def async_start_initial_backfill(
         _track_backfill_task(hass, entry, task, trigger="sp_group_full_backfill")
         return
     LOGGER.info("SP Group source-history backfill deferred until HA start")
-    hass.loop.create_task(_schedule_after_start(hass, entry))
+    task = hass.async_create_task(
+        _schedule_after_start(hass, entry),
+        name="sp_group_backfill_start_waiter",
+    )
+    _track_backfill_task(hass, entry, task, trigger="sp_group_backfill_start_waiter")
 
 
 async def _schedule_after_start(
@@ -247,9 +269,9 @@ async def _schedule_after_start(
 ) -> None:
     """Wait for EVENT_HOMEASSISTANT_START, then launch the tracked backfill.
 
-    This function runs as an untracked task so the bootstrap framework
-    does not wait for it.  Once HA is running, it hands off the real
-    work to a tracked task that HA can monitor.
+    The waiter itself is tracked so unload can cancel it.  Once HA is running,
+    it hands off the real work to a separately tracked task without blocking
+    the bootstrap framework.
     """
     started = asyncio.Event()
     _unsub = hass.bus.async_listen_once(
@@ -293,7 +315,7 @@ async def _run_backfill_with_retry(
                 entry,
                 "electric",
                 runtime.electricity_coordinator.async_poll_now,
-                poll_count=2,
+                poll_count=2 if runtime.electricity_coordinator.require_two_sightings else 1,
             )
             or any_utility_failed
         )
@@ -322,54 +344,42 @@ async def _run_backfill_with_retry(
         LOGGER.debug("SP Group utility backfill deferred")
         return
 
-    # Statistics import with retry
+    # Statistics import is a single non-blocking attempt.  Recorder events and
+    # the coordinator's normal refresh path provide the retry mechanisms; this
+    # one-shot source job must not create a second retry loop.
     LOGGER.info(
         "SP Group source-history backfill completed; starting statistics import"
     )
-    for attempt in range(3):
-        try:
-            result = await async_backfill_statistics(hass, entry)
-            LOGGER.info(
-                "SP Group initial statistics import finished: attempt=%d planned=%d "
-                "importable=%d processed=%d warnings=%d",
-                attempt + 1,
-                result.planned_count,
-                result.importable_count,
-                result.processed_count,
-                result.warning_count,
-            )
-            break
-        except UpdateFailed:
-            if attempt < 2:
-                LOGGER.warning(
-                    "SP Group stats backfill transient failure (attempt %d/3)",
-                    attempt + 1,
-                )
-                await asyncio.sleep(30 * (attempt + 1))
-            else:
-                LOGGER.warning("SP Group stats backfill deferred after 3 attempts")
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            if attempt < 2:
-                LOGGER.exception(
-                    "SP Group stats backfill error (attempt %d/3)",
-                    attempt + 1,
-                )
-                await asyncio.sleep(30 * (attempt + 1))
-            else:
-                ir.async_create_issue(
-                    hass,
-                    DOMAIN,
-                    "backfill_failed",
-                    is_fixable=True,
-                    severity=ir.IssueSeverity.WARNING,
-                    translation_key="backfill_failed",
-                    translation_placeholders={
-                        "error": "Statistics import failed after 3 attempts",
-                    },
-                )
-                LOGGER.exception("SP Group stats backfill failed after 3 attempts")
+    try:
+        result = await async_backfill_statistics(hass, entry)
+        LOGGER.info(
+            "SP Group initial statistics import finished: planned=%d "
+            "importable=%d processed=%d warnings=%d",
+            result.planned_count,
+            result.importable_count,
+            result.processed_count,
+            result.warning_count,
+        )
+    except UpdateFailed:
+        LOGGER.warning(
+            "SP Group initial statistics import deferred: Recorder retry remains "
+            "available"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "backfill_failed",
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="backfill_failed",
+            translation_placeholders={
+                "error": "Statistics import failed; check logs for details",
+            },
+        )
+        LOGGER.exception("SP Group initial statistics import failed")
 
 
 async def _run_utility_source_backfill(

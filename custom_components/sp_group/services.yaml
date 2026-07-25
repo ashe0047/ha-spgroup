@@ -1,2 +1,26 @@
 dev_force_statistics_compile:
   fields: {}
+
+dev_prepare_poll_gap:
+  fields:
+    utility:
+      required: true
+      selector:
+        select:
+          options:
+            - electric
+            - water
+
+dev_poll_now:
+  fields:
+    utility:
+      required: true
+      selector:
+        select:
+            options:
+              - electric
+              - water
+    poll_end:
+      required: false
+      selector:
+        text:

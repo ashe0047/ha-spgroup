@@ -42,7 +42,8 @@ from .coordinator import (
     SpGroupElectricityCoordinator,
     SpGroupWaterCoordinator,
 )
-from .dev import async_register_dev_services
+from .dev import async_register_dev_services, initial_backfill_skipped_for_dev
+from .external_statistics import EXTERNAL_STATISTICS_STRATEGY
 from .ledger import STATISTICS_STRATEGY_NATIVE_OFFSET_V2, SpGroupLedgerStore
 from .polling_options import normalize_options
 from .sources import source_configs_for_data
@@ -144,7 +145,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: SpGroupConfigEntry) -> b
     # Source-history backfill is a one-shot provider fetch.  Statistics import
     # may remain pending until HA creates a native reference row, but that must
     # not cause repeated full-history API calls on restart.
-    if ledger_store.snapshot.malformed:
+    if initial_backfill_skipped_for_dev():
+        LOGGER.warning(
+            "SP Group setup source-history backfill skipped: "
+            "reason=dev_controlled_poll_gap"
+        )
+        _backfill_needed = False
+    elif ledger_store.snapshot.malformed:
         _backfill_needed = False
     else:
         try:
@@ -224,11 +231,7 @@ def _any_entry_missing_watermark(runtime: SpGroupRuntimeData) -> bool:
     if runtime.ledger_store is None or runtime.ledger_store.snapshot.malformed:
         return True
     for _ledger_entry in runtime.ledger_store.snapshot.entries.values():
-        if (
-            _ledger_entry.statistics_imported_through is None
-            or _ledger_entry.statistics_strategy_version
-            != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
-        ):
+        if not _statistics_entry_complete(_ledger_entry):
             return True
     return False
 
@@ -242,14 +245,13 @@ def _any_entry_can_eventually_retry_statistics(runtime: SpGroupRuntimeData) -> b
         return False
     for _ledger_entry in entries.values():
         if _statistics_retry_blocked_by_warning(
-            _ledger_entry.statistics_warnings
+            (
+                *getattr(_ledger_entry, "statistics_warnings", ()),
+                *getattr(_ledger_entry, "warnings", ()),
+            )
         ):
             continue
-        if (
-            _ledger_entry.statistics_imported_through is None
-            or _ledger_entry.statistics_strategy_version
-            != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
-        ):
+        if not _statistics_entry_complete(_ledger_entry):
             return True
     return False
 
@@ -265,16 +267,34 @@ def _any_entry_should_retry_statistics(runtime: SpGroupRuntimeData) -> bool:
         if _ledger_entry.source_backfill_attempted_at is None:
             continue
         if _statistics_retry_blocked_by_warning(
-            _ledger_entry.statistics_warnings
+            (
+                *getattr(_ledger_entry, "statistics_warnings", ()),
+                *getattr(_ledger_entry, "warnings", ()),
+            )
         ):
             continue
-        if (
-            _ledger_entry.statistics_imported_through is None
-            or _ledger_entry.statistics_strategy_version
-            != STATISTICS_STRATEGY_NATIVE_OFFSET_V2
-        ):
+        if not _statistics_entry_complete(_ledger_entry):
             return True
     return False
+
+
+def _statistics_entry_complete(ledger_entry: Any) -> bool:
+    """Return whether the current statistics strategy has no dirty suffix."""
+    if ledger_entry.statistics_imported_through is None:
+        if (
+            getattr(ledger_entry, "external_statistic_id", None) is not None
+            and not getattr(ledger_entry, "accepted", ())
+            and getattr(ledger_entry, "external_migration_status", None)
+            == "complete"
+        ):
+            return True
+        return False
+    if getattr(ledger_entry, "statistics_dirty_from", None) is not None:
+        return False
+    strategy = ledger_entry.statistics_strategy_version
+    if getattr(ledger_entry, "external_statistic_id", None) is not None:
+        return bool(strategy == EXTERNAL_STATISTICS_STRATEGY)
+    return bool(strategy == STATISTICS_STRATEGY_NATIVE_OFFSET_V2)
 
 
 def _statistics_retry_blocked_by_warning(warnings: tuple[str, ...]) -> bool:
@@ -282,6 +302,7 @@ def _statistics_retry_blocked_by_warning(warnings: tuple[str, ...]) -> bool:
     return any(
         warning.startswith("statistics_existing_negative_delta:")
         or warning.startswith("statistics_conflict:")
+        or warning.startswith("corrected_bucket:")
         or warning == "statistics_legacy_rows_need_manual_rebuild"
         for warning in warnings
     )
@@ -328,10 +349,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: SpGroupConfigEntry) -> 
     LOGGER.info("SP Group unload started")
     runtime = getattr(entry, "runtime_data", None)
     if runtime is not None:
+        tasks = set(getattr(runtime, "backfill_tasks", set()) or set())
         water_coordinator = getattr(runtime, "water_coordinator", None)
         if water_coordinator is not None:
             water_coordinator.async_cancel_schedule()
-        tasks = set(getattr(runtime, "backfill_tasks", set()) or set())
+            tasks.update(getattr(runtime, "backfill_tasks", set()) or set())
         for task in tasks:
             task.cancel()
         if tasks:
