@@ -3122,3 +3122,457 @@ Ruff and mypy passed, compileall passed, and the worktree was clean apart from
 ignored `.runtime/` state. Provider-owned external statistics remains a
 separate future implementation; these commits preserve the current
 native-offset checkpoint and its documented migration plan.
+
+### 2026-07-22 20:05 +08 - Provider-Owned Statistics Implementation Started
+
+Started implementing `docs/plans/provider-owned-external-statistics.md` as a
+separate strategy boundary. New ledger entries now receive deterministic
+`sp_group:<sensor_key>_consumption` statistic IDs, an identity fingerprint, the
+`external_provider_v3` strategy, and a dirty-from marker. Existing entries are
+left on the legacy path until the ledger store prepares them for migration;
+that preparation only assigns the new identity and never deletes or rewrites
+legacy entity statistics.
+
+Added an external Recorder reconciliation path using HA's public
+`async_add_external_statistics()` API. It projects accepted electricity and
+water provider periods into positive cumulative rows from zero, checks metadata
+ownership, reads and verifies Recorder rows on the Recorder executor, allows
+only a ledger-marked dirty suffix to be rewritten, and preserves retryable
+missing-bridge warnings. Metadata is advanced only after Recorder commit and
+exact row verification. The existing entity/native-reference importer remains
+available for unprepared legacy test/runtime entries.
+
+Added focused tests for positive provider-period projection, dirty-suffix versus
+conflict reconciliation, public external API usage without an entity registry,
+and missing-bridge safe-prefix behavior. The external and existing Recorder
+statistics tests currently pass: 21 passed. The full SP Group suite is at 282
+passed and 1 skipped after updating diagnostics expectations for the new
+strategy/dirty/migration summaries. Runtime reset and end-to-end dev
+verification remain pending until the complete external implementation and
+full static checks are finished.
+
+### 2026-07-22 20:22 +08 - External Runtime Verification and Safety Closure
+
+Reset the disposable HA runtime, completed HA onboarding as `Test`, and
+completed the SP Group frontend config flow using the cached provider session.
+Live evidence: electricity accepted 40 provider 30-minute buckets, the sensor
+state reached `1011.002 kWh`, and Recorder stored 20 external hourly rows under
+`sp_group:..._electric_consumption`. External metadata is `source=sp_group`,
+`unit=kWh`, `has_mean=0`, and `has_sum=1`; the first sums are positive and
+cumulative (`1.004`, `2.626`, `4.161`). Water was queried successfully but the
+provider returned no usable monthly observations for the configured safe seed
+boundary, so its sensor remained at `1000.0 m³` and no water statistic was
+fabricated.
+
+The dev force-statistics helper initially failed to exchange the HA refresh
+token because the browser login used `127.0.0.1` while the helper assumed
+`localhost`; it now tries both loopback client IDs. Its old native strategy
+assumptions were also updated to recognize external IDs and query external
+Recorder rows. A forced Recorder compile then fired the listener and performed
+an idempotent external recheck (`planned=20 importable=0 processed=20`) without
+provider refetch.
+
+Closed additional safety gaps found during review: external metadata updates
+now compare the captured accepted-bucket fingerprint and epoch before commit;
+provider correction warnings hard-block export and create the existing
+statistics conflict Repair; Recorder acknowledgement waits are bounded and
+remain retryable on timeout; and a successful empty provider response is
+recorded as verified-empty so it does not trigger an hourly retry forever.
+Focused external tests now pass: 7 passed; full-suite/static verification is
+being rerun after these final changes.
+
+### 2026-07-22 20:27 +08 - Scope Decision: No Legacy Migration in Dev Rollout
+
+The legacy native-to-external migration and Energy Dashboard acknowledgement
+repair are explicitly out of scope for this development rollout. The previous
+implementation attempt was removed. Fresh config-flow entries use
+`external_provider_v3`; legacy native rows are not migrated or rewritten. A
+future production rollout can add the migration and explicit Energy source
+switch after the fresh external path has been validated.
+
+### 2026-07-22 20:26 +08 - Final Fresh-Setup Runtime Check
+
+Restarted the existing non-reset dev configuration once so the final Python
+module edits were loaded, then ran `mise run ha:dev:force-statistics`. The
+Recorder compile event fired and the listener correctly skipped a complete
+external series as `not_ready`/already complete; the helper exited without its
+former 30-second timeout. The persisted fresh ledger now shows electricity
+`external_provider_v3`, 40 accepted buckets, clean dirty state, and water
+`external_provider_v3`, zero accepted buckets, `external_migration_status`
+`complete`, and clean dirty state. This confirms an empty but successful water
+response does not remain an artificial retry condition.
+
+The verified instance was then detached into `.runtime/ha-dev-detached.log` and
+remains available at `http://localhost:8123`; its final startup log reports
+`source-history backfill not scheduled: ... needed=False` and
+`statistics retry listener skipped: complete_or_blocked`.
+
+### 2026-07-22 20:38 +08 - Live Statistics Conflict Investigation
+
+Inspected the still-running instance after a fresh reset and complete SP Group
+config flow. The flow completed normally. Source backfill succeeded for both
+utilities: electricity ran two sightings and accepted 27,257 half-hour buckets;
+water accepted 11 monthly buckets. The statistics task then reported
+electricity `planned=13628 imported=13628 verified=13628 warnings=0`, but water
+`planned=11 imported=11 verified=0 warnings=11`.
+
+The water ledger persisted one `statistics_conflict:<month-end>` warning for
+each August 2025 through June 2026 period, with no imported-through watermark.
+Recorder nevertheless contains all 11 water rows under the external statistic
+ID, with the expected positive cumulative sequence ending at `244.4` and no
+decreasing sums. Electricity also has 13,628 rows with no decreasing sums.
+
+The persisted HA repair registry currently contains only the unrelated
+`deprecated_method` issue; no active SP Group statistics conflict repair is
+present. The conflict state is therefore present in the ledger, but the repair
+is not currently active in the registry.
+
+Code-path evidence indicates a false post-import verification result rather
+than a data mismatch: the external importer queues rows with HA's public
+`async_add_external_statistics()` API, waits through Recorder's
+`async_block_till_done()`, then verifies each row. The log's water result says
+all 11 rows failed verification, while the rows are present and correct in the
+database after the task. This is consistent with the Recorder queue/commit
+acknowledgement race in the current read-back boundary. No fix was applied in
+this investigation; the running HA process remains up.
+
+### 2026-07-22 20:42 +08 - Resolution for False External-Statistics Conflicts
+
+The correct resolution is to make Recorder read-back verification bounded and
+retryable. After `async_add_external_statistics()` queues a batch, the importer
+should wait for the Recorder acknowledgement and then reread the expected rows
+through `statistics_during_period()` several times with a short deadline. A
+missing row during that deadline is a pending Recorder visibility/acknowledgement
+condition, not a data conflict.
+
+Only a row that is visible in Recorder and has a different `state` or `sum`
+should produce `statistics_conflict:<start>` and a conflict Repair. If the
+deadline expires with rows still missing, persist a retryable warning such as
+`statistics_recorder_rows_pending`, retain the ledger dirty/incomplete, and let
+the existing statistics retry path try again. When a later retry observes exact
+rows, clear the warning and advance `statistics_imported_through`.
+
+The external ledger metadata update must also remain `pending`/dirty whenever
+verification is incomplete or warnings exist. It must not set
+`external_migration_status=complete` or clear the dirty suffix merely because a
+Recorder import job was queued. This prevents a false verification result from
+becoming a hard retry blocker.
+
+The `statistics_imported_through` watermark remains necessary as a progress
+marker and retry optimization. It must advance only to the latest contiguous
+row confirmed present and correct in Recorder. Submitted-but-unverified rows
+must not advance it; a partial verification must retain the prior watermark or
+advance only through the verified contiguous prefix. The watermark is not, by
+itself, proof that the full source history was imported.
+
+### 2026-07-22 20:50 +08 - External Read-Back Fix Planning
+
+Created `docs/plans/statistics-recorder-readback-fix.md` for the false external
+statistics conflict. The plan separates pure row classification from Recorder
+orchestration, classifying visible value mismatches as conflicts and absent rows
+as bounded, retryable pending visibility. It retains
+`statistics_imported_through` as a contiguous verified-prefix watermark and
+requires pending/conflict outcomes to keep the external ledger incomplete and
+dirty.
+
+The plan preserves the provider-owned external statistics strategy, public HA
+Recorder import/query APIs, source projections, statistic IDs, and
+statistics-only retry behavior. It is implementation-ready but has not been
+implemented or adversarially reviewed in this turn.
+
+### 2026-07-22 21:08 +08 - External Read-Back Fix Implemented
+
+Implemented the read-back fix from
+`docs/plans/statistics-recorder-readback-fix.md`. The external statistics
+importer now classifies Recorder rows as exact, pending, or conflicting and
+retries pending visibility for a bounded five-second deadline without
+requeueing the import batch. Missing rows persist bounded
+`statistics_recorder_rows_pending:*` warnings; visible mismatches retain the
+existing conflict warning/Repair path.
+
+External ledger metadata now distinguishes pending from complete state. The
+watermark advances only through the latest contiguous verified row, dirty state
+is retained for incomplete verification, and successful exact retries clear
+warnings and complete the series. Verification timestamps are not created for
+an initial import with no confirmed rows.
+
+Added pure, delayed-visibility, timeout, retry, conflict, metadata, and
+scheduler regression coverage. Verification completed with `294 passed, 1
+skipped`; Ruff, mypy, compile checks, and `git diff --check` pass. The existing
+HA process was not restarted, so the live instance has not loaded these module
+changes yet.
+
+### 2026-07-22 21:15 +08 - Controlled Post-Seed Poll Gap Verification
+
+The normal config-flow path cannot naturally provide a first-poll historical
+gap: setup immediately schedules the one-shot source-history backfill, which
+consumes all provider buckets from the configured seed boundary before normal
+polling begins.
+
+Recommended lowest-resistance route for manual verification is a dev-only
+controlled-gap harness. It should pause/skip only the initial source-history
+backfill, establish a deterministic seed boundary a few hours before `now`,
+then invoke the existing coordinator poll through an unload-safe HA service or
+mise helper. The harness must use the runtime ledger/coordinator APIs rather
+than edit `.storage` JSON or Recorder SQLite directly.
+
+The verification target is the external Recorder statistics timeline: after
+the two-sighting acceptance behavior, four 30-minute provider buckets spanning
+two hours should become two hourly rows whose row states equal the paired
+bucket deltas and whose cumulative sums have non-negative consecutive deltas.
+The live sensor state will still be timestamped at the poll time because HA
+state updates cannot be backdated by a normal integration poll; it should not
+be used as proof of historical hourly placement.
+
+### 2026-07-22 21:22 +08 - Controlled Gap Flow Correction
+
+The initial controlled-gap proposal requires one correction. Leaving
+`source_backfill_status` as `never_attempted` would cause the statistics
+scheduler to skip the entry even when `force=True`; the current readiness gate
+explicitly ignores `never_attempted`, `running`, and `failed` source states.
+
+The dev harness must therefore be enabled before config-flow setup so the
+initial full-backfill task is never scheduled, and after setup it must mark the
+controlled source as developer-bypassed/succeeded through a dedicated ledger
+API. The fresh entry must still have no accepted or pending buckets. The
+coordinator polls must be invoked with `backfill=False` twice, proving the first
+poll creates pending observations and the second matching poll accepts them
+under the existing two-sighting rule.
+
+The manual acceptance criteria are: no `mode=backfill` log; two normal/manual
+polls from the configured seed boundary; first poll `accepted_delta=0` with a
+positive pending delta; second poll with a positive accepted delta; then
+external Recorder rows at the expected hourly starts with correct states and
+non-negative cumulative-sum deltas. `ha:dev:force-statistics` remains a
+Recorder compile helper and is not the poll-gap creator.
+
+### 2026-07-22 21:26 +08 - Seed and Poll Window Boundary Clarification
+
+For electricity, `seed_observed_at` represents the last trusted meter reading,
+not a poll-window end field. The source builder normalizes it to
+`seed_effective_from`, the next non-overlapping 30-minute boundary. With no
+accepted or pending ledger buckets, the normal coordinator poll starts at that
+effective boundary and ends at the current poll time. Provider observations
+whose bucket is not yet closed are excluded.
+
+Therefore, to create an approximately two-hour post-seed gap, place the trusted
+seed observation/effective boundary about two hours before `now`; `now` remains
+the poll-window end. `backfill_from` is the historical source-backfill boundary
+and is not the normal poll end. For an aligned electricity seed, setting both
+form timestamps to the same boundary is appropriate, but the dev skip-backfill
+gate is still required to prevent setup from consuming the gap.
+## 2026-07-22 21:40 +08 - Controlled Post-Seed Poll Gap Harness Completed
+
+- Implemented the missing dev-only harness for the controlled post-seed polling test.
+- `SPGROUP_HA_DEV_SKIP_INITIAL_BACKFILL=1` is accepted only alongside `SPGROUP_HA_DEV_TOOLS=1`; setup therefore skips the one-shot provider history backfill after config-flow completion without changing production behavior.
+- Added guarded `sp_group.dev_prepare_poll_gap` and `sp_group.dev_poll_now` services. Preparation refuses malformed or non-empty ledgers and marks only the selected utility's source status as succeeded; normal polling invokes the coordinator with `backfill=False`, preserving the existing two-sighting rule and statistics-only retry path.
+- Added `scripts/ha_dev_sp_group_service.py` and four mise commands for electricity/water preparation and normal polling. The force-statistics command remains separate and only queues Recorder compilation.
+- Focused test coverage now checks both environment gating, service behavior, empty-ledger safety, normal-poll invocation, and validated service metadata.
+## 2026-07-22 22:20 +08 - Controlled Gap Test Used Provider-Lagged Zero Buckets
+
+- Live verification showed the controlled electricity test was orchestrated correctly: setup skipped full source backfill, preparation succeeded, the first normal poll created two pending buckets, and the second accepted them and completed the statistics-only import.
+- A direct read-only AMI request for the same premise and date showed non-zero provider readings through `15:30`, followed by literal zero rows from `16:00` onward. The tested `21:00` and `21:30` buckets were therefore in the provider's not-yet-covered/lagged suffix.
+- The test instructions assumed a recent two-hour window would contain positive data. That assumption is invalid for a lagging provider. The current parser accepts zero-valued AMI rows as valid buckets, so this run validates orchestration but not positive time-projected accumulation and may treat provider coverage sentinels as real zero consumption.
+- No production fix was made in this investigation. A follow-up design must distinguish legitimate zero-usage buckets from provider coverage gaps before using this live harness as a positive backfill test.
+## 2026-07-22 22:30 +08 - AMI Zero Semantics Decision Scope
+
+- Repository grounding confirms one locked zero-value decision only: the June 2026 AMI zero prefix represents pre-smart-meter coverage, so the history monthly bucket is authoritative for that transition month and the AMI rows are discarded. See `docs/adr/adr-hybrid-backfill-partial-month.md`.
+- No general decision exists for zero-valued post-seed/current AMI suffix rows. The manual-seed design records provider lag as variable and says freshness must not rely on a fixed delay, but it does not define whether a zero row means real zero usage or “not covered yet.”
+- `docs/adr/adr-polling-window-exact-end.md` describes `end >= now` filtering as the lag safeguard, but its status remains Proposed and that filter excludes in-progress buckets; it does not resolve completed-looking zero sentinel rows.
+- Current `_electricity_ami_observations` accepts zero values because it rejects only negative values. Therefore, the live test exposed an undocumented semantic gap rather than violating a locked general zero-value rule.
+## 2026-07-22 22:40 +08 - Locked General AMI Zero-Value Semantics
+
+- Locked the distinction requested for AMI zero values: leading zero prefixes represent pre-smart-meter coverage; trailing zero suffixes after the last non-zero bucket represent provider lag/unavailable data; future or in-progress zero rows are not observations.
+- Any zero row after AMI coverage begins, including an isolated internal zero, is treated as unavailable provider data until a later response supplies a usable value or an explicit coverage signal.
+- Added `docs/adr/adr-ami-zero-coverage-semantics.md` and updated the manual seed design and payload contract.
+- This is a documentation/decision update only. The parser and ledger still require a separate implementation plan before behavior changes.
+## 2026-07-22 22:50 +08 - Validation Must Bound Poll End to Provider Coverage
+
+- A live positive-gap test cannot be made valid by changing only `seed_observed_at`: normal coordinator polling always uses the real current time as its request/filter end, so later provider zero suffix rows remain in the same response.
+- Revised test design must first identify the latest usable non-zero AMI bucket, then bound the simulated poll end to that bucket's closed end and place the seed boundary before it.
+- The dev harness therefore needs either a controlled poll-end override that is strictly dev-gated, or a deterministic provider fixture. A preflight alone is insufficient if the coordinator still polls through wall-clock `now`.
+- Production polling semantics remain unchanged: its end remains the actual poll time; this is only a validation-harness requirement.
+## 2026-07-22 23:00 +08 - Provider-Coverage-Bounded Gap Harness Implemented
+
+- Added an optional, timezone-validated `poll_end` to the dev normal-poll service. Production scheduled refreshes remain wall-clock based.
+- Added `scripts/ha_dev_ami_latest.py` and `mise run ha:dev:ami-latest:electric` to query recent AMI days read-only and report the latest positive bucket plus seed/backfill/poll-end timestamps.
+- Added tests for dev poll-end forwarding and service metadata; focused coordinator/init/packaging suite passes.
+- Updated `docs/testing/ha-runtime-validation.md` with the corrected preflight -> config flow -> bounded two-poll -> Recorder verification sequence.
+## 2026-07-22 23:20 +08 - Corrected Preflight Poll-End Boundary
+
+- The live bounded-gap run accepted the positive `14:30-15:00` and `15:00-15:30` buckets, but excluded the latest `15:30-16:00` bucket because the recommended `poll_end=16:00` is inclusive at the bucket end (`end >= now` filter).
+- This left the `15:00` hourly projection incomplete and correctly produced `statistics_missing_bridge:15:00`; external statistics were not imported, although the native sensor statistic reflected the one-shot current sensor update.
+- Corrected `ha_dev_ami_latest.py` to recommend `latest_positive_bucket.start + 60 minutes`: for the observed latest positive `15:30` bucket, use `16:30`. This includes `15:30-16:00` and excludes the following lagged `16:00-16:30` zero bucket.
+## 2026-07-22 23:30 +08 - Aligned Preflight Seed to Complete Statistics Hour
+
+- The first bounded run also revealed that `seed=latest_start - 1h` can place the seed at `:30`, causing the first hourly statistics row to be intentionally skipped as a partial seed hour.
+- Updated the preflight to place the seed at the preceding whole-hour boundary while retaining `poll_end=latest_start + 60 minutes`. With the observed latest `15:30` bucket, the next test uses seed/backfill `14:00` and poll end `16:30`.
+- This gives the live test positive buckets `14:00`, `14:30`, `15:00`, and `15:30`, while the lagged `16:00` zero bucket remains excluded and complete `14:00`/`15:00` hourly projections can be verified.
+
+## 2026-07-22 22:50 UTC - AMI Preflight Failed on Expired Cached Access Token
+
+- `mise run ha:dev:ami-latest:electric` failed before AMI discovery because `/jarvis/v3/me` returned HTTP 401.
+- `.runtime/mobile-session.json` contained an access token expired at `2026-07-22T14:48:02Z`; the cached refresh token was present.
+- `mise run ha:dev:refresh-session` successfully refreshed the cache, after which the AMI preflight completed and returned the expected seed/backfill `2026-07-22T14:00:00+08:00` and poll end `2026-07-22T16:30:00+08:00`.
+- The preflight helper currently reads the cached session directly and does not refresh automatically. The failure was session expiry, not a provider response-shape or poll-window defect.
+
+## 2026-07-22 22:55 +08 - Controlled Electricity Gap Rerun Verified
+
+- The fresh controlled run completed without restarting or stopping the running HA instance.
+- First poll requested `14:00` through `16:30` and recorded four AMI observations as pending; the second identical poll accepted all four and cleared pending state.
+- Accepted source buckets were `0.315`, `0.361`, `0.252`, and `0.259` kWh for `14:00`, `14:30`, `15:00`, and `15:30`, totaling `1.187` kWh.
+- The sensor moved from seed `1000.0` to `1001.187`, exactly matching the seed plus accepted bucket total.
+- The statistics-only retry imported two complete hourly external rows with deltas `0.676` and `0.511` kWh; both were non-negative and matched the two 30-minute bucket pairs.
+- Ledger verification passed: pending empty, `statistics_warnings` empty, `statistics_dirty_from` null, `statistics_strategy_version=external_provider_v3`, and `external_migration_status=complete`.
+- Recorder also contained the normal native sensor statistic row. The water entity was unavailable because water was intentionally not selected for this electricity-only run.
+
+## 2026-07-22 23:00 +08 - Scope of Controlled Gap Validation
+
+- The controlled run proves post-seed AMI polling can accept 30-minute buckets and project them into complete hourly external statistics rows: `.315 + .361 = .676` and `.252 + .259 = .511`.
+- It does not prove that the sensor history itself is backfilled hourly; the sensor state still changes at the poll execution time, which is expected for a live HA entity.
+- It also does not cover arbitrary outage lengths, incomplete hours, provider corrections, restart recovery, water, or production wall-clock polling without the dev-only bounded `poll_end`.
+
+## 2026-07-22 23:05 +08 - Sensor State History Verification
+
+- Live HA API and Recorder state history both contain `sensor.electricity_consumption=1000.0` followed by `1001.187` at the second poll timestamp.
+- The current entity state API reports `state=1001.187`, with the expected energy device class, `total_increasing` state class, and `kWh` unit.
+- Therefore the integration did publish and Recorder did persist the sensor update. A graph remaining visually at `1000` is not explained by missing sensor state data; it is likely a frontend time-range/cache/data-source presentation issue, or the graph being viewed is the long-term statistics series rather than the entity state history.
+
+## 2026-07-22 23:10 +08 - Clarified Controlled-Test Coverage Limits
+
+- “Not covered” refers to scenarios not exercised by the latest manual run, not confirmed implementation failures.
+- The run covered one bounded electricity window containing four 30-minute buckets that formed two complete hourly rows. Long outages, incomplete hours, provider corrections, restart recovery, and water require separate verification paths.
+
+## 2026-07-22 23:20 +08 - Static Trace of Unexercised Recovery Scenarios
+
+- Electricity long-outage recovery is structurally supported when the provider returns the complete interval: the cursor derives from accepted/pending buckets, the two-hour overlap is deduplicated by bucket key, and requests split into bounded windows. It is not a guarantee for an unresolved gap older than the overlap or beyond provider retention.
+- Incomplete electricity hours are safely withheld by the statistics planner with `statistics_missing_bridge`; later accepted buckets trigger a statistics-only retry. The parser still accepts zero AMI values, so provider-lagged zero rows can incorrectly close a bridge despite the locked zero-coverage decision.
+- Accepted-provider corrections are deliberately not auto-applied: the ledger keeps the original value, records `corrected_bucket`, and blocks statistics with a repair. This preserves integrity but requires manual remediation to converge to corrected provider data.
+- Restart recovery converts persisted `running` source backfills to `failed`, allowing retry; however, the pre-HA-start deferred backfill waiter is not stored in tracked runtime tasks, and water startup catch-up failures clear without an immediate retry.
+- Water normal polling rereads the provider history and is idempotent, but startup catch-up checks only the latest ready month. An older missing month can remain undetected if the latest ready month is already accepted.
+
+## 2026-07-22 23:35 +08 - Source Timeline Recovery and Water Parity Issue Documented
+
+- Grounding confirmed the existing design intent already requires water to use the same seed-plus-delta architecture as electricity with monthly buckets, but the current water coordinator does not share electricity's derived cursor or unresolved-gap behavior.
+- Documented the proposed fix in `docs/issues/source-timeline-recovery-and-water-parity.md`.
+- The proposal adds a cadence-aware common source timeline, persisted unresolved gaps, ADR-compliant AMI zero handling, all-month water gap scanning, lifecycle-safe retries, and explicit provider-owned correction remediation.
+- No production implementation changes were made for this issue.
+## 2026-07-22 23:57 +0800 - Cadence-aware recovery implementation
+
+- Locked implementation scope: recover missing electricity and water source
+  buckets through the existing ledger/coordinator flow; preserve provider-owned
+  external statistics and current entity/statistic identities.
+- Correction policy remains conservative: accepted-bucket corrections are
+  detected and surfaced for explicit repair, with no automatic sensor/statistics
+  rewrite or new epoch in this refactor.
+- Implementation will proceed in gated phases: ledger persistence/cursor,
+  coverage-aware adapters, lifecycle, statistics snapshot verification, and
+  focused regression tests before full validation.
+
+## 2026-07-23 00:12 +0800 - Cadence-aware recovery implementation completed
+
+- Exact-end source cursors now prioritize unresolved ranges, pending buckets,
+  accepted bucket ends, and the seed boundary. The HA Store minor version is
+  bumped and recovery metadata is serialized with bounded correction records.
+- Electricity AMI parsing now treats only completed positive rows as coverage;
+  leading/trailing/internal/future/in-progress zero behavior follows the locked
+  ADR. Water shares the ledger application path, caches one history request per
+  premise, and scans all expected closed months during startup catch-up.
+- Deferred backfill waiters and water catch-up tasks are tracked for unload;
+  transient water startup failures requeue within the grace window. Statistics
+  remains provider-owned, snapshot/fingerprint guarded, Recorder read-back
+  verified, and statistics-only retries remain free of provider calls.
+- Focused and full SP Group tests pass. Accepted-bucket corrections remain
+  Repair-only and are intentionally not rewritten automatically.
+
+## 2026-07-23 00:24 +0800 - Final lifecycle validation
+
+- Water schedule cancellation now removes the active catch-up task for
+  rescheduling, while unload snapshots tasks before cancellation so every
+  cancelled task is still awaited.
+- The initial statistics attempt no longer owns a parallel sleep/retry loop;
+  Recorder hourly events and normal coordinator refreshes provide retry paths.
+- Final validation passed: `308 passed, 1 skipped`, Ruff, mypy, compileall, and
+  `git diff --check`.
+
+## 2026-07-23 10:45 +0800 - Test coverage closure for cadence-aware recovery
+
+Audited the 308-test suite against the 6 test gates declared in the cadence-aware
+recovery plan. Coverage was ~85% complete with 7 identified gaps.
+
+Added 10 new tests to close all but one gap:
+
+**Ledger gate (+)**
+- `test_ledger_source_poll_cursor_falls_back_to_seed_when_empty`
+- `test_ledger_concurrent_apply_observations_lock_serializes`
+- `test_ledger_concurrent_apply_observations_same_bucket`
+- `test_ledger_preserves_cursor_on_retention_exceeded`
+
+**Electricity/water gate (+)**
+- `test_water_repeated_full_history_is_idempotent`
+- `test_electricity_source_poll_malformed_response_at_coordinator`
+
+**Recorder gate (+)**
+- `test_external_readback_partial_acknowledgement_retryable`
+- `test_external_readback_partial_ack_out_of_order`
+- `test_external_readback_first_row_conflict_with_partial_ack`
+- `test_external_poll_completes_during_import_metadata_update_rejected`
+
+**Still open**
+- Water startup catch-up bounded retry after transient failure (existing
+  `test_water_startup_catchup_schedules_one_refresh_task` covers the happy
+  path; failure path requires async coordinator orchestration and is
+  low-risk since HA's coordinator model handles `UpdateFailed` natively).
+
+Final validation: `318 passed, 1 skipped` (up from 308).
+
+---
+
+## 2026-07-23 — Dev instance auto-onboarding
+
+**Goal**: After `ha:dev:reset`, the dev instance skips the interactive onboarding flow and goes straight to the login page, with a pre-configured owner account.
+
+**Discovery**:
+- `HA_DEV_RESET=1` calls `shutil.rmtree(config_dir)`, wiping `.storage/` and all onboarding state.
+- On fresh start, HA's onboarding component checks `.storage/onboarding` for completed steps. If all 4 steps (`user`, `core_config`, `analytics`, `integration`) are marked done, `async_setup` returns `True` without registering any onboarding views.
+- Auth data is stored across three files: `.storage/auth` (users, groups, credentials), `.storage/auth_provider.homeassistant` (bcrypt-hashed passwords), and `.storage/http.auth` (content user reference).
+- Location/timezone config lives in `.storage/core.config`.
+
+**Implementation**: `_write_auto_onboarding()` in `ha_dev.py` is called after `_write_minimal_config()` when `.storage/onboarding` does not exist (first run or after reset). It creates the full set of pre-onboarded storage files:
+- Auth system: owner user, admin group, credential, bcrypt-hashed password for `test`/`test123`
+- Content user: `system-read-only` user with system token for frontend rendering
+- Config: Singapore location, metric units, Asia/Singapore timezone
+- Person, areas, default Lovelace dashboard
+- HTTP config with the selected port
+
+**Credentials**: Username `test`, password `test123`. After HA starts, visit `http://localhost:8123`, log in, and reach the dashboard directly — no onboarding steps.
+
+## 2026-07-25 — Mid-window gap recovery scenario assessed
+
+Assessed whether a mid-window data gap (data available at start and end of
+backfill window but missing in middle) could self-heal through normal polling.
+Conclusion: unlikely, because the provider processes data in time-sequential
+order — a middle gap would require out-of-order processing. Not tested or
+verified against the live API. Documented in
+`docs/adr/adr-seed-statistics-alignment.md#mid-window-gap-scenario-unlikely`.
+
+---
+
+## 2026-07-25 — Dev seed defaults for config flow
+
+**Goal**: Pre-fill seed values (seed_value, seed_observed_at, backfill_from) in the SP Group config flow so the user doesn't have to type them after a reset.
+
+**How it works**:
+- A JSON file `.runtime/dev-seed-defaults.json` maps utility types to default field values.
+- `config_flow.py` loads this file and applies defaults to the seed form schema fields using `vol.Required(..., default=...)`.
+- `ha_dev.py` writes this file after auto-onboarding, computing dynamic timestamps:
+  - Water: `seed_observed_at` = 1st of current month at 00:00 SGT
+  - Electricity: `seed_observed_at` = current time rounded down to nearest 30 min SGT
+- Both utilities: `backfill_from` = 2025-01-01, `seed_value` = 500 (water) / 2000 (electricity)
+
+**Constants added to config_flow.py**:
+- `DEV_SEED_DEFAULTS_FILE_ENV` / `DEFAULT_DEV_SEED_DEFAULTS_FILE` — follows the same pattern as the dev session file resolution.
+
+**Files changed**:
+- `scripts/ha_dev.py` — writes dev-seed-defaults.json in `_write_auto_onboarding`
+- `custom_components/sp_group/config_flow.py` — loads defaults and pre-fills seed step schemas

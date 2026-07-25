@@ -2,13 +2,13 @@
 
 ## Status
 
-Proposed — 2026-07-21
+Accepted — 2026-07-22
 
 ## Context
 
 The electric coordinator's polling window determines which time range of AMI
-data is fetched on each poll. The current implementation uses `source_poll_cursor_start`
-which applies a 2-hour overlap:
+data is fetched on each poll. The original implementation used
+`source_poll_cursor_start` with a 2-hour overlap:
 
 ```python
 # Current (simplified):
@@ -37,8 +37,9 @@ both concerns:
   not by precise time window. Two polls 5 minutes apart return the same
   date-range data. The `_observations` filter `start < backfill_from` already
   excludes already-accepted data.
-- The `end >= now` filter independently handles provisional data near the
-  current time. This is the true data-lag safeguard, not the overlap.
+- The half-open source filter excludes any bucket whose end is after the poll
+  time. Provider lag is retained as coverage state and unresolved ranges rather
+  than accepted usage.
 - SP Group AMI data for completed 30-minute periods is authoritative and
   stable (regulated smart meter utility). No evidence of late corrections.
 
@@ -103,7 +104,7 @@ return self.seed_effective_from
 
 The cursor naturally advances forward with each poll, never re-fetching
 already-accepted data. In steady-state, `accepted_end ≈ now`, so the window
-is `[now, now]` (empty) until new data matures past the `end >= now` filter.
+is `[now, now]` (empty) until a completed bucket is available from the provider.
 
 **Trace without two-sighting rule** (for reference):
 
@@ -125,31 +126,33 @@ inconsistencies:
 | 24h downtime catch-up | ✅ Catch-up completes in 2 polls |
 | Steady-state incremental | ✅ Empty window when caught up, no re-fetching |
 | Boundary bucket at `accepted_end` | ✅ Clean — `start < backfill_from` excludes already-accepted |
-| Water coordinator | ✅ Unaffected — uses base `_request_start`, not cursor |
-| API data lag | ✅ Handled by `end >= now` filter independently |
+| Water coordinator | ✅ Uses the shared persisted cursor and ledger recovery model |
+| API data lag | ✅ Incomplete buckets are excluded and lagging coverage is persisted |
 | Instance restart with persisted ledger | ✅ Loads from persistence, cursor derives from accepted |
 
 ## Decision
 
-Remove the 2-hour overlap from `source_poll_cursor_start`. The cursor should
-return the exact boundary — `pending_start`, `accepted_end`, or
-`seed_effective_from` — without subtracting the overlap.
+The 2-hour overlap is removed from `source_poll_cursor_start`. The cursor
+returns the exact boundary — proven unresolved range, `pending_start`,
+`accepted_end`, or `seed_effective_from` — without subtracting the overlap.
 
 ### Changes required
 
 1. **`custom_components/sp_group/ledger.py`**: Remove the `overlap` parameter
    from `source_poll_cursor_start` and the subtraction in all branches.
 
-2. **`custom_components/sp_group/coordinator.py`**: Update the electricity
-   coordinator's `_request_start` to pass `overlap=timedelta()` (no overlap).
-   Alternatively, remove the overlap entirely from the method signature.
+2. **`custom_components/sp_group/coordinator.py`**: Use the exact persisted
+   cursor for electricity and water. The cursor prioritizes proven unresolved
+   ranges, pending buckets, and the latest accepted bucket end.
 
 ### What stays the same
 
 - The two-sighting rule (`require_two_sightings=True`) is unchanged.
-- The `end >= now` filter in `_observations` is unchanged.
+- The source filter uses half-open bucket semantics and excludes only buckets
+  whose end is after the poll time.
 - The polling interval (DurationSelector) is unchanged.
-- The water coordinator is unchanged.
+- The water coordinator uses the shared persisted cursor, coverage, unresolved
+  range, and ledger application path while retaining monthly closure semantics.
 - The data backfill into statistics is unchanged.
 
 ## Consequences

@@ -291,6 +291,11 @@ Locked source freshness policy:
 - do not use a fixed freshness delay as the only acceptance rule;
 - accept only buckets that are non-overlapping, not current/in-progress, and
   stable according to the implemented ledger policy;
+- AMI zero rows are positional: a leading zero prefix is pre-smart-meter
+  coverage, while a trailing zero suffix after the last non-zero bucket is
+  provider lag/unavailable data and must not be accepted as usage;
+- future or in-progress zero rows are not observations, and isolated internal
+  zero rows require explicit source evidence before being treated as missing;
 - lack of a new bucket does not make the sensor unavailable;
 - keep the last derived total and expose source freshness metadata instead;
 - water monthly buckets are accepted only after the month is closed, with a

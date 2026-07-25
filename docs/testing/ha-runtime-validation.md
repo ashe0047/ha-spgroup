@@ -83,6 +83,61 @@ For a real HA runtime, additionally verify:
 - confirmed lower replacement is visible as an intentional reset/replacement
   event, not a silent historical rewrite.
 
+## Controlled Post-Seed Electricity Gap
+
+Use this disposable dev-only flow when validating delayed AMI buckets. Do not
+choose the seed as simply `now - 2 hours`: the provider may return zero rows
+after its latest available bucket.
+
+1. Before resetting HA or completing config flow, run:
+
+   ```bash
+   mise run ha:dev:ami-latest:electric
+   ```
+
+2. Use the reported `recommended_seed_observed_at` and
+   `recommended_backfill_from` for the electricity seed. Select only the
+   matching electricity utility during config flow. The reported
+   `recommended_poll_end` is one 30-minute bucket after the latest positive
+   provider bucket. The extra bucket is required because the coordinator
+   excludes rows whose bucket end equals the poll end. The recommended seed is
+   placed at the preceding whole-hour boundary so at least one complete hourly
+   statistics row can be projected.
+
+3. Start the disposable controlled-gap instance and complete onboarding:
+
+   ```bash
+   mise run ha:dev:cached-session:poll-gap:reset
+   ```
+
+4. After config flow completes, arm the empty ledger:
+
+   ```bash
+   mise run ha:dev:prepare-poll-gap:electric
+   ```
+
+5. Run two normal polls with the exact same preflight end timestamp:
+
+   ```bash
+   SPGROUP_HA_DEV_POLL_END="<recommended_poll_end>" \
+     mise run ha:dev:poll-now:electric
+   SPGROUP_HA_DEV_POLL_END="<recommended_poll_end>" \
+     mise run ha:dev:poll-now:electric
+   ```
+
+   The first poll must leave positive buckets pending. The second must accept
+   them without including provider-lagged zero rows after the bounded end.
+
+6. Compile Recorder statistics and inspect the ledger, sensor total, and
+   timestamped external statistics:
+
+   ```bash
+   mise run ha:dev:force-statistics
+   ```
+
+The `poll_end` override is available only through the dev service and does not
+change production scheduled polling, which continues to use wall-clock time.
+
 ## Opt-In Live HA Soak
 
 Run only after hermetic tests pass:
