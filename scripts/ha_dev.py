@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import signal
 import socket
+import secrets
 import subprocess
 import sys
+import uuid
 from contextlib import suppress
 from pathlib import Path
 from types import FrameType
+from datetime import datetime, timezone
 
 SHUTDOWN_TIMEOUT = 60
 TERMINATE_TIMEOUT = 10
@@ -73,6 +77,345 @@ def _check_environment() -> str | None:
 
 
 
+def _write_auto_onboarding(config_dir: Path, port: int) -> None:
+    """Write storage files so HA starts fully onboarded with a pre-configured owner.
+
+    Creates the auth system, core config, person, areas, defaults, and HTTP
+    setup that the interactive onboarding flow would normally produce.  Called
+    only when the config directory is freshly created (first run or after reset).
+    """
+    import base64
+
+    import bcrypt
+
+    storage_dir = config_dir / ".storage"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    user_id = uuid.uuid4().hex[:32]
+    content_user_id = uuid.uuid4().hex[:32]
+    credential_id = uuid.uuid4().hex[:32]
+    now = datetime.now(timezone.utc).isoformat()
+
+    # --- Onboarding: all 4 steps done
+    (storage_dir / "onboarding").write_text(
+        json.dumps(
+            {
+                "version": 4,
+                "minor_version": 1,
+                "key": "onboarding",
+                "data": {
+                    "done": ["user", "core_config", "analytics", "integration"]
+                },
+            }
+        )
+    )
+
+    # --- Auth provider: bcrypt-hashed password for test / test123
+    password_hash: bytes = bcrypt.hashpw(
+        b"test123", bcrypt.gensalt(rounds=12)
+    )
+    stored_password: str = base64.b64encode(password_hash).decode()
+    (storage_dir / "auth_provider.homeassistant").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 1,
+                "key": "auth_provider.homeassistant",
+                "data": {
+                    "users": [{"username": "test", "password": stored_password}]
+                },
+            }
+        )
+    )
+
+    # --- Auth: users, groups, credentials
+    system_token = secrets.token_hex(64)
+    system_jwt_key = secrets.token_hex(64)
+    (storage_dir / "auth").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 1,
+                "key": "auth",
+                "data": {
+                    "users": [
+                        {
+                            "id": content_user_id,
+                            "group_ids": ["system-read-only"],
+                            "is_owner": False,
+                            "is_active": True,
+                            "name": "Home Assistant Content",
+                            "system_generated": True,
+                            "local_only": False,
+                        },
+                        {
+                            "id": user_id,
+                            "group_ids": ["system-admin"],
+                            "is_owner": True,
+                            "is_active": True,
+                            "name": "Test",
+                            "system_generated": False,
+                            "local_only": False,
+                        },
+                    ],
+                    "groups": [
+                        {"id": "system-admin", "name": "Administrators"},
+                        {"id": "system-users", "name": "Users"},
+                        {"id": "system-read-only", "name": "Read Only"},
+                    ],
+                    "credentials": [
+                        {
+                            "id": credential_id,
+                            "user_id": user_id,
+                            "auth_provider_type": "homeassistant",
+                            "auth_provider_id": None,
+                            "data": {"username": "test"},
+                        },
+                    ],
+                    "refresh_tokens": [
+                        {
+                            "id": content_user_id,
+                            "user_id": content_user_id,
+                            "client_id": None,
+                            "client_name": None,
+                            "client_icon": None,
+                            "token_type": "system",
+                            "created_at": now,
+                            "access_token_expiration": 1800.0,
+                            "token": system_token,
+                            "jwt_key": system_jwt_key,
+                            "last_used_at": None,
+                            "last_used_ip": None,
+                            "expire_at": None,
+                            "credential_id": None,
+                            "version": "2026.7.2",
+                        },
+                    ],
+                },
+            }
+        )
+    )
+
+    # --- Person
+    (storage_dir / "person").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "minor_version": 1,
+                "key": "person",
+                "data": {
+                    "items": [
+                        {
+                            "id": "test",
+                            "name": "Test",
+                            "user_id": user_id,
+                            "device_trackers": [],
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    # --- Core config: Singapore location
+    (storage_dir / "core.config").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 4,
+                "key": "core.config",
+                "data": {
+                    "latitude": 1.357107,
+                    "longitude": 103.8194992,
+                    "elevation": 0,
+                    "unit_system_v2": "metric",
+                    "location_name": "Home",
+                    "time_zone": "Asia/Singapore",
+                    "external_url": None,
+                    "internal_url": None,
+                    "currency": "SGD",
+                    "country": "SG",
+                    "language": "en",
+                    "radius": 100,
+                },
+            }
+        )
+    )
+
+    # --- HTTP
+    (storage_dir / "http").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 1,
+                "key": "http",
+                "data": {
+                    "server_port": port,
+                    "ssl_profile": "modern",
+                    "use_x_frame_options": True,
+                    "cors_allowed_origins": [
+                        "https://cast.home-assistant.io"
+                    ],
+                    "ip_ban_enabled": True,
+                    "login_attempts_threshold": -1,
+                },
+            }
+        )
+    )
+
+    (storage_dir / "http.auth").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 1,
+                "key": "http.auth",
+                "data": {"content_user": content_user_id},
+            }
+        )
+    )
+
+    # --- Area registry: default named areas
+    (storage_dir / "core.area_registry").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 9,
+                "key": "core.area_registry",
+                "data": {
+                    "areas": [
+                        {
+                            "aliases": [],
+                            "floor_id": None,
+                            "humidity_entity_id": None,
+                            "icon": "mdi:sofa",
+                            "id": "living_room",
+                            "labels": [],
+                            "name": "Living Room",
+                            "picture": None,
+                            "temperature_entity_id": None,
+                            "created_at": now,
+                            "modified_at": now,
+                        },
+                        {
+                            "aliases": [],
+                            "floor_id": None,
+                            "humidity_entity_id": None,
+                            "icon": "mdi:stove",
+                            "id": "kitchen",
+                            "labels": [],
+                            "name": "Kitchen",
+                            "picture": None,
+                            "temperature_entity_id": None,
+                            "created_at": now,
+                            "modified_at": now,
+                        },
+                        {
+                            "aliases": [],
+                            "floor_id": None,
+                            "humidity_entity_id": None,
+                            "icon": "mdi:bed",
+                            "id": "bedroom",
+                            "labels": [],
+                            "name": "Bedroom",
+                            "picture": None,
+                            "temperature_entity_id": None,
+                            "created_at": now,
+                            "modified_at": now,
+                        },
+                    ]
+                },
+            }
+        )
+    )
+
+    # --- Lovelace: default dashboard
+    (storage_dir / "lovelace_dashboards").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "minor_version": 1,
+                "key": "lovelace_dashboards",
+                "data": {
+                    "items": [
+                        {
+                            "id": "map",
+                            "icon": "mdi:map",
+                            "title": "Map",
+                            "url_path": "map",
+                            "require_admin": False,
+                            "mode": "storage",
+                            "show_in_sidebar": True,
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    # --- Dev seed defaults for config flow
+    _write_dev_seed_defaults(config_dir)
+
+    # --- HA version marker
+    (config_dir / ".HA_VERSION").write_text("2026.7.2")
+
+
+
+def _write_dev_seed_defaults(config_dir: Path) -> None:
+    """Write developer seed defaults so the config flow pre-fills seed fields.
+
+    Timestamps are computed dynamically relative to 'now' so a fresh reset
+    always produces sensible defaults without manual entry.
+    """
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    sgt = ZoneInfo("Asia/Singapore")
+    now_sgt = datetime.now(sgt)
+
+    # Water: 1st of current month at 00:00 SGT (naive)
+    water_seen = datetime(
+        year=now_sgt.year, month=now_sgt.month,
+        day=1, hour=0, minute=0, second=0, microsecond=0,
+    )
+    # Frontend DateTimeSelector expects YYYY-MM-DDT00:00:00 HH:MM format
+    water_seen_frontend = water_seen.strftime("%Y-%m-%dT00:00:00 00:00")
+
+    # Electricity: round down to nearest 30-minute boundary (naive)
+    elec_minutes = (now_sgt.minute // 30) * 30
+    elec_seen = datetime(
+        year=now_sgt.year, month=now_sgt.month,
+        day=now_sgt.day, hour=now_sgt.hour,
+        minute=elec_minutes, second=0, microsecond=0,
+    )
+    # Frontend DateTimeSelector expects YYYY-MM-DDT00:00:00 HH:MM format
+    elec_seen_frontend = f"{elec_seen.strftime('%Y-%m-%d')}T00:00:00 {elec_seen.strftime('%H:%M')}"
+
+    defaults = {
+        "water": {
+            "seed_value": 500,
+            "seed_observed_at": water_seen_frontend,
+            "backfill_from": "2025-01-01T00:00:00 00:00",
+        },
+        "electric": {
+            "seed_value": 2000,
+            "seed_observed_at": elec_seen_frontend,
+            "backfill_from": "2025-01-01T00:00:00 00:00",
+        },
+    }
+
+    target = config_dir.parent / "dev-seed-defaults.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(defaults, indent=2))
+    _LOGGER = __import__("logging").getLogger(__name__)
+    _LOGGER.info(
+        "SP Group dev seed defaults written: %s (water=%s, elec=%s)",
+        target,
+        defaults["water"]["seed_observed_at"],
+        defaults["electric"]["seed_observed_at"],
+    )
+
+
+
 def main() -> int:
     """Prepare a minimal HA config directory and start Home Assistant."""
     repo = Path(__file__).resolve().parents[1]
@@ -97,6 +440,12 @@ def main() -> int:
         sp_group_link.unlink()
     sp_group_link.symlink_to(repo / "custom_components" / "sp_group")
     _write_minimal_config(config_dir, port)
+    if not (config_dir / ".storage" / "onboarding").exists():
+        _write_auto_onboarding(config_dir, port)
+        print(
+            "Onboarding auto-configured -- log in with test / test123",
+            flush=True,
+        )
     print(f"Starting Home Assistant at http://localhost:{port}", flush=True)
     process = subprocess.Popen(
         [

@@ -34,6 +34,14 @@ run = "SPGROUP_HA_DEV_AUTH_BYPASS=1 SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-
 description = "Reset config & start HA dev (Python 3.14, HA 2026.7.2) cached session bypass"
 run = "HA_DEV_RESET=1 SPGROUP_HA_DEV_AUTH_BYPASS=1 SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json python scripts/ha_dev.py"
 
+[tasks."ha:dev:cached-session:poll-gap"]
+description = "Start HA dev with controlled post-seed poll-gap mode"
+run = "SPGROUP_HA_DEV_AUTH_BYPASS=1 SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json SPGROUP_HA_DEV_SKIP_INITIAL_BACKFILL=1 python scripts/ha_dev.py"
+
+[tasks."ha:dev:cached-session:poll-gap:reset"]
+description = "Reset config & start HA dev with controlled post-seed poll-gap mode"
+run = "HA_DEV_RESET=1 SPGROUP_HA_DEV_AUTH_BYPASS=1 SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json SPGROUP_HA_DEV_SKIP_INITIAL_BACKFILL=1 python scripts/ha_dev.py"
+
 [tasks."ha:dev:refresh-session"]
 description = "Dev-only: refresh .runtime/mobile-session.json access token"
 run = "SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json python scripts/ha_dev_refresh_session.py"
@@ -41,6 +49,26 @@ run = "SPGROUP_HA_DEV_SESSION_FILE=.runtime/mobile-session.json python scripts/h
 [tasks."ha:dev:force-statistics"]
 description = "Dev-only: force HA Recorder statistics and SP Group statistics import"
 run = "python scripts/ha_dev_force_statistics.py"
+
+[tasks."ha:dev:prepare-poll-gap:electric"]
+description = "Dev-only: arm an empty electricity ledger for a post-seed poll-gap test"
+run = "python scripts/ha_dev_sp_group_service.py prepare_poll_gap electric"
+
+[tasks."ha:dev:prepare-poll-gap:water"]
+description = "Dev-only: arm an empty water ledger for a post-seed poll-gap test"
+run = "python scripts/ha_dev_sp_group_service.py prepare_poll_gap water"
+
+[tasks."ha:dev:poll-now:electric"]
+description = "Dev-only: run one normal electricity poll"
+run = "python scripts/ha_dev_sp_group_service.py poll_now electric"
+
+[tasks."ha:dev:poll-now:water"]
+description = "Dev-only: run one normal water poll"
+run = "python scripts/ha_dev_sp_group_service.py poll_now water"
+
+[tasks."ha:dev:ami-latest:electric"]
+description = "Dev-only: find latest usable electricity AMI bucket and test timestamps"
+run = "python scripts/ha_dev_ami_latest.py"
 
 [tasks."python:lint"]
 description = "Run Python lint and type checks"

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +14,8 @@ from typing import Any
 
 DOMAIN = "sp_group"
 SERVICE = "dev_force_statistics_compile"
+EXTERNAL_STATISTICS_STRATEGY = "external_provider_v3"
+LEGACY_STATISTICS_STRATEGY = "native_offset_v2"
 DEFAULT_CONFIG_DIR = Path(".runtime/ha-config")
 WAIT_TIMEOUT_SECONDS = 30
 WAIT_INTERVAL_SECONDS = 1
@@ -44,28 +45,36 @@ def _server_port(config_dir: Path) -> int:
 
 def _access_token(config_dir: Path, port: int) -> str:
     refresh = _refresh_token(config_dir)
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-            "client_id": f"http://localhost:{port}/",
-        }
-    ).encode()
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/auth/token",
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
+    for host in ("127.0.0.1", "localhost"):
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": f"http://{host}:{port}/",
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/auth/token",
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+            return str(payload["access_token"])
+        except urllib.error.HTTPError as exc:
+            if exc.code != 400:
+                raise
+        except urllib.error.URLError as exc:
+            raise SystemExit(
+                "Could not reach the HA dev instance. Start it with "
+                "`mise run ha:dev:cached-session` first."
+            ) from exc
+    raise SystemExit(
+        "Could not exchange the Test user's HA refresh token. "
+        "Sign in again after a dev reset."
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except urllib.error.URLError as exc:
-        raise SystemExit(
-            "Could not reach the HA dev instance. Start it with "
-            "`mise run ha:dev:cached-session` first."
-        ) from exc
-    return str(payload["access_token"])
 
 
 def _refresh_token(config_dir: Path) -> str:
@@ -154,10 +163,23 @@ def _ledger_import_status(config_dir: Path) -> str:
             if entry.get("source_backfill_attempted_at") is None:
                 continue
             saw_source_attempt = True
+            strategy = entry.get("statistics_strategy_version")
+            if entry.get("statistics_dirty_from") is not None:
+                return "pending"
+            if strategy == EXTERNAL_STATISTICS_STRATEGY:
+                if (
+                    entry.get("external_migration_status") == "complete"
+                    and not entry.get("accepted")
+                ):
+                    continue
+                if entry.get("statistics_imported_through") is None:
+                    return "pending"
+                continue
+            if entry.get("statistics_imported_through") is None:
+                return "pending"
             if (
-                entry.get("statistics_imported_through") is None
+                strategy != LEGACY_STATISTICS_STRATEGY
                 or entry.get("statistics_reference_start") is None
-                or entry.get("statistics_strategy_version") != "native_anchored_v1"
             ):
                 return "pending"
     return "complete" if saw_source_attempt else "pending"
@@ -182,7 +204,7 @@ def _print_statistics_rows(config_dir: Path) -> None:
             WHERE m.statistic_id IN (
                 'sensor.electricity_consumption',
                 'sensor.water_consumption'
-            )
+            ) OR m.statistic_id LIKE 'sp_group:%'
             GROUP BY m.statistic_id
             ORDER BY m.statistic_id
             """
