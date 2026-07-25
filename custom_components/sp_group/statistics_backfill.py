@@ -210,6 +210,74 @@ _HALF_HOUR_SECONDS = int(_HALF_HOUR.total_seconds())
 _SLOT_EPOCH = datetime(2000, 1, 1, tzinfo=SINGAPORE_TZ)
 
 
+
+async def _async_backfill_external(
+    hass: HomeAssistant,
+    ledger_store: Any,
+    sensor_key: str,
+    ledger_entry: SpGroupLedgerEntry,
+    *,
+    entry_id: str,
+    force: bool,
+) -> StatisticsImportResult:
+    """Import external statistics using provider-owned statistic ID."""
+    del force
+    projected, bridge_warnings = await hass.async_add_executor_job(
+        _projected_statistics_with_warnings,
+        ledger_entry,
+    )
+    if not projected:
+        if bridge_warnings:
+            await _update_statistics_metadata(
+                ledger_store, sensor_key,
+                warnings=bridge_warnings,
+            )
+        LOGGER.info(
+            "SP Group external statistics skipped: utility=%s projected=0 "
+            "warnings=%d",
+            ledger_entry.utility_type,
+            len(bridge_warnings),
+        )
+        return StatisticsImportResult(warning_count=len(bridge_warnings))
+
+    planned = _planned_statistics(ledger_entry)
+    if not planned:
+        LOGGER.info(
+            "SP Group external statistics skipped: utility=%s projected=%d "
+            "planned=0",
+            ledger_entry.utility_type,
+            len(projected),
+        )
+        return StatisticsImportResult(warning_count=len(bridge_warnings))
+
+    statistic_id = ledger_entry.external_statistic_id
+    metadata = _metadata(statistic_id, ledger_entry.utility_type)
+    async_import_statistics(
+        hass, metadata,
+        [_statistic_data(row) for row in planned],
+    )
+
+    last_start = max(row.start for row in planned)
+    await _update_statistics_metadata(
+        ledger_store, sensor_key,
+        imported_through=last_start,
+        warnings=bridge_warnings,
+    )
+
+    LOGGER.info(
+        "SP Group external statistics reconciled: utility=%s "
+        "statistic_id=%s planned=%d imported=%d",
+        ledger_entry.utility_type,
+        statistic_id,
+        len(planned), len(planned),
+    )
+    return StatisticsImportResult(
+        planned_count=len(planned),
+        importable_count=len(planned),
+        processed_count=len(planned),
+        warning_count=len(bridge_warnings),
+    )
+
 async def async_backfill_statistics(
     hass: HomeAssistant,
     entry: SpGroupConfigEntry,
@@ -228,6 +296,16 @@ async def async_backfill_statistics(
     total_processed = 0
     total_warnings = 0
     for sensor_key, ledger_entry in ledger_store.snapshot.entries.items():
+        if ledger_entry.external_statistic_id is not None:
+            result = await _async_backfill_external(
+                hass, ledger_store, sensor_key, ledger_entry,
+                entry_id=entry.entry_id, force=force,
+            )
+            total_planned += result.planned_count
+            total_importable += result.importable_count
+            total_processed += result.processed_count
+            total_warnings += result.warning_count
+            continue
         entity_id = registry.async_get_entity_id("sensor", DOMAIN, sensor_key)
         if entity_id is None:
             continue
@@ -863,6 +941,8 @@ def _has_seed_bridge(
     if row_start < seed < row_end:
         return False
     if row_end <= seed:
+        if entry.utility_type == UTILITY_ELECTRIC:
+            return True
         return _has_indexed_contiguous_range(
             index,
             start=row_start,
@@ -984,7 +1064,7 @@ def _metadata(entity_id: str, utility_type: str) -> StatisticMetaData:
         "has_mean": False,
         "mean_type": StatisticMeanType.NONE,
         "has_sum": True,
-        "name": None,
+        "name": f"SP Group {'Electricity' if utility_type == UTILITY_ELECTRIC else 'Water'} consumption",
         "source": RECORDER_DOMAIN,
         "statistic_id": entity_id,
         "unit_class": "energy" if utility_type == UTILITY_ELECTRIC else "volume",
