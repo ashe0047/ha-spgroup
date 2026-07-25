@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -16,11 +17,14 @@ from custom_components.sp_group.ledger import (
     SOURCE_BACKFILL_NEVER_ATTEMPTED,
     SOURCE_BACKFILL_RUNNING,
     SOURCE_BACKFILL_SUCCEEDED,
+    SOURCE_COVERAGE_COVERED,
     WARNING_SOURCE_BACKFILL_INTERRUPTED,
     WARNING_USER_REBUILT_LEDGER,
     SpGroupBucketObservation,
     SpGroupLedgerEntry,
     SpGroupLedgerSnapshot,
+    SpGroupSourceCoverage,
+    SpGroupUnresolvedRange,
     closed_month_ready,
     historical_state_at,
 )
@@ -221,9 +225,9 @@ async def test_source_poll_cursor_derives_from_pending_then_accepted(
         now=datetime(2026, 7, 15, 16, 0, tzinfo=SINGAPORE_TZ),
         require_two_sightings=True,
     )
-    assert snapshot.entries["opaque_electric"].source_poll_cursor_start(
-        overlap=timedelta(hours=2)
-    ) == datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ)
+    assert snapshot.entries["opaque_electric"].source_poll_cursor_start() == datetime(
+        2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ
+    )
 
     snapshot = await store.async_apply_observations(
         "opaque_electric",
@@ -231,9 +235,138 @@ async def test_source_poll_cursor_derives_from_pending_then_accepted(
         now=datetime(2026, 7, 15, 17, 0, tzinfo=SINGAPORE_TZ),
         require_two_sightings=True,
     )
-    assert snapshot.entries["opaque_electric"].source_poll_cursor_start(
-        overlap=timedelta(hours=1)
-    ) == datetime(2026, 7, 15, 14, 30, tzinfo=SINGAPORE_TZ)
+    assert snapshot.entries["opaque_electric"].source_poll_cursor_start() == datetime(
+        2026, 7, 15, 15, 30, tzinfo=SINGAPORE_TZ
+    )
+
+
+async def test_source_poll_cursor_prioritizes_proven_unresolved_range(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """An older proven gap is retried before pending or accepted data."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-unresolved-cursor")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    gap = SpGroupUnresolvedRange(
+        cadence="30m",
+        start=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 14, 30, tzinfo=SINGAPORE_TZ),
+        reason="missing_internal_bucket",
+        first_seen_at=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+        last_seen_at=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_apply_observations(
+        "opaque_electric",
+        (),
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=True,
+        coverage=SpGroupSourceCoverage(
+            status=SOURCE_COVERAGE_COVERED,
+            start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+            end=datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ),
+            unresolved_ranges=(gap,),
+        ),
+    )
+    entry = store.snapshot.entries["opaque_electric"]
+    assert entry.unresolved_ranges == (gap,)
+    assert entry.source_poll_cursor_start() == gap.start
+
+
+async def test_accepted_correction_is_recorded_without_mutating_trusted_total(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Provider corrections remain explicit repair work."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-correction")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    observation = SpGroupBucketObservation(
+        bucket_key="bucket-1500",
+        start=datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 15, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1"),
+    )
+    await store.async_apply_observations(
+        "opaque_electric",
+        (observation,),
+        now=datetime(2026, 7, 15, 16, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+    )
+    corrected = SpGroupBucketObservation(
+        bucket_key=observation.bucket_key,
+        start=observation.start,
+        end=observation.end,
+        value=Decimal("0.5"),
+    )
+    snapshot = await store.async_apply_observations(
+        "opaque_electric",
+        (corrected,),
+        now=datetime(2026, 7, 15, 17, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+    )
+    entry = snapshot.entries["opaque_electric"]
+    assert entry.latest_total == Decimal("101")
+    assert entry.accepted[0].value == Decimal("1")
+    assert entry.corrections[0].candidate_value == Decimal("0.5")
+    assert "corrected_bucket:bucket-1500" in entry.warnings
+
+
+def test_ledger_round_trip_preserves_recovery_metadata() -> None:
+    """New recovery fields round-trip without exposing raw payloads."""
+    entry = SpGroupLedgerEntry(
+        sensor_key="opaque_electric",
+        source=SOURCE_MANUAL_SEED_AMI,
+        utility_type="electric",
+        epoch_id="epoch",
+        seed_value=Decimal("100"),
+        seed_effective_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        latest_total=Decimal("100"),
+        unresolved_ranges=(
+            SpGroupUnresolvedRange(
+                cadence="30m",
+                start=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+                end=datetime(2026, 7, 15, 14, 30, tzinfo=SINGAPORE_TZ),
+                reason="missing_internal_bucket",
+                first_seen_at=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+                last_seen_at=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+            ),
+        ),
+        source_coverage_status=SOURCE_COVERAGE_COVERED,
+    )
+    restored = SpGroupLedgerEntry.from_dict(entry.to_dict())
+    assert restored.unresolved_ranges == entry.unresolved_ranges
+    assert restored.source_coverage_status == SOURCE_COVERAGE_COVERED
+    assert "payload" not in str(entry.to_dict()).lower()
 
 
 async def test_ledger_subtracts_pre_seed_history_and_adds_post_seed_buckets(
@@ -753,3 +886,184 @@ async def test_ledger_save_failure_does_not_publish_unpersisted_total(
 
     assert store.snapshot.entries["opaque_electric"].latest_total == Decimal("100.0")
     assert store.snapshot.entries["opaque_electric"].accepted == ()
+
+
+async def test_ledger_source_poll_cursor_falls_back_to_seed_when_empty(
+    hass: HomeAssistant,
+    tmp_path,
+) -> None:
+    """An empty ledger entry returns seed_effective_from as the cursor."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-empty-cursor")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    entry = store.snapshot.entries["opaque_electric"]
+    assert entry.pending == ()
+    assert entry.accepted == ()
+    assert entry.unresolved_ranges == ()
+    assert entry.source_poll_cursor_start() == datetime(
+        2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ
+    )
+    assert entry.source_poll_cursor_start() == datetime(
+        2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ
+    )
+
+
+async def test_ledger_concurrent_apply_observations_lock_serializes(
+    hass: HomeAssistant,
+    tmp_path,
+) -> None:
+    """Concurrent apply calls are serialized by the ledger lock without data loss."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-concurrent")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    bucket_a = SpGroupBucketObservation(
+        bucket_key="bucket-a",
+        start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1.0"),
+    )
+    bucket_b = SpGroupBucketObservation(
+        bucket_key="bucket-b",
+        start=datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+        value=Decimal("2.0"),
+    )
+    async def _apply_a() -> None:
+        await store.async_apply_observations(
+            "opaque_electric",
+            (bucket_a,),
+            now=datetime(2026, 7, 15, 19, 0, tzinfo=SINGAPORE_TZ),
+            require_two_sightings=False,
+        )
+    async def _apply_b() -> None:
+        await store.async_apply_observations(
+            "opaque_electric",
+            (bucket_b,),
+            now=datetime(2026, 7, 15, 19, 0, tzinfo=SINGAPORE_TZ),
+            require_two_sightings=False,
+        )
+    await asyncio.gather(_apply_a(), _apply_b())
+    entry = store.snapshot.entries["opaque_electric"]
+    accepted_keys = {b.bucket_key for b in entry.accepted}
+    assert "bucket-a" in accepted_keys
+    assert "bucket-b" in accepted_keys
+    assert entry.latest_total == Decimal("103.0")
+
+
+async def test_ledger_concurrent_apply_observations_same_bucket(
+    hass: HomeAssistant,
+    tmp_path,
+) -> None:
+    """Concurrent apply calls for same bucket: first accepted, second records correction."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-same-bucket")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    bucket_v1 = SpGroupBucketObservation(
+        bucket_key="bucket-same",
+        start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1.0"),
+    )
+    bucket_v2 = SpGroupBucketObservation(
+        bucket_key="bucket-same",
+        start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("2.0"),
+    )
+    async def _apply_v1() -> None:
+        await store.async_apply_observations(
+            "opaque_electric",
+            (bucket_v1,),
+            now=datetime(2026, 7, 15, 19, 0, tzinfo=SINGAPORE_TZ),
+            require_two_sightings=False,
+        )
+    async def _apply_v2() -> None:
+        await store.async_apply_observations(
+            "opaque_electric",
+            (bucket_v2,),
+            now=datetime(2026, 7, 15, 19, 0, tzinfo=SINGAPORE_TZ),
+            require_two_sightings=False,
+        )
+    await asyncio.gather(_apply_v1(), _apply_v2())
+    entry = store.snapshot.entries["opaque_electric"]
+    assert len(entry.accepted) == 1
+    assert entry.accepted[0].value == Decimal("1.0")
+    assert any("corrected_bucket:bucket-same" in w for w in entry.warnings)
+
+
+async def test_ledger_preserves_cursor_on_retention_exceeded(
+    hass: HomeAssistant,
+    tmp_path,
+) -> None:
+    """A retention-exceeded coverage response does not advance the cursor."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-retention")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    snapshot = await store.async_apply_observations(
+        "opaque_electric",
+        (),
+        now=datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+        coverage=SpGroupSourceCoverage(status="retention_exceeded"),
+    )
+    entry = snapshot.entries["opaque_electric"]
+    assert entry.source_coverage_status == "retention_exceeded"
+    assert entry.latest_total == Decimal("100")
+    assert entry.accepted == ()
+    assert entry.last_source_poll_succeeded_at is not None
+    assert entry.source_poll_cursor_start() == datetime(
+        2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ
+    )

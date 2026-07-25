@@ -118,3 +118,9 @@ def test_services_yaml_describes_registered_dev_service() -> None:
     services = _SERVICES_SCHEMA(load_yaml_dict(str(services_path)))
 
     assert services["dev_force_statistics_compile"] == {"fields": {}}
+    for service in ("dev_prepare_poll_gap", "dev_poll_now"):
+        assert services[service]["fields"]["utility"]["required"] is True
+        assert services[service]["fields"]["utility"]["selector"]["select"][
+            "options"
+        ] == ["electric", "water"]
+    assert "poll_end" in services["dev_poll_now"]["fields"]

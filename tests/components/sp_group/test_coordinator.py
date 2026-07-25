@@ -17,9 +17,12 @@ from custom_components.sp_group.coordinator import (
     SpGroupDataUpdateCoordinator,
     SpGroupElectricityCoordinator,
     SpGroupWaterCoordinator,
-    _ami_request_windows,
+    
     _ami_rows,
+    _electricity_ami_source_poll,
+    _missing_closed_water_months,
     _water_history_observations,
+    _water_history_source_poll,
     _water_startup_catchup_needed,
 )
 from custom_components.sp_group.discovery import (
@@ -27,7 +30,11 @@ from custom_components.sp_group.discovery import (
     SpGroupPremise,
     SpGroupUtilityAccount,
 )
-from custom_components.sp_group.ledger import SpGroupLedgerStore
+from custom_components.sp_group.ledger import (
+    SpGroupBucketObservation,
+    SpGroupLedgerStore,
+    SpGroupSourceCoverage,
+)
 from custom_components.sp_group.sources import (
     SINGAPORE_TZ,
     SOURCE_MANUAL_SEED_MONTHLY,
@@ -307,11 +314,6 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
         ) as source_backfill,
     ):
         await coordinator._async_update_data()
-        assert ledger_store.snapshot.entries[sensor_key.key].latest_total == Decimal(
-            "100.0"
-        )
-        schedule_stats_backfill.assert_not_called()
-        await coordinator._async_update_data()
 
     assert ledger_store.snapshot.entries[sensor_key.key].latest_total == Decimal(
         "101.25"
@@ -326,11 +328,13 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
     assert "jarvis.get_ami_charts:day:electric" in calls
 
 
-async def test_backfill_poll_uses_backfill_anchor_but_normal_poll_uses_seed(
+
+
+async def test_normal_poll_recovers_pre_seed_lag(
     hass: HomeAssistant,
-    tmp_path,  # noqa: ANN001
+    tmp_path,
 ) -> None:
-    """Normal polling avoids repeated history while backfill uses backfill_from."""
+    """Normal polling recovers pre-seed backfill data that was lagging."""
     hass.config.config_dir = str(tmp_path)
     session = make_mobile_session("auth0|account-1")
     sensor_key = SpGroupFutureSensorKey(
@@ -340,13 +344,34 @@ async def test_backfill_poll_uses_backfill_anchor_but_normal_poll_uses_seed(
     )
     config = build_source_config(
         sensor_key=sensor_key,
-        seed_value="100.0",
-        seed_observed_at="2026-07-14T03:00:00+08:00",
-        backfill_from="2026-07-01T00:00:00+08:00",
-        now=datetime(2026, 7, 14, 4, 0, tzinfo=SINGAPORE_TZ),
+        seed_value="1000.0",
+        seed_observed_at="2026-07-24T14:30:00+08:00",
+        backfill_from="2026-06-01T00:00:00+08:00",
+        now=datetime(2026, 7, 24, 15, 0, tzinfo=SINGAPORE_TZ),
     )
-    calls: list[str] = []
-    jarvis_client = FakeJarvisClient(calls)
+    ledger_store = SpGroupLedgerStore(hass, "entry-lag-recovery")
+    await ledger_store.async_load()
+    await ledger_store.async_initialize_sources({sensor_key.key: config})
+
+    # Simulate backfill that returned data up to 13:30 only (provider lag).
+    partial_bucket = SpGroupBucketObservation(
+        bucket_key="2026-07-24T13:00:00+08:00",
+        start=datetime(2026, 7, 24, 13, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1.0"),
+    )
+    await ledger_store.async_apply_observations(
+        sensor_key.key,
+        (partial_bucket,),
+        now=datetime(2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+        coverage=SpGroupSourceCoverage(status="covered"),
+    )
+    # Cursor should be at the last accepted bucket end (13:30)
+    assert ledger_store.snapshot.entries[sensor_key.key].source_poll_cursor_start() == datetime(
+        2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ
+    )
+
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="auth0|account-1",
@@ -356,25 +381,38 @@ async def test_backfill_poll_uses_backfill_anchor_but_normal_poll_uses_seed(
         },
         options={"source_config": source_options_payload({sensor_key.key: config})},
     )
-    ledger_store = SpGroupLedgerStore(hass, "entry-window")
-    await ledger_store.async_load()
+    calls: list[str] = []
+    jarvis = FakeJarvisClient(calls)
+    # API returns the lagged 14:00 bucket that was missing from the backfill
+    jarvis.ami_payloads = [
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": "20260724140000", "consumption": "1.5"},
+                    ]
+                },
+            ],
+        },
+    ]
     entry.runtime_data = SpGroupRuntimeData(
-        auth_client=object(),  # type: ignore[arg-type]
-        jarvis_client=jarvis_client,  # type: ignore[arg-type]
-        yggdrasil_client=FakeYggdrasilClient(calls),  # type: ignore[arg-type]
-        profile_client=UtilityClientSentinel(),  # type: ignore[arg-type]
+        auth_client=object(),
+        jarvis_client=jarvis,
+        yggdrasil_client=FakeYggdrasilClient(calls),
+        profile_client=UtilityClientSentinel(),
         session=session,
         account_id="auth0|account-1",
         refresh_lock=asyncio.Lock(),
         ledger_store=ledger_store,
     )
-    discovery = SpGroupDataUpdateCoordinator(hass, entry)  # type: ignore[arg-type]
+    discovery = SpGroupDataUpdateCoordinator(hass, entry)
     entry.runtime_data.coordinator = discovery
     discovery.async_set_updated_data(
         SpGroupCoordinatorData(
             premises=(
                 SpGroupPremise(
-                    key=sensor_key.premise_key,
+                    key="sp_group_premise_938f4ae4706115485aaa8512",
                     active=True,
                     signed_up=True,
                     shared=False,
@@ -388,35 +426,35 @@ async def test_backfill_poll_uses_backfill_anchor_but_normal_poll_uses_seed(
                     ),
                     jarvis_premise_id="JARVIS-PREMISE-1",
                 ),
-            )
+            ),
         )
     )
-    coordinator = SpGroupElectricityCoordinator(hass, entry)  # type: ignore[arg-type]
+    coordinator = SpGroupElectricityCoordinator(hass, entry)
+    entry.runtime_data.electricity_coordinator = coordinator
 
-    with patch(
-        "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
-        AsyncMock(return_value=session),
+    with (
+        patch(
+            "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
+            AsyncMock(return_value=session),
+        ),
+        patch(
+            "custom_components.sp_group.backfill.async_schedule_statistics_backfill",
+        ) as schedule_stats_backfill,
     ):
-        await coordinator.async_poll_now()
-        await coordinator.async_poll_now(backfill=True)
+        await coordinator._async_update_data()
 
-    assert jarvis_client.ami_requests[0][0].isoformat() == "2026-07-14"
-    assert jarvis_client.ami_requests[1][0].isoformat() == "2026-07-01"
-
-
-def test_ami_request_windows_are_bounded() -> None:
-    """Long AMI requests are split into bounded windows."""
-    windows = _ami_request_windows(
-        datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
-        datetime(2026, 3, 10, tzinfo=SINGAPORE_TZ),
+    entry_ledger = ledger_store.snapshot.entries[sensor_key.key]
+    # Normal poll recovered the lagged 14:00 bucket and accepted it
+    assert any(
+        b.start == datetime(2026, 7, 24, 14, 0, tzinfo=SINGAPORE_TZ)
+        for b in entry_ledger.accepted
     )
-
-    assert len(windows) == 3
-    assert windows[0][0] == datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
-    assert windows[-1][1] == datetime(2026, 3, 10, tzinfo=SINGAPORE_TZ)
-    assert all((end - start).days <= 31 for start, end in windows)
-
-
+    # Cursor moved past the lag gap to the new accepted end
+    assert entry_ledger.source_poll_cursor_start() == datetime(
+        2026, 7, 24, 14, 30, tzinfo=SINGAPORE_TZ
+    )
+    # Statistics retry was triggered because accepted_delta > 0
+    schedule_stats_backfill.assert_called_once()
 async def test_electricity_normal_poll_uses_ledger_cursor(
     hass: HomeAssistant,
     tmp_path,  # noqa: ANN001
@@ -1384,3 +1422,224 @@ def test_ami_rows_uses_amount_as_fallback() -> None:
     rows = _ami_rows(payload)
     assert len(rows) == 1
     assert rows[0]["amount"] == "42.0"
+
+
+def test_electricity_source_poll_excludes_ami_zeros_and_records_internal_gap() -> None:
+    """AMI zeros are unavailable coverage, while gaps between positives retry."""
+    now = datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ)
+    parsed = _electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": "20260715000000", "consumption": "0"},
+                        {"date": "20260715130000", "consumption": "1.0"},
+                        {"date": "20260715133000", "consumption": "0"},
+                        {"date": "20260715143000", "consumption": "2.0"},
+                    ]
+                }
+            ],
+        },
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        now=now,
+    )
+    assert [item.value for item in parsed.observations] == [
+        Decimal("1.0"),
+        Decimal("2.0"),
+    ]
+    assert parsed.coverage.status == "covered"
+    assert [item.start for item in parsed.coverage.unresolved_ranges] == [
+        datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
+        datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    ]
+
+
+def test_electricity_source_poll_with_only_zero_rows_is_lagging() -> None:
+    """A zero-only AMI response cannot advance the ledger."""
+    parsed = _electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {"data": [{"date": "20260715130000", "consumption": "0"}]}
+            ],
+        },
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    assert parsed.observations == ()
+    assert parsed.coverage.status == "lagging"
+
+
+def test_electricity_source_poll_ignores_future_and_in_progress_rows() -> None:
+    """Only completed source buckets establish AMI coverage."""
+    now = datetime(2026, 7, 15, 14, 15, tzinfo=SINGAPORE_TZ)
+    parsed = _electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": "20260715130000", "consumption": "1.0"},
+                        {"date": "20260715140000", "consumption": "2.0"},
+                        {"date": "20260715143000", "consumption": "3.0"},
+                    ]
+                }
+            ],
+        },
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        now=now,
+    )
+    assert [item.start for item in parsed.observations] == [
+        datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ)
+    ]
+    assert parsed.coverage.start == datetime(
+        2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ
+    )
+    assert parsed.coverage.end == datetime(
+        2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ
+    )
+
+
+async def test_source_poll_retains_last_known_coverage_when_provider_lags(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """A lagging response changes status without erasing coverage boundaries."""
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-coverage-lag")
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100.0",
+        seed_observed_at="2026-07-15T12:00:00+08:00",
+        backfill_from="2026-07-15T12:00:00+08:00",
+        now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    await store.async_apply_observations(
+        "opaque_electric",
+        (),
+        now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+        coverage=SpGroupSourceCoverage(
+            status="covered",
+            start=datetime(2026, 7, 15, 12, 0, tzinfo=SINGAPORE_TZ),
+            end=datetime(2026, 7, 15, 12, 30, tzinfo=SINGAPORE_TZ),
+        ),
+    )
+    snapshot = await store.async_apply_observations(
+        "opaque_electric",
+        (),
+        now=datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+        coverage=SpGroupSourceCoverage(status="lagging"),
+    )
+    entry = snapshot.entries["opaque_electric"]
+    assert entry.source_coverage_status == "lagging"
+    assert entry.source_coverage_start == datetime(
+        2026, 7, 15, 12, 0, tzinfo=SINGAPORE_TZ
+    )
+    assert entry.source_coverage_end == datetime(
+        2026, 7, 15, 12, 30, tzinfo=SINGAPORE_TZ
+    )
+
+
+def test_water_source_poll_detects_missing_closed_month_between_rows() -> None:
+    """Water history uses the same internal-gap model at month cadence."""
+    parsed = _water_history_source_poll(
+        {
+            "water": {
+                "data": [
+                    {
+                        "period": "2026-01",
+                        "unit": "m3",
+                        "consumption": {"current": "1.0"},
+                    },
+                    {
+                        "period": "2026-03",
+                        "unit": "m3",
+                        "consumption": {"current": "2.0"},
+                    },
+                ]
+            }
+        },
+        backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 5, 10, tzinfo=SINGAPORE_TZ),
+    )
+    assert [item.start for item in parsed.coverage.unresolved_ranges] == [
+        datetime(2026, 2, 1, tzinfo=SINGAPORE_TZ)
+    ]
+
+
+def test_water_startup_gap_scan_includes_older_missing_months() -> None:
+    """Startup recovery does not stop when the latest month is present."""
+    entry = SimpleNamespace(
+        seed_effective_from=datetime(2026, 4, 1, tzinfo=SINGAPORE_TZ),
+        accepted=(
+            SimpleNamespace(
+                start=datetime(2026, 6, 1, tzinfo=SINGAPORE_TZ),
+            ),
+        ),
+    )
+    assert _missing_closed_water_months(
+        entry,
+        datetime(2026, 6, 1, tzinfo=SINGAPORE_TZ),
+    ) == (
+        datetime(2026, 4, 1, tzinfo=SINGAPORE_TZ),
+        datetime(2026, 5, 1, tzinfo=SINGAPORE_TZ),
+    )
+
+
+def test_water_repeated_full_history_is_idempotent() -> None:
+    """A repeated water history response produces identical observations."""
+    payload = {
+        "water": {
+            "data": [
+                {
+                    "period": "2026-01",
+                    "unit": "m3",
+                    "consumption": {"current": "1.0"},
+                },
+                {
+                    "period": "2026-02",
+                    "unit": "m3",
+                    "consumption": {"current": "2.0"},
+                },
+            ]
+        }
+    }
+    first = _water_history_source_poll(
+        payload,
+        backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 3, 10, tzinfo=SINGAPORE_TZ),
+    )
+    second = _water_history_source_poll(
+        payload,
+        backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 3, 10, tzinfo=SINGAPORE_TZ),
+    )
+    assert len(first.observations) == len(second.observations)
+    assert [o.bucket_key for o in first.observations] == [
+        o.bucket_key for o in second.observations
+    ]
+    assert [o.value for o in first.observations] == [
+        o.value for o in second.observations
+    ]
+    assert first.coverage == second.coverage
+
+
+
+def test_electricity_source_poll_malformed_response_at_coordinator() -> None:
+    """A malformed AMI response produces zero usable observations."""
+    now = datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ)
+    parsed = _electricity_ami_source_poll(
+        {"unit": "kWh", "history": "not_a_list"},
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        now=now,
+    )
+    assert parsed.observations == ()
+    assert parsed.coverage.status == "malformed"

@@ -116,6 +116,26 @@ async def test_source_backfill_success_marks_retryable_entries_and_imports_stats
     stats_backfill.assert_awaited_once_with(hass, entry)
 
 
+async def test_initial_statistics_failure_is_deferred_without_parallel_retry(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Recorder failure defers to event retry instead of sleeping/retrying here."""
+    entry, _ledger_store = await _entry_with_source_ledger(hass, tmp_path)
+    entry.runtime_data.electricity_coordinator.async_poll_now = AsyncMock()
+    entry.runtime_data.water_coordinator.async_poll_now = AsyncMock()
+
+    with patch(
+        "custom_components.sp_group.backfill.async_backfill_statistics",
+        new_callable=AsyncMock,
+        side_effect=UpdateFailed("recorder unavailable"),
+    ) as stats_backfill:
+        await _run_backfill_with_retry(hass, entry)
+
+    stats_backfill.assert_awaited_once_with(hass, entry)
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "backfill_failed") is None
+
+
 async def test_backfill_task_lifecycle_handles_cancel_and_error(
     hass: HomeAssistant,
 ) -> None:
@@ -178,7 +198,7 @@ async def _entry_with_source_ledger(
     entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
     entry.runtime_data = SimpleNamespace(
         ledger_store=ledger_store,
-        electricity_coordinator=SimpleNamespace(async_poll_now=AsyncMock()),
+        electricity_coordinator=SimpleNamespace(async_poll_now=AsyncMock(), require_two_sightings=True),
         water_coordinator=SimpleNamespace(async_poll_now=AsyncMock()),
     )
     return entry, ledger_store

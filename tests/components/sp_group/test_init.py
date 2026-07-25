@@ -34,7 +34,11 @@ from homeassistant.components.recorder.const import (
 )
 from homeassistant.const import Platform
 from homeassistant.core import HassJob, HassJobType, HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+)
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -756,6 +760,8 @@ async def test_dev_statistics_service_is_env_gated(
     from custom_components.sp_group.dev import (
         ENV_DEV_TOOLS,
         SERVICE_FORCE_STATISTICS_COMPILE,
+        SERVICE_POLL_NOW,
+        SERVICE_PREPARE_POLL_GAP,
         async_register_dev_services,
     )
 
@@ -764,6 +770,170 @@ async def test_dev_statistics_service_is_env_gated(
     async_register_dev_services(hass)
 
     assert not hass.services.has_service(DOMAIN, SERVICE_FORCE_STATISTICS_COMPILE)
+    assert not hass.services.has_service(DOMAIN, SERVICE_PREPARE_POLL_GAP)
+    assert not hass.services.has_service(DOMAIN, SERVICE_POLL_NOW)
+
+
+def test_dev_poll_gap_start_mode_is_explicitly_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The controlled poll-gap mode requires both development flags."""
+    from custom_components.sp_group.dev import (
+        ENV_DEV_TOOLS,
+        ENV_SKIP_INITIAL_BACKFILL,
+        initial_backfill_skipped_for_dev,
+    )
+
+    monkeypatch.setenv(ENV_SKIP_INITIAL_BACKFILL, "1")
+    monkeypatch.delenv(ENV_DEV_TOOLS, raising=False)
+    assert initial_backfill_skipped_for_dev() is False
+
+    monkeypatch.setenv(ENV_DEV_TOOLS, "1")
+    assert initial_backfill_skipped_for_dev() is True
+
+
+@pytest.mark.asyncio
+async def test_dev_poll_gap_prepare_and_normal_poll(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation arms an empty utility ledger and poll-now uses normal mode."""
+    from custom_components.sp_group.dev import (
+        ENV_DEV_TOOLS,
+        SERVICE_POLL_NOW,
+        SERVICE_PREPARE_POLL_GAP,
+        async_register_dev_services,
+    )
+
+    mark_succeeded = AsyncMock()
+    coordinator = SimpleNamespace(async_poll_now=AsyncMock())
+    ledger_store = SimpleNamespace(
+        snapshot=SimpleNamespace(
+            malformed=False,
+            entries={
+                "electric_sensor": SimpleNamespace(
+                    utility_type="electric",
+                    accepted=(),
+                    pending=(),
+                ),
+                "water_sensor": SimpleNamespace(
+                    utility_type="water",
+                    accepted=(),
+                    pending=(),
+                ),
+            },
+        ),
+        async_mark_source_backfill_succeeded=mark_succeeded,
+    )
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
+    entry.runtime_data = SimpleNamespace(
+        ledger_store=ledger_store,
+        electricity_coordinator=coordinator,
+        water_coordinator=None,
+        backfill_tasks=set(),
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setenv(ENV_DEV_TOOLS, "1")
+
+    async_register_dev_services(hass)
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_PREPARE_POLL_GAP,
+        {"utility": "electric"},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_POLL_NOW,
+        {"utility": "electric"},
+        blocking=True,
+    )
+
+    mark_succeeded.assert_awaited_once()
+    assert mark_succeeded.await_args.kwargs["sensor_keys"] == {"electric_sensor"}
+    coordinator.async_poll_now.assert_awaited_once_with(backfill=False)
+
+
+@pytest.mark.asyncio
+async def test_dev_poll_now_passes_validated_poll_end(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dev service can bound a manual poll to provider coverage."""
+    from custom_components.sp_group.dev import (
+        ENV_DEV_TOOLS,
+        SERVICE_POLL_NOW,
+        async_register_dev_services,
+    )
+
+    coordinator = SimpleNamespace(async_poll_now=AsyncMock())
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
+    entry.runtime_data = SimpleNamespace(
+        ledger_store=SimpleNamespace(
+            snapshot=SimpleNamespace(malformed=False, entries={})
+        ),
+        electricity_coordinator=coordinator,
+        water_coordinator=None,
+        backfill_tasks=set(),
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setenv(ENV_DEV_TOOLS, "1")
+
+    async_register_dev_services(hass)
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_POLL_NOW,
+        {"utility": "electric", "poll_end": "2026-07-22T16:00:00+08:00"},
+        blocking=True,
+    )
+
+    call = coordinator.async_poll_now.await_args
+    assert call.kwargs["backfill"] is False
+    assert call.kwargs["poll_end"].isoformat() == "2026-07-22T16:00:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_dev_poll_gap_rejects_non_empty_ledger(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preparation action cannot discard already observed source buckets."""
+    from custom_components.sp_group.dev import (
+        ENV_DEV_TOOLS,
+        SERVICE_PREPARE_POLL_GAP,
+        async_register_dev_services,
+    )
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
+    entry.runtime_data = SimpleNamespace(
+        ledger_store=SimpleNamespace(
+            snapshot=SimpleNamespace(
+                malformed=False,
+                entries={
+                    "electric_sensor": SimpleNamespace(
+                        utility_type="electric",
+                        accepted=(object(),),
+                        pending=(),
+                    )
+                },
+            ),
+            async_mark_source_backfill_succeeded=AsyncMock(),
+        ),
+        electricity_coordinator=SimpleNamespace(),
+        water_coordinator=None,
+        backfill_tasks=set(),
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setenv(ENV_DEV_TOOLS, "1")
+
+    async_register_dev_services(hass)
+    with pytest.raises(HomeAssistantError, match="poll_gap_requires_empty_ledger"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_PREPARE_POLL_GAP,
+            {"utility": "electric"},
+            blocking=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -944,6 +1114,7 @@ def test_schedule_statistics_backfill_blocks_manual_review_warnings(
     [
         "statistics_missing_bridge:2026-07-14T02:00:00+08:00",
         "statistics_waiting_for_native_reference",
+        "statistics_recorder_rows_pending:2026-07-14T02:00:00+08:00",
     ],
 )
 async def test_schedule_statistics_backfill_allows_non_blocking_warnings(
