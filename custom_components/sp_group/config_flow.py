@@ -151,6 +151,8 @@ ACTION_RETRY_SOURCE_BACKFILL = "retry_source_backfill"
 DEV_AUTH_BYPASS_ENV = "SPGROUP_HA_DEV_AUTH_BYPASS"
 DEV_SESSION_FILE_ENV = "SPGROUP_HA_DEV_SESSION_FILE"
 DEFAULT_DEV_SESSION_FILE = ".runtime/mobile-session.json"
+DEV_SEED_DEFAULTS_FILE_ENV = "SPGROUP_HA_DEV_SEED_DEFAULTS_FILE"
+DEFAULT_DEV_SEED_DEFAULTS_FILE = str(Path(__file__).resolve().parents[2] / ".runtime" / "dev-seed-defaults.json")
 DEV_AUTH_METHOD_CACHED_SESSION = "cached_session"
 DEV_AUTH_METHOD_PASSWORD = "password_auth"
 
@@ -214,9 +216,21 @@ def _active_oob_authenticators(
 class _SeedDateTimeSelector(selector.DateTimeSelector):
     """HA datetime selector that accepts split date/time frontend payloads."""
 
+    def __init__(self, default_value: str | None = None) -> None:
+        """Initialize the selector with an optional default for the selector config."""
+        super().__init__()
+        self._default_value = default_value
+
     def __call__(self, data: Any) -> Any:
         """Validate and normalize the selected datetime value."""
         return super().__call__(_normalize_datetime_selector_value(data))
+
+    def serialize(self) -> dict[str, Any]:
+        """Serialize selector config, including the default in the selector itself."""
+        result = super().serialize()
+        if self._default_value is not None:
+            result["selector"]["datetime"]["default"] = self._default_value
+        return result
 
 
 def _normalize_datetime_selector_value(value: Any) -> Any:
@@ -242,11 +256,40 @@ async def _async_get_discovery_clients(
     return YggdrasilClient(session), JarvisClient(session)
 
 
-def _seed_data_schema(sensor_key: SpGroupFutureSensorKey) -> vol.Schema:
-    """Return the seed schema with a utility-specific unit selector."""
+def _seed_data_schema(
+    sensor_key: SpGroupFutureSensorKey,
+    *,
+    _defaults: dict[str, Any] | None = None,
+) -> vol.Schema:
+    """Return the seed schema with a utility-specific unit selector.
+
+    When _defaults is provided (e.g. from a dev-seed-defaults.json file)
+    the field schemas receive a default so the form is pre-filled.
+    """
+    defaults = _defaults or {}
+
+    seed_value_field = vol.Required(CONF_SEED_VALUE)
+    if CONF_SEED_VALUE in defaults:
+        seed_value_field = vol.Required(CONF_SEED_VALUE, default=defaults[CONF_SEED_VALUE])
+
+    seed_observed_at_field = vol.Required(CONF_SEED_OBSERVED_AT)
+    if CONF_SEED_OBSERVED_AT in defaults:
+        seed_observed_at_field = vol.Required(
+            CONF_SEED_OBSERVED_AT, default=defaults[CONF_SEED_OBSERVED_AT]
+        )
+
+    backfill_from_field = vol.Required(CONF_BACKFILL_FROM)
+    if CONF_BACKFILL_FROM in defaults:
+        backfill_from_field = vol.Required(CONF_BACKFILL_FROM, default=defaults[CONF_BACKFILL_FROM])
+
+
+
+    seed_observed_default = defaults.get(CONF_SEED_OBSERVED_AT) if defaults else None
+    backfill_from_default = defaults.get(CONF_BACKFILL_FROM) if defaults else None
+
     return vol.Schema(
         {
-            vol.Required(CONF_SEED_VALUE): selector.NumberSelector(
+            seed_value_field: selector.NumberSelector(
                 selector.NumberSelectorConfig(
                     min=0,
                     step="any",
@@ -254,8 +297,8 @@ def _seed_data_schema(sensor_key: SpGroupFutureSensorKey) -> vol.Schema:
                     unit_of_measurement=_utility_unit(sensor_key.utility_type),
                 )
             ),
-            vol.Required(CONF_SEED_OBSERVED_AT): _SeedDateTimeSelector(),
-            vol.Required(CONF_BACKFILL_FROM): _SeedDateTimeSelector(),
+            seed_observed_at_field: _SeedDateTimeSelector(default_value=seed_observed_default),
+            backfill_from_field: _SeedDateTimeSelector(default_value=backfill_from_default),
         }
     )
 
@@ -390,7 +433,7 @@ def _seed_error_field(error_key: str) -> str:
     """Return the config-flow error field for a source-config validation error."""
     if error_key in {"invalid_decimal", "seed_negative"}:
         return CONF_SEED_VALUE
-    if error_key in {"invalid_timestamp", "future_seed", "seed_too_old"}:
+    if error_key in {"invalid_timestamp", "future_seed", "seed_too_old", "seed_not_30min_step", "seed_not_current_floor", "seed_not_first_of_month"}:
         return CONF_SEED_OBSERVED_AT
     if error_key in {
         "invalid_backfill",
@@ -948,21 +991,27 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         if not self._selected_sensor_keys:
             return self._async_create_setup_entry()
         sensor_key = self._selected_sensor_keys[0]
+        seed_defaults = await _async_load_dev_seed_defaults(self.hass, sensor_key.utility_type)
         if user_input is None:
             _LOGGER.debug(
                 "SP Group config flow showing seed step: utility=%s remaining=%d",
                 sensor_key.utility_type,
                 len(self._selected_sensor_keys),
             )
-            return self.async_show_form(
+            _result = self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
+            # Inject defaults directly into the flow result data so the frontend
+            # can pre-fill the form fields even for selectors that ignore schema defaults.
+            if seed_defaults:
+                _result["data"] = dict(seed_defaults)
+            return _result
         if CONF_BACKFILL_FROM not in user_input:
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={CONF_BACKFILL_FROM: "missing_backfill_from"},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
@@ -979,8 +1028,26 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             error_key = str(err)
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={_seed_error_field(error_key): error_key},
+                description_placeholders=self._seed_placeholders(sensor_key),
+            )
+        # Seed time must match the floor of current time (differs by utility type)
+        if sensor_key.utility_type == "electric":
+            _now_sgt = datetime.now(SINGAPORE_TZ)
+            _floor_min = 0 if _now_sgt.minute < 30 else 30
+            _floor_boundary = _now_sgt.replace(minute=_floor_min, second=0, microsecond=0)
+            _err_key = "seed_not_current_floor"
+        else:
+            _now_sgt = datetime.now(SINGAPORE_TZ)
+            _floor_boundary = _now_sgt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            _err_key = "seed_not_first_of_month"
+        _seed_dt = config.seed_observed_at.astimezone(SINGAPORE_TZ)
+        if _seed_dt != _floor_boundary:
+            return self.async_show_form(
+                step_id="seed",
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
+                errors={"seed_observed_at": _err_key},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
         if not config.boundary_aligned:
@@ -1028,7 +1095,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
             self._pending_approximate_sensor_key = None
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={"base": "approximate_seed_not_confirmed"},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
@@ -1201,6 +1268,48 @@ def _duration_from_poll(poll_options: SpGroupPollingOptions) -> dict[str, float]
     }
 
 
+
+def _dev_seed_defaults_file() -> Path:
+    """Return the configured developer seed defaults file path."""
+    return Path(
+        os.environ.get(
+            DEV_SEED_DEFAULTS_FILE_ENV, DEFAULT_DEV_SEED_DEFAULTS_FILE
+        )
+    ).expanduser()
+
+
+async def _async_load_dev_seed_defaults(
+    hass: HomeAssistant,
+    utility_type: str,
+) -> dict[str, Any]:
+    """Load developer seed defaults for the given utility type.
+
+    Returns an empty dict when the file is missing, malformed,
+    or the utility type has no entry -- safe for production use.
+    """
+    path = _dev_seed_defaults_file()
+    if not path.exists():
+        return {}
+    try:
+        data: Any = json.loads(
+            await hass.async_add_executor_job(path.read_text, "utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    entry: Any = data.get(utility_type, {})
+    if not isinstance(entry, dict):
+        return {}
+    result: dict[str, Any] = {}
+    if CONF_SEED_VALUE in entry:
+        result[CONF_SEED_VALUE] = entry[CONF_SEED_VALUE]
+    if CONF_SEED_OBSERVED_AT in entry:
+        result[CONF_SEED_OBSERVED_AT] = entry[CONF_SEED_OBSERVED_AT]
+    if CONF_BACKFILL_FROM in entry:
+        result[CONF_BACKFILL_FROM] = entry[CONF_BACKFILL_FROM]
+    return result
+
 class OptionsFlowHandler(OptionsFlow):
     """Handle SP Group options for source configuration."""
 
@@ -1350,6 +1459,7 @@ class OptionsFlowHandler(OptionsFlow):
         if not self._selected_sensor_keys:
             return self._create_options_entry()
         sensor_key = self._selected_sensor_keys[0]
+        seed_defaults = await _async_load_dev_seed_defaults(self.hass, sensor_key.utility_type)
         if user_input is None:
             _LOGGER.debug(
                 "SP Group options flow showing seed step: utility=%s remaining=%d",
@@ -1358,13 +1468,13 @@ class OptionsFlowHandler(OptionsFlow):
             )
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
         if CONF_BACKFILL_FROM not in user_input:
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={CONF_BACKFILL_FROM: "missing_backfill_from"},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
@@ -1381,8 +1491,26 @@ class OptionsFlowHandler(OptionsFlow):
             error_key = str(err)
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={_seed_error_field(error_key): error_key},
+                description_placeholders=self._seed_placeholders(sensor_key),
+            )
+        # Seed time must match the floor of current time (differs by utility type)
+        if sensor_key.utility_type == "electric":
+            _now_sgt = datetime.now(SINGAPORE_TZ)
+            _floor_min = 0 if _now_sgt.minute < 30 else 30
+            _floor_boundary = _now_sgt.replace(minute=_floor_min, second=0, microsecond=0)
+            _err_key = "seed_not_current_floor"
+        else:
+            _now_sgt = datetime.now(SINGAPORE_TZ)
+            _floor_boundary = _now_sgt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            _err_key = "seed_not_first_of_month"
+        _seed_dt = config.seed_observed_at.astimezone(SINGAPORE_TZ)
+        if _seed_dt != _floor_boundary:
+            return self.async_show_form(
+                step_id="seed",
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
+                errors={"seed_observed_at": _err_key},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
         if not config.boundary_aligned:
@@ -1423,7 +1551,7 @@ class OptionsFlowHandler(OptionsFlow):
             self._pending_approximate_sensor_key = None
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={"base": "approximate_seed_not_confirmed"},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
@@ -1480,7 +1608,7 @@ class OptionsFlowHandler(OptionsFlow):
             self._pending_reset_sensor_key = None
             return self.async_show_form(
                 step_id="seed",
-                data_schema=_seed_data_schema(sensor_key),
+                data_schema=_seed_data_schema(sensor_key, _defaults=seed_defaults),
                 errors={"base": "reset_not_confirmed"},
                 description_placeholders=self._seed_placeholders(sensor_key),
             )

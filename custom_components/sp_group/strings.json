@@ -125,11 +125,14 @@
             "missing_backfill_from": "Enter a backfill start.",
             "seed_negative": "The seed reading cannot be negative.",
             "seed_too_old": "The seed timestamp is too old for the initial bounded backfill window.",
+            "seed_not_30min_step": "The seed timestamp must be on a half-hour boundary (HH:00 or HH:30).",
             "stale_flow_reset_failed": "The previous setup could not be reset because another setup is still in progress. Close other SP Group setup dialogs or restart Home Assistant, then try again.",
             "unknown": "Unexpected error.",
             "password_too_short": "The password must be at least 8 characters long.",
             "invalid_otp": "The one-time password must be 6 to 8 digits.",
-            "no_utilities_selected": "Select at least one utility to enable."
+            "no_utilities_selected": "Select at least one utility to enable.",
+            "seed_not_current_floor": "The seed timestamp must be the current time rounded down to the nearest half hour.",
+            "seed_not_first_of_month": "The seed timestamp must be the first of the current month."
         },
         "abort": {
             "already_configured": "This SP Group account is already configured.",
@@ -212,8 +215,11 @@
             "reset_not_confirmed": "Confirm the meter replacement/reset before applying a lower seed.",
             "seed_negative": "The seed reading cannot be negative.",
             "seed_too_old": "The seed timestamp is too old for the initial bounded backfill window.",
+            "seed_not_30min_step": "The seed timestamp must be on a half-hour boundary (HH:00 or HH:30).",
             "unknown": "Unexpected error.",
-            "rebuild_not_confirmed": "Confirm the ledger rebuild before applying it."
+            "rebuild_not_confirmed": "Confirm the ledger rebuild before applying it.",
+            "seed_not_current_floor": "The seed timestamp must be the current time rounded down to the nearest half hour.",
+            "seed_not_first_of_month": "The seed timestamp must be the first of the current month."
         },
         "abort": {
             "no_discovery": "Discovery data is not available yet.",

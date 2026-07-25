@@ -305,7 +305,10 @@ def _validate_seed_timestamp(value: datetime, now: datetime) -> None:
         raise SourceConfigError("future_seed")
     if value < now.astimezone(SINGAPORE_TZ) - timedelta(days=_MAX_SEED_AGE_DAYS):
         raise SourceConfigError("seed_too_old")
-
+    # Must be on a 30-minute boundary
+    local = value.astimezone(SINGAPORE_TZ)
+    if local.minute not in (0, 30) or local.second != 0 or local.microsecond != 0:
+        raise SourceConfigError("seed_not_30min_step")
 
 def _validate_backfill_from(
     value: datetime,
