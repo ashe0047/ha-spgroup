@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import patch
 
 from custom_components.sp_group.const import DOMAIN
+from custom_components.sp_group.ledger import SpGroupLedgerEntry
 from custom_components.sp_group.sources import SINGAPORE_TZ
 from custom_components.sp_group.statistics_backfill import async_backfill_statistics
 from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN
@@ -297,6 +298,160 @@ async def test_electricity_visible_deltas_from_real_recorder_rows(
             datetime(2026, 7, 14, 3, tzinfo=SINGAPORE_TZ): Decimal("0"),
         },
     )
+
+
+async def test_electricity_seed_boundary_hour_generates_continuous_chain(
+    hass: HomeAssistant,
+) -> None:
+    """The hour containing seed_effective_from must bridge pre-seed and post-seed.
+
+    When the seed falls on a half-hour boundary (e.g., 12:30) and both
+    30-minute buckets in the containing hour exist (12:00-12:30 pre-seed
+    AND 12:30-13:00 post-seed), the statistics row for that hour must be
+    generated.  Without it the cumulative state/sum chain has a permanent
+    gap that makes the Energy dashboard skip the hour entirely.
+
+    This test asserts that a ProjectedStatistic row IS generated for the
+    seed-boundary hour when both halves have contiguous buckets.  It will
+    fail on the current code because two unconditional guards skip the
+    hour: _electricity_statistics hour_start < seed < hour_end → continue,
+    and _has_seed_bridge row_start < seed < row_end → return False.
+    """
+    hass.config.components.add(RECORDER_DOMAIN)
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        SENSOR_DOMAIN,
+        DOMAIN,
+        ELECTRIC_KEY,
+        suggested_object_id="sp_group_electricity",
+    )
+
+    # Seed at 12:30 (half-hour boundary).  Buckets span 11:00-14:00.
+    seed = datetime(2026, 7, 14, 12, 30, tzinfo=SINGAPORE_TZ)
+    accepted = (
+        # Pre-seed hour (11-12)
+        _accepted_bucket(
+            "2026-07-14T11:00:00+08:00",
+            "2026-07-14T11:30:00+08:00",
+            "1",
+        ),
+        _accepted_bucket(
+            "2026-07-14T11:30:00+08:00",
+            "2026-07-14T12:00:00+08:00",
+            "1",
+        ),
+        # Seed-boundary hour (12-13): 12:00-12:30 is pre-seed,
+        # 12:30-13:00 is post-seed.  Both MUST be present for the
+        # bridge to work; the current code skips this hour unconditionally.
+        _accepted_bucket(
+            "2026-07-14T12:00:00+08:00",
+            "2026-07-14T12:30:00+08:00",
+            "2",
+        ),
+        _accepted_bucket(
+            "2026-07-14T12:30:00+08:00",
+            "2026-07-14T13:00:00+08:00",
+            "3",
+        ),
+        # Post-seed hour (13-14)
+        _accepted_bucket(
+            "2026-07-14T13:00:00+08:00",
+            "2026-07-14T13:30:00+08:00",
+            "1",
+        ),
+        _accepted_bucket(
+            "2026-07-14T13:30:00+08:00",
+            "2026-07-14T14:00:00+08:00",
+            "1",
+        ),
+    )
+    post_seed_sum = sum(
+        bucket.value
+        for bucket in accepted
+        if bucket.start >= seed
+    )
+    store = _FakeLedgerStore(
+        SpGroupLedgerEntry(
+            sensor_key=ELECTRIC_KEY,
+            source="manual_seed_plus_ami_deltas",
+            utility_type="electric",
+            epoch_id="epoch-boundary-gap",
+            seed_value=Decimal("1000"),
+            seed_effective_from=seed,
+            backfill_from=accepted[0].start,
+            latest_total=Decimal("1000") + post_seed_sum,
+            latest_accepted_at=accepted[-1].end,
+            accepted=accepted,
+        )
+    )
+    imported: list[list[dict[str, Any]]] = []
+    recorder = _FakeRecorderExecutor()
+    native_reference = {
+        "start": datetime(2026, 7, 14, 14, tzinfo=SINGAPORE_TZ),
+        "state": float(Decimal("1000") + post_seed_sum),
+        "sum": 0.0,
+    }
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            return_value={"sensor.sp_group_electricity": [native_reference]},
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_import_statistics",
+            side_effect=lambda _hass, _meta, rows: imported.append(list(rows)),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=recorder,
+        ),
+    ):
+        await async_backfill_statistics(hass, _entry_with_ledger(store))
+
+    # The 12:00 row must be present — this is the seed-boundary hour.
+    # Without it there is a gap in the state/sum chain.
+    assert imported, "no statistics were imported"
+
+    planned_rows = imported[0]
+    row_starts = [row["start"] for row in planned_rows]
+
+    expected_starts = [
+        datetime(2026, 7, 14, 10, tzinfo=SINGAPORE_TZ),  # anchor
+        datetime(2026, 7, 14, 11, tzinfo=SINGAPORE_TZ),  # 11-12 pre-seed
+        datetime(2026, 7, 14, 12, tzinfo=SINGAPORE_TZ),  # 12-13 seed-boundary ← THE FIX
+        datetime(2026, 7, 14, 13, tzinfo=SINGAPORE_TZ),  # 13-14 post-seed
+    ]
+    assert row_starts == expected_starts, (
+        f"Expected row starts {expected_starts}, got {row_starts}. "
+        "The 12:00 seed-boundary hour is missing — the current code "
+        "unconditionally skips hours containing seed_effective_from."
+    )
+
+    # Verify monotonicity: both state and sum must increase continuously
+    # 10:00 anchor: state=996, sum=0
+    # 11:00 pre:    state=998, sum=2   ← delta=2 (11-12 consumption)
+    # 12:00 bridge: state=1003, sum=7  ← delta=5 (12-13: 2 pre + 3 post)
+    # 13:00 post:   state=1005, sum=9  ← delta=2 (13-14 consumption)
+    expected_sum = Decimal("0")
+    expected_state = Decimal("996")
+    for i, (start, row) in enumerate(zip(row_starts, planned_rows, strict=True)):
+        assert row["start"] == start
+        row_sum = Decimal(str(row["sum"]))
+        assert row_sum >= expected_sum, (
+            f"Row at {start}: sum {row_sum} < previous {expected_sum} — "
+            "chain is not monotonic"
+        )
+        expected_sum = row_sum
+
+    # Verify the adjustment was applied
+    assert recorder.adjustments == [
+        (
+            "sensor.sp_group_electricity",
+            datetime(2026, 7, 14, 14, tzinfo=SINGAPORE_TZ),
+            9.0,
+            "kWh",
+        )
+    ], recorder.adjustments
 
 
 def _assert_visible_dashboard_deltas(

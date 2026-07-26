@@ -562,7 +562,24 @@ def _electricity_statistics(
     for hour_start in sorted(by_hour):
         hour_end = hour_start + timedelta(hours=1)
         if hour_start < entry.seed_effective_from < hour_end:
-            continue
+            # The seed bisects this hour.  Only generate a row when both
+            # pre-seed and post-seed halves of the hour have contiguous buckets,
+            # so the cumulative chain (seed - pre_sum) -> (seed + post_sum) is
+            # continuous.
+            if not _has_indexed_contiguous_range(
+                index,
+                start=hour_start,
+                end=entry.seed_effective_from,
+                step=_HALF_HOUR,
+            ):
+                continue
+            if not _has_indexed_contiguous_range(
+                index,
+                start=entry.seed_effective_from,
+                end=hour_end,
+                step=_HALF_HOUR,
+            ):
+                continue
         if not index.has_contiguous_fixed_range(
             start=hour_start,
             end=hour_end,
@@ -939,7 +956,15 @@ def _has_seed_bridge(
 ) -> bool:
     seed = entry.seed_effective_from
     if row_start < seed < row_end:
-        return False
+        if not _has_indexed_contiguous_range(
+            index, start=row_start, end=seed, step=step
+        ):
+            return False
+        if not _has_indexed_contiguous_range(
+            index, start=seed, end=row_end, step=step
+        ):
+            return False
+        return True
     if row_end <= seed:
         if entry.utility_type == UTILITY_ELECTRIC:
             return True

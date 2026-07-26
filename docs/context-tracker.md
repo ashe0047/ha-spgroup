@@ -3576,3 +3576,20 @@ verified against the live API. Documented in
 **Files changed**:
 - `scripts/ha_dev.py` — writes dev-seed-defaults.json in `_write_auto_onboarding`
 - `custom_components/sp_group/config_flow.py` — loads defaults and pre-fills seed step schemas
+
+## 2026-07-26 17:50 +0800 — Commit planning: seed-boundary statistics fix
+
+Reviewed the current worktree for commit preparation. The changes are one
+cohesive, uncommitted fix:
+
+- `custom_components/sp_group/statistics_backfill.py` now permits the
+  seed-boundary electricity hour when both half-hour sides are contiguous.
+- `tests/components/sp_group/test_statistics_backfill_electricity_invariants.py`
+  adds the regression coverage for the continuous boundary chain.
+- `docs/issues/statistics-seed-boundary-hour-gap.md` records the issue, root
+  cause, impact, and proposed behavior.
+
+Validation: the focused invariant suite passes (`4 passed`) and `git diff
+--check` is clean. These files should be committed together as one atomic
+change so the implementation, regression test, and issue evidence cannot
+drift apart. No commit was created in this planning step.
