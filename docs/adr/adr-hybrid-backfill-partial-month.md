@@ -2,102 +2,159 @@
 
 ## Status
 
-Locked — 2026-07-16
+Locked — revised 2026-07-26
+
+## Amendment History
+
+This ADR replaces the 2026-07-16 decision to use one monthly history bucket
+and discard AMI for a partial transition month. That approach is not compatible
+with the current electricity statistics projection, which requires a
+contiguous 30-minute source timeline to create hourly Recorder statistics.
 
 ## Context
 
-The SP Group integration backfills historical electricity data from two API sources:
+The SP Group integration backfills historical electricity data from two API
+sources:
 
-1. **AMI charts endpoint** (`/jarvis/v3/ami/charts`) — 30-minute granularity, but
-   only returns smart-meter data from June 2026 onwards (when the smart meter was
-   installed at the premise).
+1. **AMI charts endpoint** (`POST /jarvis/v3/ami/charts`) — 30-minute smart
+   meter consumption buckets.
+2. **History charts endpoint** (`GET /jarvis/v4/charts/{premise_id}`) —
+   monthly billed-consumption evidence. This endpoint has no date query
+   parameters.
 
-2. **History charts endpoint** (`/jarvis/v4/charts/{premise_id}`) — monthly
-   granularity, returns billed consumption data covering the last 12 months
-   (Jul 2025 - Jun 2026 in this case).
+For an overlapping transition month, AMI can begin partway through the month
+when a smart meter is installed. The history endpoint provides the full-month
+total, while AMI provides the observed post-installation half-hours.
 
-For the transition month (June 2026), the AMI endpoint covers 28 days of data
-(Jun 3-30, 1,316 non-zero buckets, 588.87 kWh) with a 2-day gap (Jun 1-2, 124
-zero-value buckets). The history endpoint covers the full month (685.07 kWh).
+Live validation for June 2026 established the following for the same Jarvis
+premise:
 
-The gap of 96.20 kWh is **pure consumption recorded by the traditional meter
-before the smart meter was installed on June 3**, not a measurement discrepancy.
+| Evidence | Value |
+| --- | --- |
+| AMI timestamps | 1,440 complete June half-hour slots; no missing timestamps |
+| AMI prefix | 124 zero slots / 62 hours, from 1 June 00:00 until AMI begins at 3 June 14:00 +08:00 |
+| Observed AMI suffix | 1,316 positive buckets totaling 588.8723 kWh |
+| History total | `Actual`, `kWh`, `consumption.previous = 685.07` for the June row |
+| Historical remainder | 685.07 − 588.8723 = 96.1977 kWh |
+
+The history response uses a timestamp-formatted period in this case
+(`2026-06-01T00:00:00+08:00`) and has `consumption.current = 0`. The
+historical-total field must therefore be selected through a validated
+response-shape rule; the existing current-only electricity history parser is
+not sufficient for this backfill path.
 
 ## Decision
 
-**Use the history monthly bucket for the overlapping partial AMI month.**
-The AMI 30-min data for that month is discarded.
+**Select one source strategy per calendar month, with AMI taking precedence
+whenever it has usable coverage.**
 
-### Implementation rule
+| AMI evidence for a closed month | History evidence | Selected result |
+| --- | --- | --- |
+| Full AMI coverage | Present or absent | Use AMI only; do not add or reconcile a history bucket. |
+| No usable AMI coverage | Valid `Actual` history total | Use history only as one `history_monthly` bucket. AMI absence includes no AMI rows or only zero/placeholder rows; a complete zero AMI grid is not required. |
+| Partial AMI coverage | Valid `Actual` history total | Retain AMI and backfill only its missing leading prefix from the calculated history remainder, as specified below. |
+| Partial AMI coverage | Missing or invalid history total | Fail closed and leave the month unresolved; do not fabricate buckets. |
 
-For each month during backfill:
+AMI is therefore authoritative whenever it has observed monthly coverage. The
+history endpoint is used alone only when AMI has no usable coverage for that
+month; it is never added on top of full AMI data. For a partial month, history
+is not an alternative source: it is evidence used solely to calculate the
+amount allocated into the missing AMI prefix.
 
-```
-if month has NO AMI data:
-    use history monthly bucket
-elif month has AMI data but with a zero-value prefix (partial AMI):
-    use history monthly bucket (discard AMI for this month)
-elif month has annual history data AND month has full AMI data:
-    use AMI (discard history for this month)
-else:
-    use whatever source has data (current month)
-```
+For a validated partial month:
 
-For the current backfill data, this means:
+1. Fetch and normalize both AMI and history evidence for the same direct
+   Jarvis premise mapping.
+2. Validate that the history row is closed, `Actual`, in a supported unit, and
+   exposes a provider-validated full-month total.
+3. Validate that AMI has every expected 30-minute timestamp for the calendar
+   month, with a strictly leading, contiguous zero prefix and a complete,
+   positive observed suffix.
+4. Compute:
 
-| Period | AMI coverage | Source | Buckets |
-|--------|-------------|--------|---------|
-| Jul 2025 - May 2026 | None | History | 11 monthly |
-| Jun 2026 | **Partial** (2-day zero prefix) | **History** | 1 monthly (685.07 kWh) |
-| Jul 2026+ | Full | AMI | 30-min live |
+   ```text
+   historical_remainder = historical_month_total − observed_ami_month_total
+   ```
+
+5. Retain every observed positive AMI bucket unchanged. Evenly distribute the
+   non-negative historical remainder across the leading zero slots, using a
+   deterministic fixed-precision Decimal remainder policy so the allocated
+   buckets sum exactly to the historical remainder.
+6. Persist the resulting complete, non-overlapping 30-minute month timeline
+   once, with provenance that distinguishes observed AMI buckets from
+   history-derived allocated buckets.
+
+For June 2026, this means retaining the 1,316 observed AMI buckets and
+allocating 96.1977 kWh over the 124 leading slots. At ten decimal places, one
+deterministic exact split is 92 slots of `0.7757879032` kWh and 32 slots of
+`0.7757879033` kWh, distributed deterministically through the prefix.
+
+The month is accepted only when the guards above hold and the remainder is
+non-negative. A malformed response, missing AMI slot, internal or trailing AMI
+gap, unvalidated history field, or negative remainder must not create synthetic
+buckets. Preserve coverage evidence and surface a repairable unresolved-
+backfill condition instead.
 
 ## Rationale
 
-1. **One transition month**: June is a single transition month between 11
-   months of monthly granularity and ongoing AMI 30-min granularity. The
-   cost of losing 30-min granularity for 28 of June's 30 days is acceptable.
+This approach ensures that:
 
-2. **No artificial data**: Alternative approaches require creating synthetic
-   30-min buckets (pro-rata gap-fill) or mixing daily buckets with 30-min
-   buckets within the same month, both introducing complexity without
-   meaningful benefit.
+1. **There is no data gap.** Every 30-minute interval in the transition month
+   has a ledger contribution, so the current electricity statistics projection
+   can produce a continuous hourly Recorder timeline.
+2. **The historical total is correct leading up to the observed seed value.**
+   The composed month totals exactly the validated billed/history amount rather
+   than undercounting the pre-smart-meter consumption.
+3. **Observed AMI is preserved.** Real post-installation half-hour usage is not
+   discarded merely because the beginning of the month predates AMI coverage.
+4. **The ledger has one unambiguous timeline.** Source arbitration and
+   allocation occur before persistence, preventing a monthly history bucket
+   from being added on top of AMI buckets and double-counting the month.
 
-3. **Simpler implementation**: The statistics projection already handles
-   monthly buckets (for water and pre-AMI electricity). No special handling
-   is needed for mixed bucket durations within a single month.
+## Trade-off
 
-4. **Consistency**: June is treated the same as the 11 pre-AMI months,
-   avoiding special-case logic for the transition.
+The allocated leading buckets are **not observed time-resolved consumption**.
+They evenly project an aggregate historical remainder over time and therefore
+misrepresent the actual consumption pattern during the pre-AMI interval. Their
+provenance must remain visible to diagnostics and future repair/migration work;
+they must never be presented as provider-observed AMI readings.
+
+This trade-off is accepted because the provider supplies only an aggregate
+historical total for the missing interval, while a continuous 30-minute
+timeline is required to avoid a data gap and to align the cumulative history
+correctly with the observed seed value.
 
 ## Alternatives Considered
 
-### Pro-rata Gap-Fill (Rejected)
+### Whole Monthly History Bucket (Rejected)
 
-Create 124 synthetic 30-min buckets for Jun 1-2 by distributing the 96.20 kWh
-gap evenly (0.776 kWh per bucket). Keeps 30-min granularity for 93% of June,
-but the flat-valued synthetic buckets create an unnatural straight-line pattern
-in the sensor graph, followed by real varying data from Jun 3.
-
-### Single Gap Bucket + AMI (Rejected)
-
-Create one daily bucket covering Jun 1-2 (96.20 kWh) while keeping AMI 30-min
-buckets for Jun 3-30. Granularity preserved for the AMI period, but the
-statistics projection must handle mixed bucket durations within the same month
-(a daily bucket interspersed with 30-min buckets). Added complexity and testing
-surface outweighs the benefit of 28 days of 30-min data.
+Discard all AMI for the transition month and store one monthly history bucket.
+This preserves the monthly total but loses the real AMI suffix and cannot feed
+the current electricity statistics projection, which requires contiguous
+30-minute buckets.
 
 ### Use AMI As-Is (Rejected)
 
-Use AMI data for Jun 3-30 as-is (588.87 kWh), leaving Jun 1-2 as zero values.
-June total would undercount by 96.20 kWh (14%), creating a data gap. Rejected
-because the requirement is no data gaps.
+Keep only the observed AMI suffix. This undercounts the transition month by the
+historical remainder and leaves a permanent cumulative/history gap before the
+observed seed value.
+
+### One Daily Gap Bucket Plus AMI (Rejected)
+
+Represent the missing prefix as one or more daily buckets while retaining AMI.
+This creates mixed-duration electricity input and still does not satisfy the
+current fixed 30-minute statistics projection.
 
 ## Consequences
 
-- The user loses 30-min granularity for June 2026 (one transition month).
-- The statistics projection handles monthly-to-30-min transition at the
-  July 1 boundary (same as water already does).
-- No changes needed to the statistics projection for mixed bucket durations.
-- Future smart meter retrofits at other premises will follow the same pattern:
-  the installation month uses the history bucket; subsequent months use AMI.
-
+- Electricity source ingestion needs a month-level composition adapter before
+  ledger persistence; the existing AMI-only coordinator and current-only
+  history parser cannot be used unchanged.
+- Accepted buckets need durable provenance for observed AMI versus
+  history-derived allocation.
+- Existing persisted partial-AMI months require a deliberate strategy/version
+  migration and rebuild so old AMI rows are not combined with new allocations.
+- Tests must prove the response shape, partial-month classification, exact
+  remainder allocation, exact month total, 30-minute continuity, idempotency,
+  no double counting, migration behavior, and positive Recorder-visible
+  cumulative deltas across the transition.

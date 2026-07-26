@@ -1,9 +1,9 @@
 """Persistent accumulation ledger for SP Group dashboard sensors."""
 
 from __future__ import annotations
-import logging
 
 import asyncio
+import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -14,14 +14,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
-from .sources import SINGAPORE_TZ, SpGroupSourceConfig, UTILITY_ELECTRIC
 from .external_statistics import (
     EXTERNAL_STATISTICS_STRATEGY,
     external_identity_fingerprint,
     external_statistic_id,
 )
+from .sources import SINGAPORE_TZ, UTILITY_ELECTRIC, SpGroupSourceConfig
+
 LOGGER = logging.getLogger(__name__)
-from .sources import SINGAPORE_TZ, SpGroupSourceConfig
 
 _STORE_VERSION = 1
 _STORE_MINOR_VERSION = 2
@@ -60,6 +60,10 @@ SOURCE_COVERAGE_STATUSES = frozenset(
     }
 )
 _MAX_CORRECTION_RECORDS = 32
+ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1 = "hybrid_electricity_v1"
+PROVENANCE_AMI_OBSERVED = "ami_observed"
+PROVENANCE_HISTORY_ALLOCATED = "history_allocated"
+PROVENANCE_HISTORY_MONTHLY = "history_monthly"
 
 
 class LedgerError(ValueError):
@@ -76,6 +80,7 @@ class SpGroupAcceptedBucket:
     value: Decimal
     first_seen_at: datetime
     accepted_at: datetime
+    provenance: str = PROVENANCE_AMI_OBSERVED
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the accepted bucket."""
@@ -86,11 +91,18 @@ class SpGroupAcceptedBucket:
             "value": str(self.value),
             "first_seen_at": self.first_seen_at.isoformat(),
             "accepted_at": self.accepted_at.isoformat(),
+            "provenance": self.provenance,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> SpGroupAcceptedBucket:
         """Deserialize an accepted bucket."""
+        raw_provenance = payload.get("provenance")
+        provenance = (
+            raw_provenance
+            if isinstance(raw_provenance, str)
+            else PROVENANCE_AMI_OBSERVED
+        )
         return cls(
             bucket_key=_required_string(payload, "bucket_key"),
             start=_parse_datetime(_required_string(payload, "start")),
@@ -98,6 +110,7 @@ class SpGroupAcceptedBucket:
             value=_parse_decimal(_required_string(payload, "value")),
             first_seen_at=_parse_datetime(_required_string(payload, "first_seen_at")),
             accepted_at=_parse_datetime(_required_string(payload, "accepted_at")),
+            provenance=provenance,
         )
 
 
@@ -169,12 +182,8 @@ class SpGroupUnresolvedRange:
             start=_parse_datetime(_required_string(payload, "start")),
             end=_parse_datetime(_required_string(payload, "end")),
             reason=_required_string(payload, "reason"),
-            first_seen_at=_parse_datetime(
-                _required_string(payload, "first_seen_at")
-            ),
-            last_seen_at=_parse_datetime(
-                _required_string(payload, "last_seen_at")
-            ),
+            first_seen_at=_parse_datetime(_required_string(payload, "first_seen_at")),
+            last_seen_at=_parse_datetime(_required_string(payload, "last_seen_at")),
         )
 
 
@@ -204,9 +213,7 @@ class SpGroupCorrection:
         return cls(
             bucket_key=_required_string(payload, "bucket_key"),
             start=_parse_datetime(_required_string(payload, "start")),
-            previous_value=_parse_decimal(
-                _required_string(payload, "previous_value")
-            ),
+            previous_value=_parse_decimal(_required_string(payload, "previous_value")),
             candidate_value=_parse_decimal(
                 _required_string(payload, "candidate_value")
             ),
@@ -252,6 +259,7 @@ class SpGroupLedgerEntry:
     statistics_source_fingerprint: str | None = None
     external_migration_status: str | None = None
     statistics_last_verified_at: datetime | None = None
+    electricity_backfill_strategy: str | None = None
 
     @property
     def has_trusted_total(self) -> bool:
@@ -276,9 +284,7 @@ class SpGroupLedgerEntry:
             ),
             "accepted": [bucket.to_dict() for bucket in self.accepted],
             "pending": [bucket.to_dict() for bucket in self.pending],
-            "unresolved_ranges": [
-                item.to_dict() for item in self.unresolved_ranges
-            ],
+            "unresolved_ranges": [item.to_dict() for item in self.unresolved_ranges],
             "source_coverage_status": self.source_coverage_status,
             "source_coverage_start": (
                 self.source_coverage_start.isoformat()
@@ -349,6 +355,7 @@ class SpGroupLedgerEntry:
                 if self.statistics_last_verified_at is not None
                 else None
             ),
+            "electricity_backfill_strategy": self.electricity_backfill_strategy,
         }
 
     @classmethod
@@ -376,9 +383,7 @@ class SpGroupLedgerEntry:
         )
         if source_coverage_status not in SOURCE_COVERAGE_STATUSES:
             source_coverage_status = SOURCE_COVERAGE_UNKNOWN
-        source_coverage_start = _optional_datetime(
-            payload.get("source_coverage_start")
-        )
+        source_coverage_start = _optional_datetime(payload.get("source_coverage_start"))
         source_coverage_end = _optional_datetime(payload.get("source_coverage_end"))
         corrections = tuple(
             SpGroupCorrection.from_dict(item)
@@ -431,6 +436,7 @@ class SpGroupLedgerEntry:
         statistics_last_verified_at = _optional_datetime(
             payload.get("statistics_last_verified_at")
         )
+        electricity_backfill_strategy = payload.get("electricity_backfill_strategy")
         raw_statistics_warnings = tuple(
             warning
             for warning in payload.get("statistics_warnings", [])
@@ -460,9 +466,7 @@ class SpGroupLedgerEntry:
         else:
             backfill_from = seed_effective_from
             warnings = tuple(
-                dict.fromkeys(
-                    (*raw_warnings, WARNING_LEGACY_BACKFILL_FROM_DEFAULTED)
-                )
+                dict.fromkeys((*raw_warnings, WARNING_LEGACY_BACKFILL_FROM_DEFAULTED))
             )
         source_backfill_status = payload.get("source_backfill_status")
         if source_backfill_status not in SOURCE_BACKFILL_STATUSES:
@@ -528,9 +532,7 @@ class SpGroupLedgerEntry:
             source_backfill_succeeded_at=source_backfill_succeeded_at,
             source_backfill_failed_at=source_backfill_failed_at,
             last_source_poll_succeeded_at=last_source_poll_succeeded_at,
-            statistics_imported_through=(
-                statistics_imported_through
-            ),
+            statistics_imported_through=(statistics_imported_through),
             statistics_reference_start=statistics_reference_start,
             statistics_reference_sum_offset=statistics_reference_sum_offset,
             statistics_strategy_version=(
@@ -561,6 +563,11 @@ class SpGroupLedgerEntry:
                 else None
             ),
             statistics_last_verified_at=statistics_last_verified_at,
+            electricity_backfill_strategy=(
+                electricity_backfill_strategy
+                if isinstance(electricity_backfill_strategy, str)
+                else None
+            ),
         )
 
     def source_poll_cursor_start(self) -> datetime:
@@ -622,6 +629,7 @@ class SpGroupBucketObservation:
     start: datetime
     end: datetime
     value: Decimal
+    provenance: str = PROVENANCE_AMI_OBSERVED
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,9 +639,7 @@ class SpGroupSourceCoverage:
     status: str = SOURCE_COVERAGE_UNKNOWN
     start: datetime | None = None
     end: datetime | None = None
-    unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = field(
-        default_factory=tuple
-    )
+    unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         """Validate coverage status at the adapter boundary."""
@@ -672,7 +678,8 @@ class SpGroupLedgerStore:
                 if entry.utility_type == UTILITY_ELECTRIC and entry.pending:
                     LOGGER.info(
                         "SP Group clearing %d legacy pending buckets for %s",
-                        len(entry.pending), entry_key,
+                        len(entry.pending),
+                        entry_key,
                     )
                     entries = dict(self._snapshot.entries)
                     entries[entry_key] = replace(entry, pending=())
@@ -699,6 +706,26 @@ class SpGroupLedgerStore:
                     changed = True
                     continue
                 if current.epoch_id == config.epoch_id:
+                    if (
+                        current.utility_type == UTILITY_ELECTRIC
+                        and current.electricity_backfill_strategy
+                        != ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1
+                    ):
+                        if current.accepted:
+                            warning = "hybrid_strategy_rebuild_required"
+                            if warning not in current.warnings:
+                                entries[sensor_key] = _copy_entry_with_warnings(
+                                    current, (*current.warnings, warning)
+                                )
+                                changed = True
+                        else:
+                            entries[sensor_key] = replace(
+                                current,
+                                electricity_backfill_strategy=(
+                                    ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1
+                                ),
+                            )
+                            changed = True
                     continue
                 if (
                     config.seed_value < current.latest_total
@@ -1051,6 +1078,7 @@ def _apply_observations_to_entry(
     require_two_sightings: bool,
     coverage: SpGroupSourceCoverage | None = None,
 ) -> SpGroupLedgerEntry:
+    _validate_observation_spans(entry.accepted, observations)
     accepted_by_key = {bucket.bucket_key: bucket for bucket in entry.accepted}
     pending_by_key = {bucket.bucket_key: bucket for bucket in entry.pending}
     warnings = list(entry.warnings)
@@ -1100,6 +1128,7 @@ def _apply_observations_to_entry(
                     value=observation.value,
                     first_seen_at=current_pending.first_seen_at,
                     accepted_at=now,
+                    provenance=observation.provenance,
                 )
             )
             changed = True
@@ -1134,6 +1163,7 @@ def _apply_observations_to_entry(
                     value=observation.value,
                     first_seen_at=now,
                     accepted_at=now,
+                    provenance=observation.provenance,
                 )
             )
             changed = True
@@ -1150,9 +1180,7 @@ def _apply_observations_to_entry(
     latest_accepted_at = max((bucket.end for bucket in accepted), default=None)
     accepted_keys = {item.bucket_key for item in entry.accepted}
     new_accepted_starts = tuple(
-        bucket.start
-        for bucket in accepted
-        if bucket.bucket_key not in accepted_keys
+        bucket.start for bucket in accepted if bucket.bucket_key not in accepted_keys
     )
     unresolved_ranges = _merge_unresolved_ranges(
         entry.unresolved_ranges,
@@ -1176,16 +1204,11 @@ def _apply_observations_to_entry(
         source_coverage_status=(
             coverage.status if coverage is not None else entry.source_coverage_status
         ),
-        source_coverage_start=(
-            coverage_start
-        ),
-        source_coverage_end=(
-            coverage_end
-        ),
+        source_coverage_start=(coverage_start),
+        source_coverage_end=(coverage_end),
         last_source_poll_succeeded_at=(
             now
-            if coverage is not None
-            and coverage.status != SOURCE_COVERAGE_MALFORMED
+            if coverage is not None and coverage.status != SOURCE_COVERAGE_MALFORMED
             else entry.last_source_poll_succeeded_at
         ),
         corrections=corrections,
@@ -1202,6 +1225,25 @@ def _apply_observations_to_entry(
     return updated if updated != entry else entry
 
 
+def _validate_observation_spans(
+    accepted: tuple[SpGroupAcceptedBucket, ...],
+    observations: tuple[SpGroupBucketObservation, ...],
+) -> None:
+    """Reject distinct buckets whose time spans overlap."""
+    spans = [(bucket.bucket_key, bucket.start, bucket.end) for bucket in accepted]
+    for observation in observations:
+        if observation.end <= observation.start:
+            raise LedgerError("invalid_observation_span")
+        for key, start, end in spans:
+            if (
+                key != observation.bucket_key
+                and observation.start < end
+                and start < observation.end
+            ):
+                raise LedgerError("overlapping_observation_span")
+        spans.append((observation.bucket_key, observation.start, observation.end))
+
+
 def _append_correction(
     existing: tuple[SpGroupCorrection, ...],
     correction: SpGroupCorrection,
@@ -1209,9 +1251,9 @@ def _append_correction(
     """Keep one latest correction per bucket within the bounded record set."""
     by_key = {item.bucket_key: item for item in existing}
     by_key[correction.bucket_key] = correction
-    return tuple(
-        sorted(by_key.values(), key=lambda item: item.detected_at)
-    )[-_MAX_CORRECTION_RECORDS:]
+    return tuple(sorted(by_key.values(), key=lambda item: item.detected_at))[
+        -_MAX_CORRECTION_RECORDS:
+    ]
 
 
 def _merge_unresolved_ranges(
@@ -1249,8 +1291,7 @@ def _resolve_unresolved_ranges(
         item
         for item in ranges
         if not any(
-            start == item.start and end == item.end
-            for start, end in accepted_spans
+            start == item.start and end == item.end for start, end in accepted_spans
         )
     )
 
@@ -1285,6 +1326,11 @@ def _entry_from_config(
         external_migration_status="pending",
         statistics_strategy_version=EXTERNAL_STATISTICS_STRATEGY,
         statistics_dirty_from=config.backfill_from,
+        electricity_backfill_strategy=(
+            ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1
+            if config.utility_type == UTILITY_ELECTRIC
+            else None
+        ),
     )
 
 
@@ -1378,6 +1424,10 @@ def _optional_epoch_id(payload: dict[str, Any]) -> str:
 
 __all__ = [
     "LedgerError",
+    "ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1",
+    "PROVENANCE_AMI_OBSERVED",
+    "PROVENANCE_HISTORY_ALLOCATED",
+    "PROVENANCE_HISTORY_MONTHLY",
     "SpGroupBucketObservation",
     "SpGroupLedgerEntry",
     "SpGroupLedgerSnapshot",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -9,9 +10,15 @@ from typing import Any
 from unittest.mock import patch
 
 from custom_components.sp_group.const import DOMAIN
-from custom_components.sp_group.ledger import SpGroupLedgerEntry
+from custom_components.sp_group.ledger import (
+    PROVENANCE_HISTORY_MONTHLY,
+    SpGroupLedgerEntry,
+)
 from custom_components.sp_group.sources import SINGAPORE_TZ
-from custom_components.sp_group.statistics_backfill import async_backfill_statistics
+from custom_components.sp_group.statistics_backfill import (
+    _projected_statistics_with_warnings,
+    async_backfill_statistics,
+)
 from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models.statistics import StatisticMeanType
@@ -34,6 +41,44 @@ from .test_recorder_statistics import (
     _wait_for_statistic_rows,
     _with_sum_offset,
 )
+
+
+def test_electricity_history_month_projects_as_end_of_period_row() -> None:
+    """A history-only electricity month coexists with later AMI hourly rows."""
+    history_month = replace(
+        _accepted_bucket(
+            "2026-06-01T00:00:00+08:00",
+            "2026-07-01T00:00:00+08:00",
+            "12",
+        ),
+        provenance=PROVENANCE_HISTORY_MONTHLY,
+    )
+    entry = _ledger_entry(
+        ELECTRIC_KEY,
+        "electric",
+        "100",
+        (
+            history_month,
+            _accepted_bucket(
+                "2026-07-01T00:00:00+08:00",
+                "2026-07-01T00:30:00+08:00",
+                "1",
+            ),
+            _accepted_bucket(
+                "2026-07-01T00:30:00+08:00",
+                "2026-07-01T01:00:00+08:00",
+                "2",
+            ),
+        ),
+    )
+
+    rows, warnings = _projected_statistics_with_warnings(entry)
+
+    assert warnings == ()
+    assert [(row.start, row.delta) for row in rows] == [
+        (datetime(2026, 6, 30, 23, tzinfo=SINGAPORE_TZ), Decimal("12")),
+        (datetime(2026, 7, 1, 0, tzinfo=SINGAPORE_TZ), Decimal("3")),
+    ]
 
 
 async def test_electricity_visible_synthetic_baseline_is_not_negative(
@@ -433,8 +478,7 @@ async def test_electricity_seed_boundary_hour_generates_continuous_chain(
     # 12:00 bridge: state=1003, sum=7  ← delta=5 (12-13: 2 pre + 3 post)
     # 13:00 post:   state=1005, sum=9  ← delta=2 (13-14 consumption)
     expected_sum = Decimal("0")
-    expected_state = Decimal("996")
-    for i, (start, row) in enumerate(zip(row_starts, planned_rows, strict=True)):
+    for _i, (start, row) in enumerate(zip(row_starts, planned_rows, strict=True)):
         assert row["start"] == start
         row_sum = Decimal(str(row["sum"]))
         assert row_sum >= expected_sum, (

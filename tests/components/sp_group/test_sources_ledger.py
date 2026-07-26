@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from custom_components.sp_group.discovery import (
     SpGroupCoordinatorData,
     SpGroupFutureSensorKey,
@@ -837,7 +838,10 @@ async def test_legacy_source_and_ledger_epoch_fallbacks_match(
     entry = snapshot.entries[sensor_key]
     assert entry.latest_total == Decimal("101.25")
     assert entry.accepted == (accepted,)
-    assert entry.warnings == ("legacy_backfill_from_defaulted",)
+    assert entry.warnings == (
+        "legacy_backfill_from_defaulted",
+        "hybrid_strategy_rebuild_required",
+    )
 
 
 async def test_ledger_save_failure_does_not_publish_unpersisted_total(
@@ -980,7 +984,7 @@ async def test_ledger_concurrent_apply_observations_same_bucket(
     hass: HomeAssistant,
     tmp_path,
 ) -> None:
-    """Concurrent apply calls for same bucket: first accepted, second records correction."""
+    """The first concurrent value is accepted; the second is a correction."""
     from custom_components.sp_group.ledger import SpGroupLedgerStore
     hass.config.config_dir = str(tmp_path)
     store = SpGroupLedgerStore(hass, "entry-same-bucket")
@@ -1028,6 +1032,59 @@ async def test_ledger_concurrent_apply_observations_same_bucket(
     assert len(entry.accepted) == 1
     assert entry.accepted[0].value == Decimal("1.0")
     assert any("corrected_bucket:bucket-same" in w for w in entry.warnings)
+
+
+async def test_ledger_rejects_distinct_overlapping_bucket_spans(
+    hass: HomeAssistant,
+    tmp_path,
+) -> None:
+    """Distinct bucket identities cannot occupy the same time span."""
+    from custom_components.sp_group.ledger import LedgerError, SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-overlap")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-07-15T13:00:00+08:00",
+        backfill_from="2026-07-15T13:00:00+08:00",
+        now=datetime(2026, 7, 15, 18, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+    now = datetime(2026, 7, 15, 19, 0, tzinfo=SINGAPORE_TZ)
+    await store.async_apply_observations(
+        "opaque_electric",
+        (
+            SpGroupBucketObservation(
+                bucket_key="first",
+                start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+                end=datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
+                value=Decimal("1"),
+            ),
+        ),
+        now=now,
+        require_two_sightings=False,
+    )
+
+    with pytest.raises(LedgerError, match="overlapping_observation_span"):
+        await store.async_apply_observations(
+            "opaque_electric",
+            (
+                SpGroupBucketObservation(
+                    bucket_key="overlap",
+                    start=datetime(2026, 7, 15, 13, 15, tzinfo=SINGAPORE_TZ),
+                    end=datetime(2026, 7, 15, 13, 45, tzinfo=SINGAPORE_TZ),
+                    value=Decimal("1"),
+                ),
+            ),
+            now=now,
+            require_two_sightings=False,
+        )
 
 
 async def test_ledger_preserves_cursor_on_retention_exceeded(

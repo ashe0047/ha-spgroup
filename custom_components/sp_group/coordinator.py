@@ -14,12 +14,19 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from spgroup.mobile import SpGroupMobileError
+from spgroup.mobile import MobileSession, SpGroupMobileError
 
 from .auth import async_refresh_runtime_session_if_needed
 from .const import DEFAULT_UPDATE_TIMEOUT_SECONDS, DOMAIN
 from .discovery import DiscoveryDataError, SpGroupCoordinatorData
 from .discovery_service import async_fetch_discovery_data
+from .electricity import (
+    AMI_COVERAGE_INVALID,
+    AMI_COVERAGE_NONE,
+    AMI_COVERAGE_PARTIAL,
+    classify_electricity_ami_month,
+    compose_electricity_history_and_ami,
+)
 from .ledger import (
     SOURCE_COVERAGE_COVERED,
     SOURCE_COVERAGE_LAGGING,
@@ -271,14 +278,19 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
                     mode,
                 )
                 continue
+            ledger_entry = runtime.ledger_store.snapshot.entries.get(sensor_key)
+            if (
+                ledger_entry is not None
+                and "hybrid_strategy_rebuild_required" in ledger_entry.warnings
+            ):
+                raise LedgerError("hybrid_strategy_rebuild_required")
             request_start = self._request_start(
                 sensor_key,
                 config,
                 backfill=backfill,
             )
             LOGGER.debug(
-                "SP Group %s poll request prepared: mode=%s "
-                "start=%s end=%s",
+                "SP Group %s poll request prepared: mode=%s start=%s end=%s",
                 self.utility_type,
                 mode,
                 request_start.isoformat(),
@@ -293,10 +305,13 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
                 self.api_utility_type,
             )
             request_count += 1
-            parsed = self._parse_source(
+            parsed = await self._async_parse_source(
                 payload,
+                session=session,
+                premise_id=premise.jarvis_premise_id,
                 backfill_from=request_start,
                 now=now,
+                backfill=backfill,
             )
             observation_count += len(parsed.observations)
             coverage = parsed.coverage
@@ -383,6 +398,20 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
             )
         )
 
+    async def _async_parse_source(
+        self,
+        payload: dict[str, Any],
+        *,
+        session: MobileSession,
+        premise_id: str,
+        backfill_from: datetime,
+        now: datetime,
+        backfill: bool,
+    ) -> SpGroupParsedSource:
+        """Async parser hook for sources that need supporting evidence."""
+        del session, premise_id, backfill
+        return self._parse_source(payload, backfill_from=backfill_from, now=now)
+
 
 class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
     """Coordinate electricity AMI ledger polling."""
@@ -446,6 +475,67 @@ class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
             payload,
             backfill_from=backfill_from,
             now=now,
+        )
+
+    async def _async_parse_source(
+        self,
+        payload: dict[str, Any],
+        *,
+        session: MobileSession,
+        premise_id: str,
+        backfill_from: datetime,
+        now: datetime,
+        backfill: bool,
+    ) -> SpGroupParsedSource:
+        """Compose history only when closed AMI evidence needs it."""
+        if not _electricity_ami_needs_history(
+            payload,
+            backfill_from=backfill_from,
+            now=now,
+            backfill=backfill,
+        ):
+            return self._parse_source(payload, backfill_from=backfill_from, now=now)
+        jarvis_client = self.entry.runtime_data.jarvis_client
+        history_payload = await jarvis_client.get_history_charts(session, premise_id)
+        rows: list[tuple[datetime, Decimal]] = []
+        for row in _ami_rows(payload):
+            start = _parse_bucket_start(row.get("date"))
+            value = _parse_decimal(row.get("consumption", row.get("amount")))
+            if start is not None and value is not None and value >= 0:
+                rows.append((start, value))
+        composition = compose_electricity_history_and_ami(
+            history_payload,
+            tuple(rows),
+            backfill_from=backfill_from,
+            now=now,
+        )
+        unresolved = tuple(
+            SpGroupUnresolvedRange(
+                cadence="month",
+                start=month,
+                end=_next_month(month),
+                reason="electricity_hybrid_month_unresolved",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+            for month in composition.unresolved_months
+        )
+        observations = composition.observations
+        if not observations and unresolved:
+            return SpGroupParsedSource(
+                coverage=SpGroupSourceCoverage(
+                    status=SOURCE_COVERAGE_LAGGING,
+                    unresolved_ranges=unresolved,
+                )
+            )
+        return SpGroupParsedSource(
+            observations=observations,
+            coverage=SpGroupSourceCoverage(
+                status=SOURCE_COVERAGE_COVERED,
+                start=min((item.start for item in observations), default=None),
+                end=max((item.end for item in observations), default=None),
+                unresolved_ranges=unresolved,
+            ),
         )
 
 
@@ -730,6 +820,7 @@ class SpGroupWaterCoordinator(SpGroupUtilityCoordinator):
         )
         self._schedule_next(local_now + timedelta(days=1))
 
+
 # Compatibility import for tests/modules that still refer to the old name.
 SpGroupDataUpdateCoordinator = SpGroupDiscoveryCoordinator
 
@@ -749,7 +840,6 @@ def next_water_run(now: datetime, options: Mapping[str, Any]) -> datetime:
         else:
             configured = configured.replace(month=local.month + 1)
     return configured
-
 
 
 def _water_startup_catchup_needed(
@@ -915,8 +1005,6 @@ def _date_for_api(value: datetime) -> date:
     return value.astimezone(SINGAPORE_TZ).date()
 
 
-
-
 def _fixed_missing_ranges(
     previous_start: datetime,
     next_start: datetime,
@@ -994,16 +1082,12 @@ def _electricity_ami_source_poll(
         rows.append((start, value))
     rows.sort(key=lambda item: item[0])
     completed_rows = [
-        (start, value)
-        for start, value in rows
-        if start + timedelta(minutes=30) <= now
+        (start, value) for start, value in rows if start + timedelta(minutes=30) <= now
     ]
     positive = [(start, value) for start, value in completed_rows if value > 0]
     if not positive:
         status = SOURCE_COVERAGE_LAGGING
-        return SpGroupParsedSource(
-            coverage=SpGroupSourceCoverage(status=status)
-        )
+        return SpGroupParsedSource(coverage=SpGroupSourceCoverage(status=status))
 
     coverage_start = positive[0][0]
     coverage_end = positive[-1][0] + timedelta(minutes=30)
@@ -1027,9 +1111,7 @@ def _electricity_ami_source_poll(
             value=value,
         )
         for start, value in rows
-        if value > 0
-        and start >= backfill_from
-        and start + timedelta(minutes=30) <= now
+        if value > 0 and start >= backfill_from and start + timedelta(minutes=30) <= now
     )
     return SpGroupParsedSource(
         observations=observations,
@@ -1040,6 +1122,56 @@ def _electricity_ami_source_poll(
             unresolved_ranges=tuple(unresolved),
         ),
     )
+
+
+def _electricity_ami_needs_history(
+    payload: dict[str, Any],
+    *,
+    backfill_from: datetime,
+    now: datetime,
+    backfill: bool,
+) -> bool:
+    """Return whether closed-month history evidence is required."""
+    if backfill and backfill_from < now:
+        return True
+    rows_by_month: dict[datetime, dict[datetime, Decimal]] = {}
+    duplicate_months: set[datetime] = set()
+    for row in _ami_rows(payload):
+        start = _parse_bucket_start(row.get("date"))
+        value = _parse_decimal(row.get("consumption", row.get("amount")))
+        if (
+            start is None
+            or value is None
+            or value < 0
+            or start + timedelta(minutes=30) > now
+        ):
+            continue
+        month = _parse_month_start(start.isoformat())
+        if month is not None:
+            rows = rows_by_month.setdefault(month, {})
+            if start in rows:
+                duplicate_months.add(month)
+            rows[start] = value
+    request_month = _parse_month_start(backfill_from.isoformat())
+    if request_month is not None and _next_month(request_month) <= now:
+        if not rows_by_month:
+            return True
+    for month, rows in rows_by_month.items():
+        month_end = _next_month(month)
+        if month_end > now:
+            continue
+        classification = classify_electricity_ami_month(
+            month,
+            rows,
+            duplicate=month in duplicate_months,
+        )
+        if classification.coverage in {
+            AMI_COVERAGE_NONE,
+            AMI_COVERAGE_PARTIAL,
+            AMI_COVERAGE_INVALID,
+        }:
+            return True
+    return False
 
 
 def _water_history_source_poll(

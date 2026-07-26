@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -17,8 +17,8 @@ from custom_components.sp_group.coordinator import (
     SpGroupDataUpdateCoordinator,
     SpGroupElectricityCoordinator,
     SpGroupWaterCoordinator,
-    
     _ami_rows,
+    _electricity_ami_needs_history,
     _electricity_ami_source_poll,
     _missing_closed_water_months,
     _water_history_observations,
@@ -368,8 +368,9 @@ async def test_normal_poll_recovers_pre_seed_lag(
         coverage=SpGroupSourceCoverage(status="covered"),
     )
     # Cursor should be at the last accepted bucket end (13:30)
-    assert ledger_store.snapshot.entries[sensor_key.key].source_poll_cursor_start() == datetime(
-        2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ
+    assert (
+        ledger_store.snapshot.entries[sensor_key.key].source_poll_cursor_start()
+        == datetime(2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ)
     )
 
     entry = MockConfigEntry(
@@ -813,6 +814,37 @@ def test_water_history_observations_malformed_rows() -> None:
         now=datetime(2026, 9, 5, tzinfo=SINGAPORE_TZ),
     )
     assert observations == ()
+
+
+def test_electricity_history_fetch_decision_distinguishes_coverage() -> None:
+    """Backfill fetches history for absent/partial coverage, not full AMI."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    full_payload = {
+        "history": [
+            {
+                "data": [
+                    {
+                        "date": slot.strftime("%Y%m%d%H%M%S"),
+                        "consumption": "1",
+                    }
+                    for slot in slots
+                ]
+            }
+        ]
+    }
+    assert not _electricity_ami_needs_history(
+        full_payload,
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        backfill=False,
+    )
+    assert _electricity_ami_needs_history(
+        {"history": []},
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        backfill=False,
+    )
 
 
 async def test_water_coordinator_calls_get_history_charts(

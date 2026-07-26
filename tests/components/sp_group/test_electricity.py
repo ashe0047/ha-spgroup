@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from custom_components.sp_group.electricity import (
+    AMI_COVERAGE_FULL,
+    AMI_COVERAGE_INVALID,
+    AMI_COVERAGE_NONE,
+    AMI_COVERAGE_PARTIAL,
+    classify_electricity_ami_month,
+    compose_electricity_history_and_ami,
     parse_ami_electricity_chart,
     parse_history_electricity_chart,
+    parse_history_electricity_months,
 )
+from custom_components.sp_group.sources import SINGAPORE_TZ
 
 
 def history_chart_payload() -> dict[str, object]:
@@ -103,6 +112,212 @@ def test_history_chart_parser_accepts_live_validated_apk_shape() -> None:
     assert candidate.source == "history_chart"
     assert candidate.semantic == "period_usage"
     assert candidate.publishable is False
+
+
+def test_history_month_normalizer_uses_previous_for_validated_live_shape() -> None:
+    """Actual history backfill uses previous when current is the live zero shape."""
+    months = parse_history_electricity_months(
+        {
+            "elec": {
+                "data": [
+                    {
+                        "period": "2026-06-01T00:00:00+08:00",
+                        "status": "Actual",
+                        "unit": "kWh",
+                        "consumption": {"current": 0, "previous": "685.07"},
+                    }
+                ]
+            }
+        }
+    )
+    assert len(months) == 1
+    assert months[0].total_kwh == Decimal("685.07")
+    assert months[0].selected_field == "previous"
+
+
+def test_month_composer_allocates_leading_prefix_exactly() -> None:
+    """A partial AMI month keeps observed values and fills only its prefix."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    composition = compose_electricity_history_and_ami(
+        {
+            "elec": {
+                "data": [
+                    {
+                        "period": "2026-01",
+                        "status": "Actual",
+                        "unit": "kWh",
+                        "consumption": {"current": 0, "previous": "1488"},
+                    }
+                ]
+            }
+        },
+        tuple(
+            (slot, Decimal("0") if index < 2 else Decimal("1"))
+            for index, slot in enumerate(slots)
+        ),
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+    assert composition.unresolved_months == ()
+    assert len(composition.observations) == 31 * 48
+    assert sum(
+        (item.value for item in composition.observations), Decimal("0")
+    ) == Decimal("1488")
+    assert [item.provenance for item in composition.observations[:2]] == [
+        "history_allocated",
+        "history_allocated",
+    ]
+    assert all(
+        item.provenance == "ami_observed" for item in composition.observations[2:]
+    )
+
+
+def test_month_composer_keeps_history_only_month_monthly() -> None:
+    """A complete all-zero AMI month remains AMI-authoritative."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    composition = compose_electricity_history_and_ami(
+        {
+            "elec": {
+                "data": [
+                    {
+                        "period": "2026-01",
+                        "status": "Actual",
+                        "unit": "kWh",
+                        "consumption": {"current": "12"},
+                    }
+                ]
+            }
+        },
+        tuple((slot, Decimal("0")) for slot in slots),
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+    assert composition.observations == ()
+    assert composition.unresolved_months == ()
+
+
+def test_ami_month_classifier_covers_full_none_partial_and_invalid() -> None:
+    """AMI coverage classification is independent of history totals."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    assert (
+        classify_electricity_ami_month(
+            month, {slot: Decimal("0") for slot in slots}
+        ).coverage
+        == AMI_COVERAGE_FULL
+    )
+    full_with_zero_interval = {slot: Decimal("1") for slot in slots}
+    full_with_zero_interval[slots[10]] = Decimal("0")
+    assert (
+        classify_electricity_ami_month(month, full_with_zero_interval).coverage
+        == AMI_COVERAGE_FULL
+    )
+    assert classify_electricity_ami_month(month, {}).coverage == AMI_COVERAGE_NONE
+    assert (
+        classify_electricity_ami_month(
+            month, {slots[0]: Decimal("0"), slots[1]: Decimal("0")}
+        ).coverage
+        == AMI_COVERAGE_NONE
+    )
+    partial_rows = {slot: Decimal("1") for slot in slots}
+    partial_rows[slots[0]] = Decimal("0")
+    assert (
+        classify_electricity_ami_month(month, partial_rows).coverage
+        == AMI_COVERAGE_PARTIAL
+    )
+    invalid_rows = dict(partial_rows)
+    del invalid_rows[slots[1]]
+    assert (
+        classify_electricity_ami_month(month, invalid_rows).coverage
+        == AMI_COVERAGE_INVALID
+    )
+    assert (
+        classify_electricity_ami_month(month, partial_rows, duplicate=True).coverage
+        == AMI_COVERAGE_INVALID
+    )
+
+
+def test_month_composer_uses_history_when_ami_is_absent() -> None:
+    """A history month absent from AMI becomes one monthly bucket."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    composition = compose_electricity_history_and_ami(
+        {
+            "elec": {
+                "data": [
+                    {
+                        "period": "2026-01",
+                        "status": "Actual",
+                        "unit": "kWh",
+                        "consumption": {"current": "12"},
+                    }
+                ]
+            }
+        },
+        (),
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+    assert [(item.value, item.provenance) for item in composition.observations] == [
+        (Decimal("12"), "history_monthly")
+    ]
+
+
+def test_month_composer_rejects_invalid_partial_without_synthesis() -> None:
+    """Positive AMI with a missing timestamp remains unresolved."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    rows = tuple(
+        (slot, Decimal("0") if index == 0 else Decimal("1"))
+        for index, slot in enumerate(slots)
+        if index != 1
+    )
+    composition = compose_electricity_history_and_ami(
+        {
+            "elec": {
+                "data": [
+                    {
+                        "period": "2026-01",
+                        "status": "Actual",
+                        "unit": "kWh",
+                        "consumption": {"current": "48"},
+                    }
+                ]
+            }
+        },
+        rows,
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+    assert composition.observations == ()
+    assert composition.unresolved_months == (month,)
+
+
+def test_month_composer_prefers_full_ami_when_history_is_present() -> None:
+    """Full AMI coverage never adds a history bucket."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    composition = compose_electricity_history_and_ami(
+        {
+            "elec": {
+                "data": [
+                    {
+                        "period": "2026-01",
+                        "status": "Actual",
+                        "unit": "kWh",
+                        "consumption": {"current": "999"},
+                    }
+                ]
+            }
+        },
+        tuple((slot, Decimal("1")) for slot in slots),
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+    assert len(composition.observations) == len(slots)
+    assert all(item.provenance == "ami_observed" for item in composition.observations)
+    assert composition.unresolved_months == ()
 
 
 def test_history_chart_parser_reports_malformed_and_uncertain_rows() -> None:

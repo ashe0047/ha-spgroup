@@ -29,6 +29,7 @@ from homeassistant.helpers import issue_registry as ir
 
 from .const import DOMAIN
 from .ledger import (
+    PROVENANCE_HISTORY_MONTHLY,
     STATISTICS_STRATEGY_NATIVE_OFFSET_V2,
     WARNING_LEGACY_STATISTICS_STRATEGY_MIGRATED,
     SpGroupAcceptedBucket,
@@ -210,7 +211,6 @@ _HALF_HOUR_SECONDS = int(_HALF_HOUR.total_seconds())
 _SLOT_EPOCH = datetime(2000, 1, 1, tzinfo=SINGAPORE_TZ)
 
 
-
 async def _async_backfill_external(
     hass: HomeAssistant,
     ledger_store: Any,
@@ -229,12 +229,12 @@ async def _async_backfill_external(
     if not projected:
         if bridge_warnings:
             await _update_statistics_metadata(
-                ledger_store, sensor_key,
+                ledger_store,
+                sensor_key,
                 warnings=bridge_warnings,
             )
         LOGGER.info(
-            "SP Group external statistics skipped: utility=%s projected=0 "
-            "warnings=%d",
+            "SP Group external statistics skipped: utility=%s projected=0 warnings=%d",
             ledger_entry.utility_type,
             len(bridge_warnings),
         )
@@ -243,8 +243,7 @@ async def _async_backfill_external(
     planned = _planned_statistics(ledger_entry)
     if not planned:
         LOGGER.info(
-            "SP Group external statistics skipped: utility=%s projected=%d "
-            "planned=0",
+            "SP Group external statistics skipped: utility=%s projected=%d planned=0",
             ledger_entry.utility_type,
             len(projected),
         )
@@ -253,13 +252,15 @@ async def _async_backfill_external(
     statistic_id = ledger_entry.external_statistic_id
     metadata = _metadata(statistic_id, ledger_entry.utility_type)
     async_import_statistics(
-        hass, metadata,
+        hass,
+        metadata,
         [_statistic_data(row) for row in planned],
     )
 
     last_start = max(row.start for row in planned)
     await _update_statistics_metadata(
-        ledger_store, sensor_key,
+        ledger_store,
+        sensor_key,
         imported_through=last_start,
         warnings=bridge_warnings,
     )
@@ -269,7 +270,8 @@ async def _async_backfill_external(
         "statistic_id=%s planned=%d imported=%d",
         ledger_entry.utility_type,
         statistic_id,
-        len(planned), len(planned),
+        len(planned),
+        len(planned),
     )
     return StatisticsImportResult(
         planned_count=len(planned),
@@ -277,6 +279,7 @@ async def _async_backfill_external(
         processed_count=len(planned),
         warning_count=len(bridge_warnings),
     )
+
 
 async def async_backfill_statistics(
     hass: HomeAssistant,
@@ -298,8 +301,12 @@ async def async_backfill_statistics(
     for sensor_key, ledger_entry in ledger_store.snapshot.entries.items():
         if ledger_entry.external_statistic_id is not None:
             result = await _async_backfill_external(
-                hass, ledger_store, sensor_key, ledger_entry,
-                entry_id=entry.entry_id, force=force,
+                hass,
+                ledger_store,
+                sensor_key,
+                ledger_entry,
+                entry_id=entry.entry_id,
+                force=force,
             )
             total_planned += result.planned_count
             total_importable += result.importable_count
@@ -349,9 +356,7 @@ async def async_backfill_statistics(
                 ledger_store,
                 sensor_key,
                 reference_start=(
-                    native_offset.reference.start
-                    if native_offset is not None
-                    else None
+                    native_offset.reference.start if native_offset is not None else None
                 ),
                 reference_sum_offset=(
                     native_offset.desired if native_offset is not None else None
@@ -390,13 +395,16 @@ async def async_backfill_statistics(
                 native_offset.desired,
                 native_offset.missing,
             )
-        _all_importable, _all_processed, import_warnings, last_successful_start = (
-            await _import_in_batches(
-                hass,
-                entity_id,
-                planned,
-                ledger_entry,
-            )
+        (
+            _all_importable,
+            _all_processed,
+            import_warnings,
+            last_successful_start,
+        ) = await _import_in_batches(
+            hass,
+            entity_id,
+            planned,
+            ledger_entry,
         )
         final_warnings = tuple(
             dict.fromkeys((*bridge_warnings, *anchor_warnings, *import_warnings))
@@ -418,9 +426,7 @@ async def async_backfill_statistics(
             sensor_key,
             imported_through=last_successful_start,
             reference_start=(
-                native_offset.reference.start
-                if native_offset is not None
-                else None
+                native_offset.reference.start if native_offset is not None else None
             ),
             reference_sum_offset=(
                 native_offset.desired if native_offset is not None else None
@@ -482,7 +488,9 @@ async def _import_in_batches(
     for i in range(0, len(planned), _IMPORT_BATCH_SIZE):
         batch = planned[i : i + _IMPORT_BATCH_SIZE]
         importable, processed, warnings = await _filter_conflicts(
-            hass, entity_id, batch,
+            hass,
+            entity_id,
+            batch,
         )
         all_importable.extend(importable)
         all_processed.extend(processed)
@@ -548,8 +556,15 @@ def _electricity_statistics(
     entry: SpGroupLedgerEntry,
     index: LedgerStatisticsIndex,
 ) -> tuple[tuple[ProjectedStatistic, ...], tuple[str, ...]]:
+    monthly = tuple(
+        bucket
+        for bucket in entry.accepted
+        if bucket.provenance == PROVENANCE_HISTORY_MONTHLY
+    )
     by_hour: dict[datetime, list[SpGroupAcceptedBucket]] = defaultdict(list)
     for bucket in entry.accepted:
+        if bucket.provenance == PROVENANCE_HISTORY_MONTHLY:
+            continue
         hour_start = bucket.start.astimezone(SINGAPORE_TZ).replace(
             minute=0,
             second=0,
@@ -607,7 +622,38 @@ def _electricity_statistics(
                 delta=hour_delta,
             )
         )
-    return tuple(rows), tuple(dict.fromkeys(warnings))
+    for bucket in monthly:
+        row_start = (bucket.end.astimezone(SINGAPORE_TZ) - timedelta(hours=1)).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if not _has_seed_bridge(
+            entry,
+            index,
+            row_start=bucket.start,
+            row_end=bucket.end,
+            step=None,
+        ):
+            warnings.append(f"statistics_missing_bridge:{bucket.start.isoformat()}")
+            continue
+        rows.append(
+            ProjectedStatistic(
+                start=row_start,
+                period_start=bucket.start,
+                period_end=bucket.end,
+                state=index.state_at(bucket.end),
+                delta=bucket.value,
+            )
+        )
+    starts = [row.start for row in rows]
+    if len(starts) != len(set(starts)):
+        warnings.append("statistics_duplicate_projected_start")
+        rows = []
+    return (
+        tuple(sorted(rows, key=lambda item: item.start)),
+        tuple(dict.fromkeys(warnings)),
+    )
 
 
 def _water_statistics(
@@ -661,8 +707,7 @@ async def _native_anchored_statistics(
     )
     existing = await _existing_statistics(hass, entity_id, existing_start, None)
     LOGGER.info(
-        "SP Group statistics existing rows loaded: utility=%s projected=%d "
-        "existing=%d",
+        "SP Group statistics existing rows loaded: utility=%s projected=%d existing=%d",
         entry.utility_type,
         len(projected),
         len(existing),
@@ -960,9 +1005,7 @@ def _has_seed_bridge(
             index, start=row_start, end=seed, step=step
         ):
             return False
-        if not _has_indexed_contiguous_range(
-            index, start=seed, end=row_end, step=step
-        ):
+        if not _has_indexed_contiguous_range(index, start=seed, end=row_end, step=step):
             return False
         return True
     if row_end <= seed:
@@ -991,7 +1034,10 @@ def _has_indexed_contiguous_range(
     end: datetime,
     step: timedelta | None,
 ) -> bool:
-    if step is None:
+    if step is None or any(
+        bucket.provenance == PROVENANCE_HISTORY_MONTHLY
+        for bucket in index.entry.accepted
+    ):
         return index.has_contiguous_variable_range(start=start, end=end)
     return index.has_contiguous_fixed_range(start=start, end=end, step=step)
 
@@ -1012,9 +1058,7 @@ def _has_contiguous_buckets(
         if bucket is None:
             return False
         current = (
-            current + step
-            if step is not None
-            else bucket.end.astimezone(SINGAPORE_TZ)
+            current + step if step is not None else bucket.end.astimezone(SINGAPORE_TZ)
         )
     return current == target
 
@@ -1089,7 +1133,11 @@ def _metadata(entity_id: str, utility_type: str) -> StatisticMetaData:
         "has_mean": False,
         "mean_type": StatisticMeanType.NONE,
         "has_sum": True,
-        "name": f"SP Group {'Electricity' if utility_type == UTILITY_ELECTRIC else 'Water'} consumption",
+        "name": (
+            "SP Group "
+            f"{'Electricity' if utility_type == UTILITY_ELECTRIC else 'Water'} "
+            "consumption"
+        ),
         "source": RECORDER_DOMAIN,
         "statistic_id": entity_id,
         "unit_class": "energy" if utility_type == UTILITY_ELECTRIC else "volume",

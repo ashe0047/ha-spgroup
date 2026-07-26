@@ -3593,3 +3593,407 @@ Validation: the focused invariant suite passes (`4 passed`) and `git diff
 --check` is clean. These files should be committed together as one atomic
 change so the implementation, regression test, and issue evidence cannot
 drift apart. No commit was created in this planning step.
+
+---
+
+## 2026-07-26 18:10 +0800 — Hybrid partial-AMI-month ADR implementation assessment
+
+Reviewed `docs/adr/adr-hybrid-backfill-partial-month.md` against the current
+electricity ingestion and statistics code; this is an assessment only, with no
+production implementation started.
+
+Discoveries:
+
+- Electricity has one configured source type,
+  `manual_seed_plus_ami_deltas`, and `SpGroupElectricityCoordinator` calls only
+  `get_ami_charts()` with `grouped_by="day"`. It accepts only positive
+  half-hour AMI observations.
+- `_electricity_ami_source_poll()` deliberately uses leading zero rows as
+  positional evidence but reports only positive rows. It identifies gaps only
+  *between* positive AMI rows; it does not expose a month-level partial-coverage
+  classification and cannot itself select history for the transition month.
+- `get_history_charts()` and `parse_history_electricity_chart()` already exist,
+  and the latter validates monthly kWh `elec.data[*].consumption.current`; the
+  history parser is presently non-publishable / unused by the ledger.
+- The shared ledger can store buckets of different durations, but has no source
+  provenance on accepted buckets and permits overlapping spans with distinct
+  keys. Applying a monthly history bucket alongside AMI half-hours would
+  double-count, so source arbitration must happen before
+  `async_apply_observations()`.
+- Existing coverage and Recorder tests exercise AMI zero handling, ledger
+  application, and separate water monthly projection, but not the hybrid
+  electricity month or a transition from monthly to 30-minute electricity.
+
+Provisional implementation direction (not yet locked): add a dedicated
+electricity composition adapter that fetches/parses both sources per premise,
+groups valid AMI evidence and valid history rows by Singapore calendar month,
+then emits exactly one non-overlapping set of observations per month: history
+for no/partial AMI months, AMI for full historical-overlap months, and AMI for
+the current/open month when history is absent or not closed. Treat malformed or
+ambiguous coverage as non-authoritative rather than silently replacing AMI with
+history. Preserve existing statistics projection as the consumer after the
+ledger owns the selected timeline.
+
+Required test gates: pure source-composition matrix, coordinator request and
+idempotency test, ledger no-double-count test, and Recorder-visible cumulative
+delta test across the monthly-to-half-hour boundary. Run focused suites first,
+then the integration suite/lint/HA check.
+
+## 2026-07-26 18:24 +0800 — Re-evaluation: distribute partial-month history delta
+
+The user proposed retaining actual AMI half-hours for the AMI-covered portion
+of June and evenly distributing the validated `history_month_total -
+ami_month_total` across the leading missing AMI slots so cumulative history
+reaches the observed seed without empty intervals.
+
+This exposes a material ADR/code discrepancy: current electricity statistics
+projection requires a contiguous 30-minute pair for each hourly Recorder row.
+It does not have water-like variable-duration handling for electricity.
+Therefore the ADR's assertion that the existing projection handles a monthly
+electricity bucket is not true in the current implementation; a single June
+monthly bucket would not create electricity long-term-statistics rows.
+
+Provisional assessment: gap-fill is technically the lower-complexity way to
+retain real AMI resolution after installation *and* preserve the current
+electricity statistics invariant, but it must be explicitly labeled as
+synthetic allocation rather than observed usage. Do not hard-code a two-day or
+124-slot assumption: derive the eligible leading slots from validated AMI
+timestamps. The ADR states both a two-day gap and 124 zero buckets, which are
+inconsistent for ordinary 30-minute calendar slots (two days has 96 slots).
+The original source response / redacted fixture must resolve the actual time
+range before an implementation decision is locked.
+
+If adopted, require all of: an ACTUAL closed history row; a positive,
+non-negative difference within an agreed reconciliation tolerance; a strictly
+leading contiguous missing interval; and a complete contiguous AMI suffix for
+the month. Allocate `difference / missing_slot_count` with a deterministic
+Decimal remainder policy that makes allocated sum exactly equal the difference.
+If any guard fails, do not manufacture intervals; report unresolved coverage
+and use the explicitly selected fallback/recovery path.
+
+## 2026-07-26 18:31 +0800 — Live validation of June 2026 AMI gap
+
+Ran read-only live Jarvis requests using the retained cached developer session;
+no raw payloads, tokens, premise identifiers, or account identifiers were
+recorded.
+
+- One accessible electricity AMI response contained all 1,440 expected June
+  half-hour timestamps: 1,316 positive and 124 zero-valued rows, with no
+  missing timestamp rows.
+- Positive AMI total was `588.8723 kWh`. The first positive interval was
+  `2026-06-03T14:00:00+08:00`, and the final one was
+  `2026-06-30T23:30:00+08:00`.
+- The zero prefix is therefore exactly 124 half-hour slots / 62 hours, running
+  from `2026-06-01T00:00:00+08:00` through the interval ending
+  `2026-06-03T14:00:00+08:00`. It is not a two-day / 96-slot gap. The ADR's
+  count is correct but its description of the duration and June 3 start is
+  insufficiently precise.
+- The currently live history-chart response for that same accessible candidate
+  contains a June row whose period is timestamp-formatted rather than `YYYY-MM`
+  and whose `Actual kWh` current value is `0`. It does not reproduce the ADR's
+  historical `685.07 kWh` value. A second numeric candidate rejected the
+  history request. Consequently a live, source-to-source validation of the
+  stated `96.20 kWh` delta is not possible from the current API responses.
+
+Decision impact: the AMI prefix geometry is now proven, but synthetic
+allocation must remain blocked until an authoritative archived/redacted June
+history response or a provider-confirmed history total is obtained. If the ADR
+total is later corroborated, use the unrounded calculation
+`(685.07 - 588.8723) / 124 = 96.1977 / 124` with deterministic remainder
+allocation, not the ADR's rounded `0.776` value per bucket.
+
+## 2026-07-26 18:41 +0800 — Correction: live June history total validated
+
+Corrected the initial live-history assessment. The request path was correct
+(`GET /jarvis/v4/charts/{jarvis_premise_id}`) and has no date query parameters,
+but the first aggregation read `consumption.current` only and used an
+insufficient numeric-ID premise selection heuristic.
+
+Re-ran the request using the direct `premises[*].id` mapping from Jarvis
+`/me`. The matching June row is timestamp-formatted
+`2026-06-01T00:00:00+08:00`, status `Actual`, unit `kWh`, with:
+
+- `consumption.current = 0`
+- `consumption.previous = 685.07`
+
+This validates the ADR's monthly total and the live gap:
+`685.07 - 588.8723 = 96.1977 kWh`.
+
+The AMI result remains validated: 1,440 June timestamps, 1,316 positive rows,
+124 leading zero rows, no missing slots, and first positive bucket at
+`2026-06-03T14:00:00+08:00`.
+
+Critical implementation discovery: `parse_history_electricity_chart()`
+currently reads `consumption.current` only and normalizes the row period only
+as an opaque key. It would treat this real June row as `0`, so it cannot be
+used as the hybrid-backfill adapter unchanged. Before implementation, establish
+and document the provider semantics of `current` versus `previous` for this
+specific response shape; do not globally substitute one field for the other
+based only on one month. The composition adapter should select the
+provider-validated historical total explicitly, with a fixture covering this
+actual `current=0` / `previous=685.07` case.
+
+## 2026-07-26 18:55 +0800 — Recommended revised hybrid-backfill direction
+
+Recommended replacing the ADR's whole-month-history decision with a guarded
+hybrid gap-fill policy for a validated partial-AMI transition month.
+
+For the proven June 2026 case, compose the ledger timeline before persistence:
+
+1. Fetch `GET /jarvis/v4/charts/{jarvis_premise_id}` (no date parameters) and
+   the June AMI chart for the same direct Jarvis premise mapping.
+2. Normalize the timestamp-formatted history period and select the
+   provider-validated historical total (`previous=685.07` in this live shape),
+   not the generic parser's current-only value.
+3. Verify an `Actual` closed history row, all expected AMI timestamps, a
+   strictly leading contiguous zero prefix, a complete positive suffix, and a
+   non-negative reconciliation delta.
+4. Retain the 1,316 observed positive AMI buckets; allocate the exact
+   `96.1977 kWh` delta over the 124 leading zero slots; emit 1,440 contiguous
+   30-minute electricity buckets whose monthly sum is exactly `685.07 kWh`.
+5. Give allocated buckets durable provenance as history-derived/synthetic and
+   persist the complete selected timeline only once. Do not add a monthly
+   history bucket on top of AMI buckets.
+
+Use a deterministic fixed-precision remainder distribution rather than a
+single rounded value. For example at 10 decimal places, use 92 slots of
+`0.7757879032` and 32 slots of `0.7757879033`, distributed deterministically
+over the prefix; their sum is exactly `96.1977`.
+
+Guard failure behavior is explicit: do not synthesize when the history total,
+field semantics, AMI completeness, prefix shape, or reconciliation tolerance
+is not proven. Preserve the raw coverage evidence, log/raise a repairable
+issue, and leave the month pending for retry/review.
+
+Implementation must be a new source-composition boundary before the ledger,
+with source provenance and strategy/version migration for any existing AMI-only
+ledger rows. The existing electricity statistics projector can remain
+30-minute-only once the composed timeline is contiguous.
+
+## 2026-07-26 19:05 +0800 — ADR realignment assessment
+
+The locked but unimplemented hybrid partial-month ADR requires material
+realignment before implementation; it should not be treated as a minor
+erratum.
+
+- **Decision reversal**: replace "use one history monthly bucket and discard
+  AMI" with the guarded hybrid composition: retain observed AMI and allocate
+  the validated historical remainder across the leading zero prefix.
+- **Corrected evidence**: June has 124 prefix slots / 62 hours through
+  `2026-06-03T14:00+08:00`, not a two-day gap. Use precise live totals
+  `588.8723`, `685.07`, and `96.1977 kWh`.
+- **Corrected source semantics**: the relevant live history total is in
+  `consumption.previous`, while current integration parsing reads `current`.
+  The ADR must make the response-shape rule, validation, and fallback explicit.
+- **Corrected architecture consequence**: current electricity Recorder
+  projection is fixed 30-minute/hourly and does not support the ADR's proposed
+  monthly June electricity bucket. Contiguous half-hour composition is a
+  functional requirement, not merely a granularity preference.
+- **Alternative reclassification**: the former pro-rata option becomes the
+  recommended option, subject to provenance, exact-Decimal remainder handling,
+  reconciliation guards, and a repairable no-synthesis fallback.
+- **New operational requirements**: pre-ledger arbitration, source provenance,
+  migration/rebuild behavior for previously persisted partial AMI rows, and
+  an explicit coverage/test matrix.
+
+Recommended documentation action: revise this same unimplemented ADR in place
+while retaining an amendment/history section that names the superseded decision
+and live evidence. Change its status from Locked to Proposed Revision until
+the field-selection semantics and migration plan are reviewed, then relock it.
+Creating a separate ADR would make the still-unimplemented original decision
+too easy to follow accidentally.
+
+## 2026-07-26 19:14 +0800 — Hybrid partial-month ADR revised and relocked
+
+At the user's direction, revised and relocked
+`docs/adr/adr-hybrid-backfill-partial-month.md`.
+
+The ADR now locks the month-level hybrid allocation approach: retain the
+observed AMI suffix, evenly allocate the validated difference between the
+historical monthly total and AMI total over the contiguous leading zero
+half-hour prefix, and persist one complete non-overlapping 30-minute timeline.
+
+The stated rationale is no data gap and correct historical alignment leading
+up to the observed seed value. The ADR explicitly records the accepted trade-
+off: allocated values are an even time projection of aggregate consumption and
+misrepresent the real pre-AMI time pattern. It also locks provenance,
+deterministic Decimal remainder distribution, guard-failure behavior, and
+migration/testing consequences.
+
+## 2026-07-26 19:40 +0800 — Hybrid electricity backfill implementation
+
+Implemented the revised partial-AMI-month ADR in the electricity source path.
+
+- Added a backfill-only history-month normalizer. It preserves generic chart
+  parsing semantics but selects `consumption.previous` for the validated
+  `Actual/current=0/previous>0` live response shape.
+- Added month-level source composition: history-only months become one monthly
+  bucket; complete leading-zero partial AMI months preserve observed AMI and
+  fill the prefix with exact deterministic Decimal allocation.
+- Added accepted-bucket provenance (`ami_observed`, `history_allocated`, and
+  `history_monthly`) plus non-overlapping-span validation in the ledger.
+- Electricity now lazily queries history only when closed AMI evidence needs
+  composition. Unresolved months retain the source cursor for retry.
+- Electricity statistics now project provenance-marked monthly history buckets
+  as variable-duration end-of-period rows while retaining half-hour/hourly AMI
+  projection.
+- Added a hybrid strategy marker. Existing non-empty legacy electricity
+  ledgers are blocked for explicit rebuild rather than silently mixed with the
+  new strategy.
+
+Validation completed for the changed surface: focused Ruff passed, `104` focused
+tests passed, `git diff --check` passed, and `mise run ha:check` passed.
+
+Repository-wide `mise run python:test` remains blocked during collection by the
+pre-existing missing `_classify_external_rows` export expected by
+`test_external_statistics.py`. Repository-wide `mise run python:lint` remains
+blocked by pre-existing unrelated Ruff findings in `config_flow.py`,
+`test_external_statistics.py`, and other files; the changed files pass focused
+Ruff checks.
+
+After adding the mixed-cadence Recorder test, the full changed-surface result
+is `104 passed in 2.16s`. Focused mypy issues introduced by the hybrid path
+were resolved; the remaining full-package mypy failures are pre-existing in
+`external_statistics.py`, `statistics_backfill.py`, and `config_flow.py`.
+
+## 2026-07-26 19:31 +0800 — Dev-instance monthly electricity gap investigation
+
+Read-only inspection of the running dev instance confirms that the apparent
+one-month gaps originate in source composition, not Recorder import.
+
+- Recorder has electricity monthly rows only for September and November 2025,
+  then January, March, and May 2026; no monthly rows exist for the intervening
+  months. The source-backfill log reports all 1,338 planned electricity rows
+  were imported without warnings, so the statistics projector did not drop
+  already-accepted monthly buckets.
+- The persisted electricity ledger has exactly five `history_monthly` buckets
+  for those same months. August, October, December, February, and April are
+  persisted as `electricity_hybrid_month_unresolved`; the missing rows are
+  therefore deliberately absent before statistics projection.
+- The current composer requires a full expected AMI half-hour grid before it
+  will emit a history-only monthly bucket for a closed month with no positive
+  AMI values. Real AMI coverage for these historical months is not satisfying
+  that guard. This conflicts with the locked requirement that a history-only
+  month should remain a monthly electricity bucket.
+- The diagnostic session had expired before a read-only live re-query could
+  safely confirm each raw AMI month shape. No credentials or runtime state were
+modified during investigation.
+
+## 2026-07-26 19:33 +0800 — ADR-to-implementation gate evaluation
+
+The locked ADR's strict AMI timestamp/zero-prefix guard is explicitly scoped
+to a *validated partial overlap*: a month that has observed AMI suffix data and
+needs synthetic prefix allocation. That behavior is implemented and the June
+ledger contains 124 allocated plus 1,316 observed half-hour buckets.
+
+The code also applies an additional `is_full` AMI-grid condition to a
+history-only month with no positive AMI slots. It requires every half-hour to
+be present and zero before emitting `history_monthly`; otherwise it records the
+month unresolved. That condition is not required by the ADR's partial-overlap
+rule and conflicts with the separately locked history-only policy. It explains
+the persisted alternating monthly omissions: the skipped months are unresolved
+before statistics projection.
+
+The ADR itself does not contain an exhaustive source-selection table for
+history-only versus full-AMI months; it should be clarified on the next
+documentation change. The implementation should distinguish no usable AMI
+coverage (use validated history monthly bucket) from an actual partial AMI
+overlap (apply the strict full-grid/leading-prefix guard and synthesize only
+that case).
+
+## 2026-07-26 19:35 +0800 — Explicit monthly source-precedence rule
+
+The user locked the exhaustive month-selection rule in the ADR: AMI is
+authoritative whenever it has usable coverage. Full AMI is used alone even
+when history is present; no usable AMI coverage plus valid history becomes one
+history-monthly bucket; partial AMI retains observed AMI and receives only the
+history-minus-AMI remainder over its missing prefix. History is never layered
+onto full AMI. The ADR now explicitly treats absent or zero/placeholder-only
+AMI rows as no usable AMI coverage and does not require a complete all-zero AMI
+grid before choosing history-only.
+
+## 2026-07-26 19:55 +0800 — Source precedence implementation
+
+Implemented the explicit monthly precedence contract.
+
+- Added pure AMI month classification for full, no-coverage, valid partial,
+  and invalid partial shapes. Complete all-zero coverage remains AMI-owned;
+  absent/sparse zero placeholders can select history-only.
+- Composition now iterates the union of AMI and validated history months,
+  emitting history-only monthly buckets for months absent from AMI and keeping
+  full AMI authoritative when history is present.
+- Added composition metadata for unavailable history months and malformed
+  history payloads; only malformed/retryable cases create unresolved ranges.
+- Backfill polling now requests history for closed historical ranges, while
+  normal polling requests it only for no-coverage, partial, or invalid closed
+  AMI evidence.
+- Added classifier, union-composition, full-AMI precedence, absent-AMI,
+  invalid-partial, and coordinator fetch-decision tests.
+
+Validation: 109 focused tests passed and changed-source Ruff checks passed.
+Focused mypy still reports only the existing `valid_entity_id` export issue in
+`external_statistics.py` and the existing optional statistic-id issue in
+`statistics_backfill.py`.
+
+The classifier was additionally tightened so a complete AMI calendar with
+legitimate internal zero-valued intervals remains `full_ami`; only a leading
+zero prefix followed by a zero/incomplete suffix is invalid partial evidence.
+The focused suite remains at 109 passing tests, HA compile checks pass, and
+`git diff --check` passes. The repository-wide test command remains blocked by
+the pre-existing missing `_classify_external_rows` test import.
+
+## 2026-07-26 20:05 +0800 — Gap and no-data semantics ADR
+
+Created `docs/adr/adr-electricity-gap-and-no-data-semantics.md` to lock the
+clarifications made after the source-precedence implementation review:
+
+- partial AMI without History is accepted AMI-only;
+- non-terminal leading/middle/trailing gaps become explicit zero buckets;
+- terminal trailing gaps remain a distinct retryable provider-lag state whose
+  cursor resumes from the last accepted end;
+- no AMI plus no History is known-unavailable for the leading window month and
+  explicit `no_source_gap_zero` coverage for later months;
+- explicit provider zeros and inferred zeros have equal statistical effect but
+  separate provenance;
+- source failures are never converted into no-data zeros.
+
+## 2026-07-26 20:20 +0800 — Re-evaluation after locked gap semantics
+
+Rechecked the live implementation against the locked resulting-state rules.
+The intended post-change state has only terminal trailing electricity provider
+lag represented as retryable unresolved coverage. The current code still has
+three pre-change paths that must be removed or narrowed: `_fixed_missing_ranges`
+creates `missing_internal_bucket` unresolved ranges between positive AMI rows;
+the hybrid composer creates `electricity_hybrid_month_unresolved` for invalid
+partial AMI, missing History, malformed History, and negative remainders; and
+the persisted ledger can retain earlier unresolved ranges and let
+`source_poll_cursor_start()` choose their minimum. These are not terminal
+trailing gaps and conflict with the locked decision. API/transport failures
+raise `UpdateFailed` and do not create unresolved ranges. Water's
+`missing_closed_month` path is separate and remains valid unless the decision
+is explicitly broadened to water. The implementation work therefore needs to
+classify the polling-window leading/terminal month, persist explicit zero or
+known-unavailable coverage, and reserve unresolved state solely for terminal
+trailing electricity lag.
+
+## 2026-07-26 20:35 +0800 — ADR completion audit
+
+Updated `docs/adr/adr-electricity-gap-and-no-data-semantics.md` with the
+remaining cursor invariant: clean electricity ledgers must not contain
+blocking unresolved ranges; only terminal trailing provider lag is unresolved
+and it must not move the cursor backwards. Added explicit rebuild requirements
+for legacy internal/hybrid unresolved ranges and a coverage-classification
+contract distinguishing complete, absent, partial, and invalid AMI evidence.
+
+Grounding against the current code shows the ADR is decision-complete but not
+yet implementation-complete: the current composer still emits
+`electricity_hybrid_month_unresolved`, the legacy electricity parser still
+creates `missing_internal_bucket`, the ledger cursor still uses a generic
+minimum unresolved start, and provenance/known-unavailable/terminal-lag
+storage is not fully wired. These are implementation gaps, not unresolved
+architecture decisions, provided the new ADR contract is followed.
+
+The audit also made negative History-minus-AMI remainders explicit as
+data-integrity poll failures (no synthetic allocation and no ordinary
+unresolved range), and clarified that inferred zero buckets are clipped to
+the requested polling window.
