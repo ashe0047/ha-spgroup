@@ -3976,6 +3976,31 @@ classify the polling-window leading/terminal month, persist explicit zero or
 known-unavailable coverage, and reserve unresolved state solely for terminal
 trailing electricity lag.
 
+## 2026-07-26 21:00 +0800 — Implementation start from skeptical review
+
+Implementation begins from rollback commit `b6597b9`. The revised scope keeps
+water's blocking unresolved cursor semantics while making electricity terminal
+provider lag non-blocking. It adds known-unavailable leading coverage,
+explicit zero provenance, strict source normalization, per-sensor failure
+atomicity, and a hard rebuild gate for legacy electricity ledgers. All changes
+will be verified subsystem-by-subsystem before the full checks.
+
+## 2026-07-26 21:30 +0800 — Electricity gap semantics implementation status
+
+Implemented the ADR contract across ledger, electricity normalization/composition,
+coordinator polling, diagnostics, and statistics safeguards. Electricity now
+persists explicit observed/inferred/no-source zero provenance, leading
+known-unavailable ranges, and coalesced terminal provider-lag ranges; legacy
+electricity unresolved reasons require rebuild. Water retains its existing
+blocking unresolved cursor semantics.
+
+Verification: 121 focused SP Group electricity/coordinator/ledger/diagnostics/
+statistics/Recorder tests pass; `git diff --check`, changed-file Ruff, and
+`mise run ha:check` pass. The repository-wide test gate remains blocked by the
+pre-existing missing `_classify_external_rows` import in
+`tests/components/sp_group/test_external_statistics.py`; full lint also retains
+pre-existing config-flow/external-statistics findings.
+
 ## 2026-07-26 20:35 +0800 — ADR completion audit
 
 Updated `docs/adr/adr-electricity-gap-and-no-data-semantics.md` with the
@@ -3997,3 +4022,150 @@ The audit also made negative History-minus-AMI remainders explicit as
 data-integrity poll failures (no synthetic allocation and no ordinary
 unresolved range), and clarified that inferred zero buckets are clipped to
 the requested polling window.
+## 2026-07-26 22:00 +0800 — Simple pre-existing verification fixes
+
+- Fixed bounded issues outside the ADR implementation: config-flow seed-default scoping and `hass=None` handling, datetime-selector typing, external-statistic ID guarding, test dead-code/undefined-name issues, and mechanical Ruff line-length violations.
+- Focused SP Group tests now pass (`141 passed, 11 skipped`); changed-source mypy and repository Ruff checks pass.
+- Intentionally left `_classify_external_rows` untouched as the non-simple issue. The external-statistics test module (and therefore the full test suite) remains blocked at collection until that helper is designed and implemented.
+## 2026-07-26 22:20 +0800 — Test-surface audit of hybrid electricity implementation
+
+- Audited the implemented ADR paths against the required verification matrix. Focused tests pass, but coverage is concentrated in pure electricity composition and helper tests; the coordinator's History composition path (`coordinator.py` lines 514-589) has no direct integration coverage.
+- Coverage run for electricity/coordinator/ledger/statistics backfill reported 80% overall; uncovered coordinator composition, history-fetch orchestration, and several ledger cursor/error branches are material gaps rather than cosmetic coverage misses.
+- Main test gaps recorded: negative History remainder, deterministic allocation distribution/idempotency, strict History malformed/unsupported/duplicate cases, terminal leading/middle gap combinations, no-source non-leading exact zero timeline/cursor advancement, direct premise/history call caching, normal-poll retry, per-sensor failure atomicity, and mixed-cadence multi-month Recorder transitions.
+- External-statistics tests remain uncollectable because `_classify_external_rows` is intentionally deferred; this prevents full-suite evidence for the provider-owned statistics path.
+## 2026-07-26 22:45 +0800 — Hybrid test-completion implementation
+
+- Added strict History fallback/error cases, negative-remainder protection, deterministic allocation, terminal-gap, no-source, and idempotent composer tests.
+- Added coordinator tests for full-AMI History suppression and premise-scoped partial-month History caching. Corrected the coordinator's unconditional historical-backfill History fetch so full AMI remains authoritative.
+- Added electricity cursor tests for leading known-unavailable coverage and disjoint accepted spans; the cursor now rejects unproven disjoint coverage instead of advancing by blind maximum.
+- Added consecutive monthly and mixed monthly/half-hour projection tests plus a public hybrid statistics import test.
+- Verification passed for the focused hybrid suite (`119 passed`), Ruff, targeted mypy, diff check, and HA compile check. The external-statistics collection blocker remains intentionally out of scope.
+## 2026-07-26 22:55 +0800 — Final focused verification update
+
+- Added coordinator malformed-History and duplicate-AMI failure tests.
+- Final in-scope focused suite passes (`162 passed, 11 skipped`), with Ruff, targeted mypy, `git diff --check`, and `mise run ha:check` passing.
+- The earlier `119 passed` count covered the core hybrid subset before the additional coordinator failure tests; no external-statistics helper was added.
+## 2026-07-26 23:10 +0800 — ADR-to-test logic audit
+
+- Cross-checked the implemented tests against `adr-electricity-gap-and-no-data-semantics.md`.
+- Source precedence, partial allocation, no-source zero provenance, terminal gap classification, and basic cursor behavior are directly asserted.
+- Remaining verification gaps are mostly end-to-end: API/transient failure must prove cursor unchanged, no-source leading behavior must be asserted after ledger persistence, terminal retry must be exercised through normal polling, and all-zero sparse behavior should be explicitly scoped to historical backfill versus open-month polling.
+- The ADR still says `implementation pending`; this is documentation drift now that the implementation and tests are present.
+## 2026-07-26 23:35 +0800 — ADR test-closure implementation complete
+
+- Added sparse zero-only precedence, clipped polling-window, terminal-lag resolution, known-unavailable persistence/reload, and provenance-equivalent zero projection tests.
+- Updated the electricity ADR status to `Accepted and implemented — test closure in progress`.
+- In-scope verification passes: `167 passed, 11 skipped`, Ruff, targeted mypy, `git diff --check`, and `mise run ha:check`.
+- The external-statistics `_classify_external_rows` collection failure remains intentionally out of scope and is still the only known full-suite blocker.
+## 2026-07-27 00:15 +0800 — Live dev-instance backfill investigation
+
+- The running instance completed electricity backfill successfully: log reports `observation_count=27455`, `accepted_delta=27455`, and external statistics imported `13728` rows.
+- Persisted electricity ledger contains 124 `history_allocated` June buckets totaling `96.1977 kWh`, plus 1,316 AMI buckets totaling `588.8723 kWh`; June total is exactly `685.07 kWh`.
+- No `history_monthly` bucket exists because the provider supplied AMI coverage for every month in the window; June is the partial overlap case, so History is allocated into 30-minute buckets per ADR rather than stored as a monthly bucket.
+- Recorder June statistics contain 720 hourly rows and the final cumulative sum is `685.07`. The main observability gap is that runtime logs do not explicitly log History endpoint fetch/composition decisions.
+## 2026-07-27 00:30 +0800 — Zero-only AMI semantic contradiction identified
+
+- Live ledger shows complete zero-only AMI grids from 2025-01 through 2026-05 (each month persisted entirely as `ami_observed_zero`), followed by June positive AMI plus 124 History allocations.
+- The current ADR explicitly classifies a complete all-zero grid as `full_ami`, so the implementation is internally consistent with the ADR as written.
+- If the provider's pre-activation zero rows are known placeholders/no-available-data, then the current behavior contradicts the intended semantics: those months should classify as `no_ami` and allow valid History monthly buckets or no-source handling.
+- The ADR must be amended with an explicit provider-zero interpretation rule before changing implementation; complete all-zero actual-consumption months and pre-activation placeholder-zero months cannot be distinguished from the AMI payload alone without an additional provider signal or request-level rule.
+
+## 2026-07-27 00:45 +0800 — Clarified leading AMI-zero rule requires ADR realignment
+
+- The requested rule is narrower and more explicit: during a historical backfill window, AMI zero values before the first confirmed positive AMI coverage are unavailable/no-data evidence; zero values between confirmed positive AMI buckets are valid observed zero consumption and must remain accepted for contiguous statistics.
+- This conflicts with the current electricity ADR's `full_ami` definition for a complete all-zero grid and with `adr-ami-zero-coverage-semantics.md`, which currently treats internal post-coverage zero rows as provider-unavailable rather than valid zeros.
+- The ADR needs to define the reference boundary as the first confirmed positive AMI bucket in the request's historical window, distinguish leading zero prefix from internal zero rows, and specify that a zero-only AMI response has no usable AMI coverage. The existing terminal trailing provider-lag rule must be stated separately so a trailing missing/zero suffix is not accidentally accepted as real zero consumption.
+- This is a documentation/contract change first. Implementation and tests must not be changed until the treatment of trailing zero rows and the provider signal (if any) for distinguishing a genuine all-zero consumption month from pre-AMI placeholder zeros are explicitly locked.
+
+## 2026-07-27 00:50 +0800 — Leading AMI zeros do not establish source precedence
+
+- Leading AMI zero rows classified as unavailable/no-data must not count as usable AMI coverage for monthly source precedence.
+- For a zero-only AMI month, valid History must therefore be selected as the sole monthly source; AMI must not cause History to be discarded.
+- For a month with a leading unavailable zero prefix followed by positive AMI, the month is a partial hybrid case: retain the positive AMI suffix and use valid History to calculate and allocate the missing prefix remainder. History is not discarded merely because AMI returned placeholder zeros.
+- Only AMI coverage that is genuinely usable (positive observations plus accepted internal explicit zeros, with no unresolved terminal suffix) may take full-month precedence over History.
+
+## 2026-07-27 00:55 +0800 — Precedence regrounded against current ADR text
+
+- The hybrid ADR already supports the intended distinction for zero-only/placeholder AMI: its precedence table says no usable AMI plus valid History selects one `history_monthly` bucket, and explicitly includes zero/placeholder-only AMI in AMI absence.
+- The electricity gap ADR is inconsistent with that rule because it separately defines a complete all-zero grid as `full_ami` and says every explicit provider zero is an accepted observed-zero bucket.
+- The revised precedence therefore requires narrowing the electricity ADR's `full_ami` and `ami_observed_zero` definitions, while preserving the hybrid ADR's partial-month rule: leading unavailable prefix plus positive AMI remains a partial hybrid case where History is used to calculate allocation, not discarded.
+
+## 2026-07-27 01:00 +0800 — Electricity gap ADR precedence realigned
+
+- Updated `docs/adr/adr-electricity-gap-and-no-data-semantics.md` so leading AMI zero/omitted prefixes are unavailable coverage and do not establish AMI precedence.
+- The ADR now classifies zero-only AMI as `no_ami`, selects valid History as `history_monthly` for that case, and retains History-based prefix allocation for leading-zero AMI followed by positive coverage.
+- `full_ami` now requires usable positive AMI coverage; internal explicit zeros after coverage begins remain `ami_observed_zero` and valid for contiguous statistics.
+- Partial AMI without History now persists its leading prefix as known-unavailable coverage rather than a zero-consumption bucket; middle and permitted trailing gaps retain zero-gap semantics.
+- Status was changed to indicate implementation realignment is required; no production code or tests were changed in this documentation update.
+
+## 2026-07-27 01:30 +0800 — Realigned AMI precedence implementation
+
+- Updated electricity classification so zero-only AMI is `no_ami`, complete usable positive grids with internal zeros remain `full_ami`, and leading-zero-plus-positive grids are `partial_ami`.
+- Partial leading prefixes are now represented as typed known-unavailable ranges (`30m`, `ami_leading_unavailable`) when History is absent or its exact remainder is zero; positive History remainders still allocate the prefix.
+- Zero-only closed AMI now requests History and produces a monthly History bucket when valid. Existing normal AMI polling reports zero-only coverage as lagging until the coordinator composes History.
+- Added the v2 electricity strategy marker and contiguous cursor walking across accepted and known-unavailable spans; persisted state with prior decisions remains rebuild-gated.
+- Focused electricity/coordinator/ledger tests pass (`116 passed` before the added regression cases, then `90 passed` across the pure/coordinator subset); lint and mypy pass.
+
+## 2026-07-27 01:45 +0800 — Realigned precedence verification complete
+
+- Added regression coverage for zero-only History selection, unavailable partial prefixes with and without History, clipped mid-month classification, typed unavailable range metadata, and normal AMI zero-only lag behavior.
+- The in-scope SP Group suite passes (`336 passed, 12 skipped`) when excluding the known external-statistics collection blocker. Ruff, mypy, `git diff --check`, and `mise run ha:check` pass.
+- The full SP Group collection still fails only because `test_external_statistics.py` imports the intentionally deferred `_classify_external_rows` helper.
+
+## 2026-07-27 02:30 +0800 — Live historical backfill integrity verification
+
+- The fresh dev instance completed the electricity backfill from `2025-01-01` through `2026-07-27 02:00 +08:00`; logs report `observation_count=18633`, `accepted_delta=18633`, no pending/unresolved ranges, and statistics import `planned=9320 imported=9320`.
+- The persisted v2 electricity ledger has 18,633 unique, non-overlapping, gap-free accepted spans from `2025-02-01` through the seed boundary. January 2025 is represented only by a leading `known_unavailable` month range, as required.
+- Provenance is internally consistent: no-source zero buckets cover months without usable sources, five History-only monthly buckets are present, June 2026 has 124 `history_allocated` plus 1,316 observed AMI buckets totaling exactly `685.07 kWh`, and July contains observed AMI data plus 12 explicit AMI zero rows at the terminal response suffix.
+- Recorder statistics contain 9,320 rows with no duplicate starts, no negative cumulative deltas, and month totals matching the ledger. The imported cumulative sum reaches `4508.5416`, equal to the accepted ledger contribution.
+- Runtime logs do not explicitly record History fetch/classification decisions; provenance proves History was used, but endpoint-level diagnostics remain limited.
+
+## 2026-07-27 02:45 +0800 — Alternating History gap root cause identified
+
+- A direct read-only call to `GET /jarvis/v4/charts/2000536445` returned 12 electricity History rows covering July 2025 through June 2026.
+- The response included valid numeric totals for alternating months marked `Estimated`: August 729.32, October 714.12, December 646.26, February 712.10, and April 637.59 kWh. The July row had empty status and zero totals.
+- `normalize_history_electricity_months()` currently skips every row whose status is not `ACTUAL`, so the Estimated months disappear before composition. The composer then correctly—but incorrectly for the intended backfill—applies the no-source later-month rule and persists explicit zero buckets.
+- This explains the ledger/Recorder pattern of History-only buckets in September, November, January, March, and May interleaved with zero months. The failure is History status filtering, not month-union iteration or Recorder projection.
+- The ADR currently says valid History/`Actual` in its hybrid precedence contract, so accepting Estimated rows requires an explicit policy decision and ADR realignment before implementation. The data is not internally correct for the user's expectation until that decision is made.
+
+## 2026-07-27 02:55 +0800 — Root cause reproduced through live normalizer
+
+- Repeated the live History request and ran the repository's exact `normalize_history_electricity_months()` against the returned payload.
+- Raw response contains 12 rows; normalization returns exactly six rows: September, November, January, March, May, and June. Every omitted month is `Estimated` (except July, whose status is empty and totals are zero).
+- The status is provider-supplied; the implementation does not calculate `Actual` versus `Estimated`. It filters with `status.upper() == "ACTUAL"` before applying the `current=0/previous>0` field-selection rule.
+- This confirms the alternating ledger gaps are caused by the status filter with high confidence, not by a mismatch between the live response and the backfill response or by Recorder projection.
+
+## 2026-07-27 03:10 +0800 — Estimated History accepted and HA convention review
+
+- Updated `docs/adr/adr-electricity-gap-and-no-data-semantics.md` to make provider statuses `Actual` and `Estimated` equally valid for backfill selection and History remainder allocation; status must be retained as source provenance/diagnostic metadata. Empty or unknown status remains invalid.
+- Grounded against Home Assistant developer documentation: supported sensor metadata covers state, unit, device class, state class, and optional `last_reset`; long-term statistics use hourly aggregate `state`/`sum` data. Home Assistant has no native actual-versus-estimated quality flag for Recorder statistics.
+- The integration should therefore keep Actual/Estimated status in its ledger/source metadata rather than encode it through `state_class`, `last_reset`, or a second native statistics type. Both statuses represent valid energy totals for the same `total_increasing` statistics stream.
+
+## 2026-07-27 03:30 +0800 — Estimated History implementation completed
+
+- `normalize_history_electricity_months()` now accepts provider statuses `ACTUAL` and `ESTIMATED`; unsupported/empty statuses remain ignored as unusable evidence.
+- History status is carried through `SpGroupHistoryMonth`, monthly/allocated observations, and persisted accepted buckets via `source_status`, with legacy deserialization defaulting to `None`.
+- Added regression tests for Estimated field selection, status persistence, and existing/estimated composition behavior.
+- Verification passes: focused SP Group suite `338 passed, 12 skipped`, Ruff, mypy, `git diff --check`, and HA compile checks.
+- Existing live ledgers are not automatically rewritten. The current dev ledger still requires an explicit rebuild and fresh backfill to replace the previously persisted no-source zero months with Estimated History totals.
+## 2026-07-27 03:45 +0800 — Development-only ledger compatibility clarified
+
+The integration is still in development, so legacy accepted electricity
+buckets are not a compatibility target. The implementation no longer carries
+the removed v1 strategy identifier or a migration path for old bucket data.
+Existing populated ledgers from before the current provenance/precedence
+contract must be discarded or explicitly rebuilt before validating a fresh
+backfill; they must not be silently reinterpreted. The ADR now documents this
+development reset boundary while retaining the fail-closed data-integrity
+guard for populated pre-contract state.
+## 2026-07-27 13:00 +0800 — Commit planning checkpoint
+
+The current worktree contains the hybrid electricity backfill implementation,
+ADR realignment, provenance/status persistence, coordinator/ledger/statistics
+changes, and their tests. It also includes small formatting/type/import fixes
+in config flow and external-statistics code required by the current HA
+runtime. The live dev backfill was independently reconciled against AMI and
+History responses before preparing the commit plan. No commit has been
+created yet; the proposed commit should preserve the complete tested change
+set as one atomic development checkpoint, with the unrelated external
+statistics collection blocker called out separately.

@@ -31,6 +31,7 @@ from custom_components.sp_group.discovery import (
     SpGroupUtilityAccount,
 )
 from custom_components.sp_group.ledger import (
+    LedgerError,
     SpGroupBucketObservation,
     SpGroupLedgerStore,
     SpGroupSourceCoverage,
@@ -328,8 +329,6 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
     assert "jarvis.get_ami_charts:day:electric" in calls
 
 
-
-
 async def test_normal_poll_recovers_pre_seed_lag(
     hass: HomeAssistant,
     tmp_path,
@@ -368,10 +367,9 @@ async def test_normal_poll_recovers_pre_seed_lag(
         coverage=SpGroupSourceCoverage(status="covered"),
     )
     # Cursor should be at the last accepted bucket end (13:30)
-    assert (
-        ledger_store.snapshot.entries[sensor_key.key].source_poll_cursor_start()
-        == datetime(2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ)
-    )
+    assert ledger_store.snapshot.entries[
+        sensor_key.key
+    ].source_poll_cursor_start() == datetime(2026, 7, 24, 13, 30, tzinfo=SINGAPORE_TZ)
 
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -456,6 +454,8 @@ async def test_normal_poll_recovers_pre_seed_lag(
     )
     # Statistics retry was triggered because accepted_delta > 0
     schedule_stats_backfill.assert_called_once()
+
+
 async def test_electricity_normal_poll_uses_ledger_cursor(
     hass: HomeAssistant,
     tmp_path,  # noqa: ANN001
@@ -550,6 +550,7 @@ async def test_electricity_normal_poll_uses_ledger_cursor(
 
     assert jarvis_client.ami_requests[0][0].isoformat() == "2026-07-10"
     assert jarvis_client.ami_requests[-1][0].isoformat() == "2026-07-14"
+
 
 def test_water_history_observations_accepts_history_chart_water_section() -> None:
     """History chart water section parses to correct bucket observations."""
@@ -739,14 +740,22 @@ def test_water_startup_catchup_skips_when_not_needed(
 
 def test_water_history_observations_empty_payload() -> None:
     """Empty or missing water sections return empty observations."""
-    assert _water_history_observations(
-        {}, backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
-        now=datetime(2026, 8, 5, tzinfo=SINGAPORE_TZ),
-    ) == ()
-    assert _water_history_observations(
-        {"water": {}}, backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
-        now=datetime(2026, 8, 5, tzinfo=SINGAPORE_TZ),
-    ) == ()
+    assert (
+        _water_history_observations(
+            {},
+            backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+            now=datetime(2026, 8, 5, tzinfo=SINGAPORE_TZ),
+        )
+        == ()
+    )
+    assert (
+        _water_history_observations(
+            {"water": {}},
+            backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+            now=datetime(2026, 8, 5, tzinfo=SINGAPORE_TZ),
+        )
+        == ()
+    )
 
 
 def test_water_history_observations_grace_period() -> None:
@@ -804,8 +813,11 @@ def test_water_history_observations_malformed_rows() -> None:
                     {"unit": "m³", "consumption": {"current": "1.0"}},
                     {"period": "2026-06", "unit": "m³", "consumption": {}},
                     {"period": "2026-07", "unit": "m³", "consumption": {"current": -1}},
-                    {"period": "2026-08", "unit": "kWh",
-                     "consumption": {"current": "5.0"}},
+                    {
+                        "period": "2026-08",
+                        "unit": "kWh",
+                        "consumption": {"current": "5.0"},
+                    },
                     "not-a-dict",
                 ]
             }
@@ -845,6 +857,205 @@ def test_electricity_history_fetch_decision_distinguishes_coverage() -> None:
         now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
         backfill=False,
     )
+    assert not _electricity_ami_needs_history(
+        full_payload,
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        backfill=True,
+    )
+
+
+async def test_electricity_async_parse_full_ami_does_not_fetch_history(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """The runtime backfill path honours full AMI precedence."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    jarvis = runtime_entry.runtime_data.jarvis_client
+    assert isinstance(jarvis, FakeJarvisClient)
+    jarvis.ami_payloads = [
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": slot.strftime("%Y%m%d%H%M%S"), "consumption": "1"}
+                        for slot in slots
+                    ]
+                }
+            ],
+        }
+    ]
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    parsed = await coordinator._async_parse_source(
+        jarvis.ami_payloads.pop(),
+        session=runtime_entry.runtime_data.session,
+        premise_id="JARVIS-PREMISE-1",
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        backfill=True,
+    )
+    assert len(parsed.observations) == len(slots)
+    assert not any(
+        call.startswith("jarvis.get_history_charts") for call in jarvis.calls
+    )
+
+
+async def test_electricity_async_parse_partial_fetches_and_caches_history(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """Partial AMI composition fetches History once for a premise."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    jarvis = runtime_entry.runtime_data.jarvis_client
+    assert isinstance(jarvis, FakeJarvisClient)
+    jarvis.chart_payload = {
+        "elec": {
+            "data": [
+                {
+                    "period": "2026-01",
+                    "status": "Actual",
+                    "unit": "kWh",
+                    "consumption": {"current": "3"},
+                }
+            ]
+        }
+    }
+    payload = {
+        "unit": "kWh",
+        "history": [{"data": [{"date": "20260101010000", "consumption": "1"}]}],
+    }
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    for _ in range(2):
+        parsed = await coordinator._async_parse_source(
+            payload,
+            session=runtime_entry.runtime_data.session,
+            premise_id="JARVIS-PREMISE-1",
+            backfill_from=month,
+            now=datetime(2026, 2, 2, 0, 0, tzinfo=SINGAPORE_TZ),
+            backfill=False,
+        )
+        assert parsed.observations
+    history_calls = [
+        call
+        for call in jarvis.calls
+        if call == "jarvis.get_history_charts:JARVIS-PREMISE-1"
+    ]
+    assert len(history_calls) == 1
+
+
+async def test_electricity_async_parse_zero_only_uses_history_monthly(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """Zero-only closed AMI coverage does not suppress History."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(48))
+    jarvis = runtime_entry.runtime_data.jarvis_client
+    assert isinstance(jarvis, FakeJarvisClient)
+    jarvis.chart_payload = {
+        "elec": {
+            "data": [
+                {
+                    "period": "2026-01",
+                    "status": "Actual",
+                    "unit": "kWh",
+                    "consumption": {"current": "12"},
+                }
+            ]
+        }
+    }
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    parsed = await coordinator._async_parse_source(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {
+                            "date": slot.strftime("%Y%m%d%H%M%S"),
+                            "consumption": "0",
+                        }
+                        for slot in slots
+                    ]
+                }
+            ],
+        },
+        session=runtime_entry.runtime_data.session,
+        premise_id="JARVIS-PREMISE-1",
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        backfill=True,
+    )
+    assert [(item.value, item.provenance) for item in parsed.observations] == [
+        (Decimal("12"), "history_monthly")
+    ]
+    assert "jarvis.get_history_charts:JARVIS-PREMISE-1" in jarvis.calls
+
+
+async def test_electricity_async_parse_rejects_malformed_history(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """Malformed History evidence fails before ledger application."""
+    jarvis = runtime_entry.runtime_data.jarvis_client
+    assert isinstance(jarvis, FakeJarvisClient)
+    jarvis.chart_payload = {
+        "elec": {
+            "data": [
+                {
+                    "period": "2026-01",
+                    "status": "Actual",
+                    "unit": "MWh",
+                    "consumption": {"current": "1"},
+                }
+            ]
+        }
+    }
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    with pytest.raises(LedgerError, match="history_invalid_period_or_unit"):
+        await coordinator._async_parse_source(
+            {
+                "unit": "kWh",
+                "history": [{"data": [{"date": "20260101010000", "consumption": "1"}]}],
+            },
+            session=runtime_entry.runtime_data.session,
+            premise_id="JARVIS-PREMISE-1",
+            backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+            now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+            backfill=False,
+        )
+
+
+async def test_electricity_async_parse_rejects_duplicate_ami_timestamp(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """Duplicate AMI timestamps are source failures, not gap evidence."""
+    jarvis = runtime_entry.runtime_data.jarvis_client
+    assert isinstance(jarvis, FakeJarvisClient)
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    payload = {
+        "unit": "kWh",
+        "history": [
+            {
+                "data": [
+                    {"date": "20260101010000", "consumption": "1"},
+                    {"date": "20260101010000", "consumption": "1"},
+                ]
+            }
+        ],
+    }
+    with pytest.raises(LedgerError, match="duplicate_electricity_ami_timestamp"):
+        await coordinator._async_parse_source(
+            payload,
+            session=runtime_entry.runtime_data.session,
+            premise_id="JARVIS-PREMISE-1",
+            backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+            now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+            backfill=False,
+        )
 
 
 async def test_water_coordinator_calls_get_history_charts(
@@ -887,8 +1098,6 @@ async def test_water_coordinator_calls_get_history_charts(
         force=True,
     )
     source_backfill.assert_not_awaited()
-
-
 
 
 async def test_coordinator_debug_logs_are_phase_summaries(
@@ -946,15 +1155,15 @@ async def test_coordinator_propagates_auth_failure(
     [
         (
             SpGroupTransportError("network timeout ACC-SECRET"),
-                "Error refreshing SP Group discovery data",
+            "Error refreshing SP Group discovery data",
         ),
         (
             SpGroupApiError("api unavailable PREM-SECRET", status=503),
-                "Error refreshing SP Group discovery data",
+            "Error refreshing SP Group discovery data",
         ),
         (
             SpGroupMobileError("mobile sdk failure JARVIS-SECRET"),
-                "Error refreshing SP Group discovery data",
+            "Error refreshing SP Group discovery data",
         ),
         (TimeoutError(), "Timed out refreshing SP Group data"),
     ],
@@ -1165,9 +1374,12 @@ async def test_coordinator_fetches_one_chart_for_multiple_water_accounts(
         data = await coordinator._async_update_data()
 
     assert data.water_candidates == ()
-    assert runtime_entry.discovery_calls.count(
-        "jarvis.get_history_charts:JARVIS-PREMISE-1"
-    ) == 0
+    assert (
+        runtime_entry.discovery_calls.count(
+            "jarvis.get_history_charts:JARVIS-PREMISE-1"
+        )
+        == 0
+    )
 
 
 async def test_coordinator_maps_history_chart_failure_to_update_failed(
@@ -1456,8 +1668,8 @@ def test_ami_rows_uses_amount_as_fallback() -> None:
     assert rows[0]["amount"] == "42.0"
 
 
-def test_electricity_source_poll_excludes_ami_zeros_and_records_internal_gap() -> None:
-    """AMI zeros are unavailable coverage, while gaps between positives retry."""
+def test_electricity_source_poll_persists_zeros_and_fills_internal_gap() -> None:
+    """Explicit and inferred zero intervals remain accepted coverage."""
     now = datetime(2026, 7, 15, 15, 0, tzinfo=SINGAPORE_TZ)
     parsed = _electricity_ami_source_poll(
         {
@@ -1478,13 +1690,12 @@ def test_electricity_source_poll_excludes_ami_zeros_and_records_internal_gap() -
     )
     assert [item.value for item in parsed.observations] == [
         Decimal("1.0"),
+        Decimal("0"),
+        Decimal("0"),
         Decimal("2.0"),
     ]
     assert parsed.coverage.status == "covered"
-    assert [item.start for item in parsed.coverage.unresolved_ranges] == [
-        datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ),
-        datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
-    ]
+    assert parsed.coverage.unresolved_ranges == ()
 
 
 def test_electricity_source_poll_with_only_zero_rows_is_lagging() -> None:
@@ -1492,15 +1703,40 @@ def test_electricity_source_poll_with_only_zero_rows_is_lagging() -> None:
     parsed = _electricity_ami_source_poll(
         {
             "unit": "kWh",
-            "history": [
-                {"data": [{"date": "20260715130000", "consumption": "0"}]}
-            ],
+            "history": [{"data": [{"date": "20260715130000", "consumption": "0"}]}],
         },
         backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
         now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
     )
     assert parsed.observations == ()
     assert parsed.coverage.status == "lagging"
+
+
+def test_electricity_source_poll_treats_complete_zero_grid_as_unavailable() -> None:
+    """A complete all-zero AMI month does not establish coverage."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(31 * 48))
+    parsed = _electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {
+                            "date": slot.strftime("%Y%m%d%H%M%S"),
+                            "consumption": "0",
+                        }
+                        for slot in slots
+                    ]
+                }
+            ],
+        },
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+    assert parsed.observations == ()
+    assert parsed.coverage.status == "lagging"
+    assert parsed.coverage.unresolved_ranges == ()
 
 
 def test_electricity_source_poll_ignores_future_and_in_progress_rows() -> None:
@@ -1525,12 +1761,8 @@ def test_electricity_source_poll_ignores_future_and_in_progress_rows() -> None:
     assert [item.start for item in parsed.observations] == [
         datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ)
     ]
-    assert parsed.coverage.start == datetime(
-        2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ
-    )
-    assert parsed.coverage.end == datetime(
-        2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ
-    )
+    assert parsed.coverage.start == datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ)
+    assert parsed.coverage.end == datetime(2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ)
 
 
 async def test_source_poll_retains_last_known_coverage_when_provider_lags(
@@ -1662,7 +1894,6 @@ def test_water_repeated_full_history_is_idempotent() -> None:
         o.value for o in second.observations
     ]
     assert first.coverage == second.coverage
-
 
 
 def test_electricity_source_poll_malformed_response_at_coordinator() -> None:

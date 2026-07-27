@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, cast
 
 import voluptuous as vol
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlowResult, OptionsFlow
@@ -152,7 +152,9 @@ DEV_AUTH_BYPASS_ENV = "SPGROUP_HA_DEV_AUTH_BYPASS"
 DEV_SESSION_FILE_ENV = "SPGROUP_HA_DEV_SESSION_FILE"
 DEFAULT_DEV_SESSION_FILE = ".runtime/mobile-session.json"
 DEV_SEED_DEFAULTS_FILE_ENV = "SPGROUP_HA_DEV_SEED_DEFAULTS_FILE"
-DEFAULT_DEV_SEED_DEFAULTS_FILE = str(Path(__file__).resolve().parents[2] / ".runtime" / "dev-seed-defaults.json")
+DEFAULT_DEV_SEED_DEFAULTS_FILE = str(
+    Path(__file__).resolve().parents[2] / ".runtime" / "dev-seed-defaults.json"
+)
 DEV_AUTH_METHOD_CACHED_SESSION = "cached_session"
 DEV_AUTH_METHOD_PASSWORD = "password_auth"
 
@@ -229,7 +231,8 @@ class _SeedDateTimeSelector(selector.DateTimeSelector):
         """Serialize selector config, including the default in the selector itself."""
         result = super().serialize()
         if self._default_value is not None:
-            result["selector"]["datetime"]["default"] = self._default_value
+            datetime_config = cast(dict[str, Any], result["selector"]["datetime"])
+            datetime_config["default"] = self._default_value
         return result
 
 
@@ -270,7 +273,9 @@ def _seed_data_schema(
 
     seed_value_field = vol.Required(CONF_SEED_VALUE)
     if CONF_SEED_VALUE in defaults:
-        seed_value_field = vol.Required(CONF_SEED_VALUE, default=defaults[CONF_SEED_VALUE])
+        seed_value_field = vol.Required(
+            CONF_SEED_VALUE, default=defaults[CONF_SEED_VALUE]
+        )
 
     seed_observed_at_field = vol.Required(CONF_SEED_OBSERVED_AT)
     if CONF_SEED_OBSERVED_AT in defaults:
@@ -280,9 +285,9 @@ def _seed_data_schema(
 
     backfill_from_field = vol.Required(CONF_BACKFILL_FROM)
     if CONF_BACKFILL_FROM in defaults:
-        backfill_from_field = vol.Required(CONF_BACKFILL_FROM, default=defaults[CONF_BACKFILL_FROM])
-
-
+        backfill_from_field = vol.Required(
+            CONF_BACKFILL_FROM, default=defaults[CONF_BACKFILL_FROM]
+        )
 
     seed_observed_default = defaults.get(CONF_SEED_OBSERVED_AT) if defaults else None
     backfill_from_default = defaults.get(CONF_BACKFILL_FROM) if defaults else None
@@ -297,8 +302,12 @@ def _seed_data_schema(
                     unit_of_measurement=_utility_unit(sensor_key.utility_type),
                 )
             ),
-            seed_observed_at_field: _SeedDateTimeSelector(default_value=seed_observed_default),
-            backfill_from_field: _SeedDateTimeSelector(default_value=backfill_from_default),
+            seed_observed_at_field: _SeedDateTimeSelector(
+                default_value=seed_observed_default
+            ),
+            backfill_from_field: _SeedDateTimeSelector(
+                default_value=backfill_from_default
+            ),
         }
     )
 
@@ -433,7 +442,14 @@ def _seed_error_field(error_key: str) -> str:
     """Return the config-flow error field for a source-config validation error."""
     if error_key in {"invalid_decimal", "seed_negative"}:
         return CONF_SEED_VALUE
-    if error_key in {"invalid_timestamp", "future_seed", "seed_too_old", "seed_not_30min_step", "seed_not_current_floor", "seed_not_first_of_month"}:
+    if error_key in {
+        "invalid_timestamp",
+        "future_seed",
+        "seed_too_old",
+        "seed_not_30min_step",
+        "seed_not_current_floor",
+        "seed_not_first_of_month",
+    }:
         return CONF_SEED_OBSERVED_AT
     if error_key in {
         "invalid_backfill",
@@ -649,9 +665,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
 
         return self._show_otp_form(errors)
 
-    async def async_step_reauth(
-        self, entry_data: dict[str, Any]
-    ) -> ConfigFlowResult:
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
         """Start reauthentication after runtime auth failure."""
         return await self.async_step_reauth_confirm()
 
@@ -991,7 +1005,9 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         if not self._selected_sensor_keys:
             return self._async_create_setup_entry()
         sensor_key = self._selected_sensor_keys[0]
-        seed_defaults = await _async_load_dev_seed_defaults(self.hass, sensor_key.utility_type)
+        seed_defaults = await _async_load_dev_seed_defaults(
+            self.hass, sensor_key.utility_type
+        )
         if user_input is None:
             _LOGGER.debug(
                 "SP Group config flow showing seed step: utility=%s remaining=%d",
@@ -1004,7 +1020,7 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
                 description_placeholders=self._seed_placeholders(sensor_key),
             )
             # Inject defaults directly into the flow result data so the frontend
-            # can pre-fill the form fields even for selectors that ignore schema defaults.
+            # can pre-fill form fields even for selectors that ignore schema defaults.
             if seed_defaults:
                 _result["data"] = dict(seed_defaults)
             return _result
@@ -1036,11 +1052,15 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         if sensor_key.utility_type == "electric":
             _now_sgt = datetime.now(SINGAPORE_TZ)
             _floor_min = 0 if _now_sgt.minute < 30 else 30
-            _floor_boundary = _now_sgt.replace(minute=_floor_min, second=0, microsecond=0)
+            _floor_boundary = _now_sgt.replace(
+                minute=_floor_min, second=0, microsecond=0
+            )
             _err_key = "seed_not_current_floor"
         else:
             _now_sgt = datetime.now(SINGAPORE_TZ)
-            _floor_boundary = _now_sgt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            _floor_boundary = _now_sgt.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
             _err_key = "seed_not_first_of_month"
         _seed_dt = config.seed_observed_at.astimezone(SINGAPORE_TZ)
         if _seed_dt != _floor_boundary:
@@ -1079,6 +1099,9 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         ):
             return await self.async_step_seed()
         sensor_key = self._pending_approximate_sensor_key
+        seed_defaults = await _async_load_dev_seed_defaults(
+            self.hass, sensor_key.utility_type
+        )
         if user_input is None:
             _LOGGER.debug(
                 "SP Group config flow showing approximate seed confirmation: "
@@ -1115,9 +1138,8 @@ class ConfigFlow(BaseConfigFlow, domain=DOMAIN):
         sensor_key: SpGroupFutureSensorKey,
     ) -> dict[str, str]:
         """Return seed form description placeholders."""
-        step = (
-            len(self._source_configs)
-            + (1 if self._pending_approximate_config is None else 0)
+        step = len(self._source_configs) + (
+            1 if self._pending_approximate_config is None else 0
         )
         total = len(self._source_configs) + len(self._selected_sensor_keys)
         return {
@@ -1268,18 +1290,15 @@ def _duration_from_poll(poll_options: SpGroupPollingOptions) -> dict[str, float]
     }
 
 
-
 def _dev_seed_defaults_file() -> Path:
     """Return the configured developer seed defaults file path."""
     return Path(
-        os.environ.get(
-            DEV_SEED_DEFAULTS_FILE_ENV, DEFAULT_DEV_SEED_DEFAULTS_FILE
-        )
+        os.environ.get(DEV_SEED_DEFAULTS_FILE_ENV, DEFAULT_DEV_SEED_DEFAULTS_FILE)
     ).expanduser()
 
 
 async def _async_load_dev_seed_defaults(
-    hass: HomeAssistant,
+    hass: HomeAssistant | None,
     utility_type: str,
 ) -> dict[str, Any]:
     """Load developer seed defaults for the given utility type.
@@ -1288,7 +1307,7 @@ async def _async_load_dev_seed_defaults(
     or the utility type has no entry -- safe for production use.
     """
     path = _dev_seed_defaults_file()
-    if not path.exists():
+    if hass is None or not path.exists():
         return {}
     try:
         data: Any = json.loads(
@@ -1309,6 +1328,7 @@ async def _async_load_dev_seed_defaults(
     if CONF_BACKFILL_FROM in entry:
         result[CONF_BACKFILL_FROM] = entry[CONF_BACKFILL_FROM]
     return result
+
 
 class OptionsFlowHandler(OptionsFlow):
     """Handle SP Group options for source configuration."""
@@ -1413,9 +1433,7 @@ class OptionsFlowHandler(OptionsFlow):
         self._selected_sensor_keys = [
             sensor_key
             for sensor_key in enabled_keys
-            if (
-                sensor_key.key not in self._source_configs
-            )
+            if (sensor_key.key not in self._source_configs)
         ]
         reseed_key = _maintenance_sensor_key(
             sensor_keys,
@@ -1459,7 +1477,9 @@ class OptionsFlowHandler(OptionsFlow):
         if not self._selected_sensor_keys:
             return self._create_options_entry()
         sensor_key = self._selected_sensor_keys[0]
-        seed_defaults = await _async_load_dev_seed_defaults(self.hass, sensor_key.utility_type)
+        seed_defaults = await _async_load_dev_seed_defaults(
+            self.hass, sensor_key.utility_type
+        )
         if user_input is None:
             _LOGGER.debug(
                 "SP Group options flow showing seed step: utility=%s remaining=%d",
@@ -1499,11 +1519,15 @@ class OptionsFlowHandler(OptionsFlow):
         if sensor_key.utility_type == "electric":
             _now_sgt = datetime.now(SINGAPORE_TZ)
             _floor_min = 0 if _now_sgt.minute < 30 else 30
-            _floor_boundary = _now_sgt.replace(minute=_floor_min, second=0, microsecond=0)
+            _floor_boundary = _now_sgt.replace(
+                minute=_floor_min, second=0, microsecond=0
+            )
             _err_key = "seed_not_current_floor"
         else:
             _now_sgt = datetime.now(SINGAPORE_TZ)
-            _floor_boundary = _now_sgt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            _floor_boundary = _now_sgt.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
             _err_key = "seed_not_first_of_month"
         _seed_dt = config.seed_observed_at.astimezone(SINGAPORE_TZ)
         if _seed_dt != _floor_boundary:
@@ -1535,6 +1559,9 @@ class OptionsFlowHandler(OptionsFlow):
         ):
             return await self.async_step_seed()
         sensor_key = self._pending_approximate_sensor_key
+        seed_defaults = await _async_load_dev_seed_defaults(
+            self.hass, sensor_key.utility_type
+        )
         if user_input is None:
             _LOGGER.debug(
                 "SP Group options flow showing approximate seed confirmation: "
@@ -1591,6 +1618,9 @@ class OptionsFlowHandler(OptionsFlow):
         if self._pending_reset_config is None or self._pending_reset_sensor_key is None:
             return await self.async_step_seed()
         sensor_key = self._pending_reset_sensor_key
+        seed_defaults = await _async_load_dev_seed_defaults(
+            self.hass, sensor_key.utility_type
+        )
         if user_input is None:
             _LOGGER.debug(
                 "SP Group options flow showing reset confirmation: utility=%s",

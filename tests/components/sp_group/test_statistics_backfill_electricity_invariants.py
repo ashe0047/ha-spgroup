@@ -81,6 +81,202 @@ def test_electricity_history_month_projects_as_end_of_period_row() -> None:
     ]
 
 
+def test_electricity_statistics_rejects_projected_start_collision() -> None:
+    """Mixed-cadence overlap fails closed instead of dropping silently."""
+    history_month = replace(
+        _accepted_bucket(
+            "2026-06-01T00:00:00+08:00",
+            "2026-07-01T00:00:00+08:00",
+            "12",
+        ),
+        provenance=PROVENANCE_HISTORY_MONTHLY,
+    )
+    entry = _ledger_entry(
+        ELECTRIC_KEY,
+        "electric",
+        "100",
+        (
+            history_month,
+            _accepted_bucket(
+                "2026-06-30T23:00:00+08:00",
+                "2026-06-30T23:30:00+08:00",
+                "1",
+            ),
+            _accepted_bucket(
+                "2026-06-30T23:30:00+08:00",
+                "2026-07-01T00:00:00+08:00",
+                "1",
+            ),
+        ),
+    )
+    rows, warnings = _projected_statistics_with_warnings(entry)
+    assert rows == ()
+    assert warnings == ("statistics_duplicate_projected_start",)
+
+
+def test_electricity_statistics_projects_consecutive_history_months() -> None:
+    """Consecutive monthly History buckets produce one row per month."""
+    entry = _ledger_entry(
+        ELECTRIC_KEY,
+        "electric",
+        "100",
+        tuple(
+            replace(
+                _accepted_bucket(start, end, value),
+                provenance=PROVENANCE_HISTORY_MONTHLY,
+            )
+            for start, end, value in (
+                ("2026-01-01T00:00:00+08:00", "2026-02-01T00:00:00+08:00", "10"),
+                ("2026-02-01T00:00:00+08:00", "2026-03-01T00:00:00+08:00", "20"),
+            )
+        ),
+    )
+    rows, warnings = _projected_statistics_with_warnings(entry)
+    assert warnings == ()
+    assert [row.delta for row in rows] == [Decimal("10"), Decimal("20")]
+    assert [row.start for row in rows] == [
+        datetime(2026, 1, 31, 23, tzinfo=SINGAPORE_TZ),
+        datetime(2026, 2, 28, 23, tzinfo=SINGAPORE_TZ),
+    ]
+
+
+def test_electricity_statistics_projects_history_partial_and_full_transition() -> None:
+    """History, allocated half-hours, and full AMI remain one cadence chain."""
+    history = replace(
+        _accepted_bucket(
+            "2026-01-01T00:00:00+08:00",
+            "2026-02-01T00:00:00+08:00",
+            "10",
+        ),
+        provenance=PROVENANCE_HISTORY_MONTHLY,
+    )
+    partial = (
+        replace(
+            _accepted_bucket(
+                "2026-02-01T00:00:00+08:00",
+                "2026-02-01T00:30:00+08:00",
+                "1",
+            ),
+            provenance="history_allocated",
+        ),
+        _accepted_bucket(
+            "2026-02-01T00:30:00+08:00",
+            "2026-02-01T01:00:00+08:00",
+            "1",
+        ),
+    )
+    full = (
+        _accepted_bucket(
+            "2026-02-01T01:00:00+08:00",
+            "2026-02-01T01:30:00+08:00",
+            "1",
+        ),
+        _accepted_bucket(
+            "2026-02-01T01:30:00+08:00",
+            "2026-02-01T02:00:00+08:00",
+            "1",
+        ),
+    )
+    entry = _ledger_entry(ELECTRIC_KEY, "electric", "100", (history, *partial, *full))
+    rows, warnings = _projected_statistics_with_warnings(entry)
+    assert warnings == ()
+    assert sum((row.delta for row in rows), Decimal("0")) == Decimal("14")
+    assert len({row.start for row in rows}) == len(rows)
+
+
+def test_electricity_zero_provenance_values_project_with_same_statistics_effect() -> (
+    None
+):
+    """Observed, AMI-gap, and no-source zeros preserve one hourly bridge."""
+    buckets = tuple(
+        replace(
+            _accepted_bucket(start, end, "0"),
+            provenance=provenance,
+        )
+        for start, end, provenance in (
+            (
+                "2026-07-01T00:00:00+08:00",
+                "2026-07-01T00:30:00+08:00",
+                "ami_observed_zero",
+            ),
+            (
+                "2026-07-01T00:30:00+08:00",
+                "2026-07-01T01:00:00+08:00",
+                "ami_gap_zero",
+            ),
+            (
+                "2026-07-01T01:00:00+08:00",
+                "2026-07-01T01:30:00+08:00",
+                "no_source_gap_zero",
+            ),
+            (
+                "2026-07-01T01:30:00+08:00",
+                "2026-07-01T02:00:00+08:00",
+                "ami_observed_zero",
+            ),
+        )
+    )
+    entry = _ledger_entry(ELECTRIC_KEY, "electric", "100", buckets)
+    rows, warnings = _projected_statistics_with_warnings(entry)
+    assert warnings == ()
+    assert len(rows) == 2
+    assert all(row.delta == 0 for row in rows)
+
+
+async def test_electricity_hybrid_projection_imports_monthly_and_half_hour_rows(
+    hass: HomeAssistant,
+) -> None:
+    """The public statistics path accepts a monthly-to-AMI transition."""
+    hass.config.components.add(RECORDER_DOMAIN)
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        SENSOR_DOMAIN,
+        DOMAIN,
+        ELECTRIC_KEY,
+        suggested_object_id="sp_group_electricity",
+    )
+    history = replace(
+        _accepted_bucket(
+            "2026-06-01T00:00:00+08:00",
+            "2026-07-01T00:00:00+08:00",
+            "12",
+        ),
+        provenance=PROVENANCE_HISTORY_MONTHLY,
+    )
+    ami = (
+        _accepted_bucket("2026-07-01T00:00:00+08:00", "2026-07-01T00:30:00+08:00", "1"),
+        _accepted_bucket("2026-07-01T00:30:00+08:00", "2026-07-01T01:00:00+08:00", "2"),
+    )
+    store = _FakeLedgerStore(
+        _ledger_entry(ELECTRIC_KEY, "electric", "100", (history, *ami))
+    )
+    imported: list[list[dict[str, Any]]] = []
+    recorder = _FakeRecorderExecutor()
+    native_reference = {
+        "start": datetime(2026, 7, 1, 1, tzinfo=SINGAPORE_TZ),
+        "state": 115.0,
+        "sum": 0.0,
+    }
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            return_value={"sensor.sp_group_electricity": [native_reference]},
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_import_statistics",
+            side_effect=lambda _hass, _meta, rows: imported.append(list(rows)),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=recorder,
+        ),
+    ):
+        result = await async_backfill_statistics(hass, _entry_with_ledger(store))
+    assert result.importable_count > 0
+    assert imported
+    assert all(row["sum"] >= 0 for row in imported[0])
+
+
 async def test_electricity_visible_synthetic_baseline_is_not_negative(
     hass: HomeAssistant,
 ) -> None:
@@ -410,11 +606,7 @@ async def test_electricity_seed_boundary_hour_generates_continuous_chain(
             "1",
         ),
     )
-    post_seed_sum = sum(
-        bucket.value
-        for bucket in accepted
-        if bucket.start >= seed
-    )
+    post_seed_sum = sum(bucket.value for bucket in accepted if bucket.start >= seed)
     store = _FakeLedgerStore(
         SpGroupLedgerEntry(
             sensor_key=ELECTRIC_KEY,

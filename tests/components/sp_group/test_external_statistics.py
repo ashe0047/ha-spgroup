@@ -86,9 +86,7 @@ def test_external_readback_visible_mismatch_is_a_conflict() -> None:
     assert result.verified_through is None
     assert result.pending_starts == ()
     assert result.conflict_starts == (planned[0].start,)
-    assert result.warnings == (
-        "statistics_conflict:2026-07-01T00:00:00+08:00",
-    )
+    assert result.warnings == ("statistics_conflict:2026-07-01T00:00:00+08:00",)
 
 
 def test_external_readback_verified_prefix_stops_at_pending_row() -> None:
@@ -679,11 +677,7 @@ def _entry(
     *,
     utility_type: str = "electric",
 ) -> SpGroupLedgerEntry:
-    seed = (
-        buckets[0].start
-        if buckets
-        else datetime(2026, 7, 1, tzinfo=SINGAPORE_TZ)
-    )
+    seed = buckets[0].start if buckets else datetime(2026, 7, 1, tzinfo=SINGAPORE_TZ)
     return SpGroupLedgerEntry(
         sensor_key="test_sensor",
         source="test",
@@ -714,18 +708,16 @@ class _Store:
         assert sensor_key == self.entry.sensor_key
         source_fingerprint = kwargs.get("source_fingerprint")
         if source_fingerprint is not None:
-            from custom_components.sp_group.statistics_backfill import (
-                _external_source_fingerprint,
-            )
             from custom_components.sp_group.ledger import _accepted_source_fingerprint
+
             if _accepted_source_fingerprint(self.entry) != source_fingerprint:
                 self.entry = replace(
                     self.entry,
-                    statistics_warnings=kwargs.get("warnings", self.entry.statistics_warnings),
+                    statistics_warnings=kwargs.get(
+                        "warnings", self.entry.statistics_warnings
+                    ),
                 )
-                self.snapshot = SpGroupLedgerSnapshot(
-                    entries={sensor_key: self.entry}
-                )
+                self.snapshot = SpGroupLedgerSnapshot(entries={sensor_key: self.entry})
                 return False
         self.entry = replace(
             self.entry,
@@ -758,7 +750,6 @@ def _entry_with_store(store: _Store) -> Any:
         entry_id="external-entry",
         runtime_data=SimpleNamespace(ledger_store=store),
     )
-    assert _external_source_fingerprint(entry) != "wrong"
 
 
 async def test_external_readback_partial_acknowledgement_retryable(
@@ -826,15 +817,31 @@ async def test_external_readback_partial_acknowledgement_retryable(
         result = await async_backfill_statistics(hass, _entry_with_store(store))
 
     assert result.warning_count == 1
-    assert store.entry.statistics_imported_through == datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ)
+    assert store.entry.statistics_imported_through == datetime(
+        2026, 8, 31, 23, tzinfo=SINGAPORE_TZ
+    )
     assert "statistics_recorder_rows_pending" in str(store.entry.statistics_warnings)
 
     recorder_rows.clear()
-    recorder_rows.extend([
-        {"start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ), "state": 2.0, "sum": 2.0},
-        {"start": datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ), "state": 3.0, "sum": 5.0},
-        {"start": datetime(2026, 9, 30, 23, tzinfo=SINGAPORE_TZ), "state": 4.0, "sum": 9.0},
-    ])
+    recorder_rows.extend(
+        [
+            {
+                "start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ),
+                "state": 2.0,
+                "sum": 2.0,
+            },
+            {
+                "start": datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ),
+                "state": 3.0,
+                "sum": 5.0,
+            },
+            {
+                "start": datetime(2026, 9, 30, 23, tzinfo=SINGAPORE_TZ),
+                "state": 4.0,
+                "sum": 9.0,
+            },
+        ]
+    )
     query_count[0] = 0
 
     with (
@@ -871,7 +878,10 @@ async def test_external_readback_partial_acknowledgement_retryable(
 async def test_external_readback_partial_ack_out_of_order(
     hass: HomeAssistant,
 ) -> None:
-    """Out-of-order Recorder rows stop verification at the first gap without conflict."""
+    """Out-of-order Recorder rows stop at the first gap without conflict.
+
+    The first gap terminates verification without creating a conflict.
+    """
     hass.config.components.add(RECORDER_DOMAIN)
     entry = _entry(
         "sp_group:test_partial_oao_water_consumption",
@@ -896,8 +906,16 @@ async def test_external_readback_partial_ack_out_of_order(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             return_value={
                 "sp_group:test_partial_oao_water_consumption": [
-                    {"start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ), "state": 2.0, "sum": 2.0},
-                    {"start": datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ), "state": 3.0, "sum": 5.0},
+                    {
+                        "start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ),
+                        "state": 2.0,
+                        "sum": 2.0,
+                    },
+                    {
+                        "start": datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ),
+                        "state": 3.0,
+                        "sum": 5.0,
+                    },
                 ]
             },
         ),
@@ -917,7 +935,7 @@ async def test_external_readback_partial_ack_out_of_order(
 async def test_external_readback_first_row_conflict_with_partial_ack(
     hass: HomeAssistant,
 ) -> None:
-    """A conflict on the first planned row prevents import even when later rows match."""
+    """A first-row conflict prevents import even when later rows match."""
     hass.config.components.add(RECORDER_DOMAIN)
     entry = _entry(
         "sp_group:test_conflict_first_water_consumption",
@@ -942,8 +960,16 @@ async def test_external_readback_first_row_conflict_with_partial_ack(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             return_value={
                 "sp_group:test_conflict_first_water_consumption": [
-                    {"start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ), "state": 9.0, "sum": 9.0},
-                    {"start": datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ), "state": 3.0, "sum": 5.0},
+                    {
+                        "start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ),
+                        "state": 9.0,
+                        "sum": 9.0,
+                    },
+                    {
+                        "start": datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ),
+                        "state": 3.0,
+                        "sum": 5.0,
+                    },
                 ]
             },
         ),
@@ -961,7 +987,7 @@ async def test_external_readback_first_row_conflict_with_partial_ack(
 async def test_external_poll_completes_during_import_metadata_update_rejected(
     hass: HomeAssistant,
 ) -> None:
-    """A poll completing during import changes fingerprint and blocks metadata advance."""
+    """A poll during import changes fingerprint and blocks metadata advance."""
     from dataclasses import replace as dc_replace
 
     hass.config.components.add(RECORDER_DOMAIN)
@@ -1030,4 +1056,3 @@ async def test_external_poll_completes_during_import_metadata_update_rejected(
     assert store.entry.statistics_imported_through is None
     assert store.entry.external_migration_status != "complete"
     assert store.entry.statistics_source_fingerprint == _fingerprint
-

@@ -53,7 +53,7 @@ whenever it has usable coverage.**
 | Full AMI coverage | Present or absent | Use AMI only; do not add or reconcile a history bucket. |
 | No usable AMI coverage | Valid `Actual` history total | Use history only as one `history_monthly` bucket. AMI absence includes no AMI rows or only zero/placeholder rows; a complete zero AMI grid is not required. |
 | Partial AMI coverage | Valid `Actual` history total | Retain AMI and backfill only its missing leading prefix from the calculated history remainder, as specified below. |
-| Partial AMI coverage | Missing or invalid history total | Fail closed and leave the month unresolved; do not fabricate buckets. |
+| Partial AMI coverage | Missing or invalid history total | Accept AMI-only and represent permitted gaps as explicit zero buckets; terminal trailing provider lag is the only unresolved state. |
 
 AMI is therefore authoritative whenever it has observed monthly coverage. The
 history endpoint is used alone only when AMI has no usable coverage for that
@@ -67,9 +67,10 @@ For a validated partial month:
    Jarvis premise mapping.
 2. Validate that the history row is closed, `Actual`, in a supported unit, and
    exposes a provider-validated full-month total.
-3. Validate that AMI has every expected 30-minute timestamp for the calendar
-   month, with a strictly leading, contiguous zero prefix and a complete,
-   positive observed suffix.
+3. Validate that AMI rows are structurally usable and place any omitted
+   intervals on the expected 30-minute grid as leading, middle, or trailing
+   gaps. Only malformed values, duplicate timestamps, unsupported units, or an
+   otherwise untrusted response are invalid source data.
 4. Compute:
 
    ```text
@@ -90,10 +91,10 @@ deterministic exact split is 92 slots of `0.7757879032` kWh and 32 slots of
 `0.7757879033` kWh, distributed deterministically through the prefix.
 
 The month is accepted only when the guards above hold and the remainder is
-non-negative. A malformed response, missing AMI slot, internal or trailing AMI
-gap, unvalidated history field, or negative remainder must not create synthetic
-buckets. Preserve coverage evidence and surface a repairable unresolved-
-backfill condition instead.
+non-negative. A malformed response, unvalidated history field, or negative
+remainder fails closed. Missing AMI slots in an otherwise usable response are
+explicit zero buckets, except for a terminal trailing provider-lag suffix.
+Only that terminal suffix is persisted as an unresolved backfill condition.
 
 ## Rationale
 

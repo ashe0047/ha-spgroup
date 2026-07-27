@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 SINGAPORE_TZ = ZoneInfo("Asia/Singapore")
 PROVENANCE_AMI_OBSERVED = "ami_observed"
+PROVENANCE_AMI_OBSERVED_ZERO = "ami_observed_zero"
+PROVENANCE_AMI_GAP_ZERO = "ami_gap_zero"
+PROVENANCE_NO_SOURCE_GAP_ZERO = "no_source_gap_zero"
 PROVENANCE_HISTORY_ALLOCATED = "history_allocated"
 PROVENANCE_HISTORY_MONTHLY = "history_monthly"
 
@@ -33,6 +36,7 @@ class SpGroupHistoryMonth:
     start: datetime
     total_kwh: Decimal
     selected_field: str
+    status: str = "ACTUAL"
 
 
 AMI_COVERAGE_FULL = "full_ami"
@@ -52,13 +56,30 @@ class SpGroupElectricityMonthClassification:
 
 
 @dataclass(frozen=True, slots=True)
+class SpGroupElectricityUnavailableRange:
+    """A typed unavailable range produced by electricity composition."""
+
+    start: datetime
+    end: datetime
+    cadence: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class SpGroupElectricityComposition:
-    """Composed electricity observations and unresolved closed months."""
+    """Composed electricity observations and coverage outcomes."""
 
     observations: tuple[SpGroupBucketObservation, ...] = ()
     unresolved_months: tuple[datetime, ...] = ()
     unavailable_months: tuple[datetime, ...] = ()
     history_invalid: bool = False
+    failure: str | None = None
+    terminal_lag_ranges: tuple[tuple[datetime, datetime], ...] = ()
+    known_unavailable_ranges: tuple[SpGroupElectricityUnavailableRange, ...] = ()
+
+
+class ElectricitySourceError(ValueError):
+    """Raised when electricity source evidence cannot be trusted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +183,7 @@ def parse_history_electricity_months(
         return ()
     months: dict[datetime, SpGroupHistoryMonth] = {}
     for row in rows:
-        if not isinstance(row, dict) or str(row.get("status", "")).upper() != "ACTUAL":
+        if not isinstance(row, dict):
             continue
         start = _month_start(row.get("period"))
         unit = _as_string(row.get("unit"))
@@ -188,7 +209,47 @@ def parse_history_electricity_months(
             total, field = previous, "previous"
         else:
             continue
-        months[start] = SpGroupHistoryMonth(start, total, field)
+        months[start] = SpGroupHistoryMonth(
+            start, total, field, str(row.get("status", "")).upper()
+        )
+    return tuple(months[start] for start in sorted(months))
+
+
+def normalize_history_electricity_months(
+    payload: dict[str, Any],
+) -> tuple[SpGroupHistoryMonth, ...]:
+    """Strictly normalize the History evidence used by backfill composition."""
+    elec = payload.get("elec")
+    rows = elec.get("data") if isinstance(elec, dict) else None
+    if not isinstance(rows, list):
+        raise ElectricitySourceError("history_malformed_response")
+    months: dict[datetime, SpGroupHistoryMonth] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ElectricitySourceError("history_malformed_row")
+        status = str(row.get("status", "")).upper()
+        if status not in {"ACTUAL", "ESTIMATED"}:
+            continue
+        start = _month_start(row.get("period"))
+        unit = _as_string(row.get("unit"))
+        consumption = row.get("consumption")
+        if start is None or _unit_warning(unit) is not None:
+            raise ElectricitySourceError("history_invalid_period_or_unit")
+        if not isinstance(consumption, dict):
+            raise ElectricitySourceError("history_invalid_consumption")
+        current, current_warning = _parse_decimal(consumption.get("current"))
+        previous, _previous_warning = _parse_decimal(consumption.get("previous"))
+        if current_warning is not None:
+            raise ElectricitySourceError("history_invalid_consumption")
+        if current == 0 and previous is not None and previous > 0:
+            total, field = previous, "previous"
+        elif current is not None and current >= 0:
+            total, field = current, "current"
+        else:
+            raise ElectricitySourceError("history_negative_or_missing_total")
+        if start in months:
+            raise ElectricitySourceError("history_duplicate_period")
+        months[start] = SpGroupHistoryMonth(start, total, field, status)
     return tuple(months[start] for start in sorted(months))
 
 
@@ -199,9 +260,10 @@ def compose_electricity_history_and_ami(
     backfill_from: datetime,
     now: datetime,
 ) -> SpGroupElectricityComposition:
-    """Compose validated history and AMI evidence by Singapore calendar month."""
+    """Compose validated History and AMI evidence by calendar month."""
     history = {
-        item.start: item for item in parse_history_electricity_months(history_payload)
+        item.start: item
+        for item in normalize_history_electricity_months(history_payload)
     }
     rows_by_month: dict[datetime, dict[datetime, Decimal]] = {}
     duplicate_months: set[datetime] = set()
@@ -214,83 +276,120 @@ def compose_electricity_history_and_ami(
             if start in rows:
                 duplicate_months.add(month)
             rows[start] = value
-    history_invalid = not _history_payload_shape_valid(history_payload)
-    ami_months = set(rows_by_month)
-    history_months = set(history)
-    months = sorted(ami_months | history_months)
-    observations: list[SpGroupBucketObservation] = []
-    unresolved: list[datetime] = []
-    unavailable: list[datetime] = []
     first_month = _month_start(backfill_from.isoformat())
+    terminal_month = _month_start(now.isoformat())
+    if first_month is None or terminal_month is None:
+        raise ElectricitySourceError("invalid_poll_window")
+    months: list[datetime] = []
+    month = first_month
+    while month <= terminal_month:
+        months.append(month)
+        month = _next_month(month)
+    observations: list[SpGroupBucketObservation] = []
+    terminal_lag_ranges: list[tuple[datetime, datetime]] = []
+    unavailable_ranges: list[SpGroupElectricityUnavailableRange] = []
     for month in months:
-        if first_month is None or month < first_month:
-            continue
         month_end = _next_month(month)
         closed = month_end <= now
+        expected = tuple(
+            slot
+            for slot in _slots(month, month_end)
+            if slot >= backfill_from and slot + _HALF_HOUR <= now
+        )
         classification = classify_electricity_ami_month(
             month,
             rows_by_month.get(month, {}),
+            window_start=max(month, backfill_from),
+            window_end=min(month_end, now),
             duplicate=month in duplicate_months,
         )
         month_history = history.get(month)
-        if not closed:
-            if classification.coverage in {
-                AMI_COVERAGE_FULL,
-                AMI_COVERAGE_PARTIAL,
-            }:
-                observations.extend(
-                    _ami_observation(start, value)
-                    for start, value in classification.rows
-                    if value > 0
-                )
-            continue
+        if classification.coverage == AMI_COVERAGE_INVALID:
+            raise ElectricitySourceError(classification.reason or "invalid_ami")
         if classification.coverage == AMI_COVERAGE_FULL:
             observations.extend(
                 _ami_observation(start, value)
                 for start, value in classification.rows
-                if value > 0
+                if start in expected
             )
             continue
         if classification.coverage == AMI_COVERAGE_NONE:
-            if month_history is not None and not history_invalid:
+            if closed and month_history is not None:
                 observations.append(_monthly_observation(month_history))
-            elif history_invalid:
-                unresolved.append(month)
-            else:
-                unavailable.append(month)
+            elif closed and month == first_month:
+                unavailable_ranges.append(
+                    SpGroupElectricityUnavailableRange(
+                        max(month, backfill_from),
+                        min(month_end, now),
+                        "month",
+                        "no_source_leading_month",
+                    )
+                )
+            elif closed:
+                observations.extend(
+                    _ami_gap_observation(slot, PROVENANCE_NO_SOURCE_GAP_ZERO)
+                    for slot in expected
+                )
             continue
         if classification.coverage == AMI_COVERAGE_PARTIAL:
-            if month_history is None or history_invalid:
-                unresolved.append(month)
-                continue
-            observed_total = sum(
-                (value for _, value in classification.rows if value > 0),
-                Decimal("0"),
-            )
-            remainder = month_history.total_kwh - observed_total
-            if remainder < 0:
-                unresolved.append(month)
-                continue
-            expected = tuple(_slots(month, month_end))
-            first_positive = next(
-                start
-                for start, value in classification.rows
-                if value > 0
-            )
+            rows = dict(classification.rows)
+            first_positive = min(start for start, value in rows.items() if value > 0)
+            last_positive = max(start for start, value in rows.items() if value > 0)
             prefix = tuple(slot for slot in expected if slot < first_positive)
-            observations.extend(_allocated_observations(prefix, remainder))
-            observations.extend(
-                _ami_observation(start, value)
-                for start, value in classification.rows
-                if value > 0
-            )
+            allocated_prefix: set[datetime] = set()
+            if closed and month_history is not None:
+                observed_total = sum(
+                    (value for _, value in classification.rows if value > 0),
+                    Decimal("0"),
+                )
+                remainder = month_history.total_kwh - observed_total
+                if remainder < 0:
+                    raise ElectricitySourceError("negative_history_remainder")
+                if remainder > 0 and not prefix:
+                    raise ElectricitySourceError("history_remainder_without_prefix")
+                if remainder > 0:
+                    observations.extend(
+                        _allocated_observations(
+                            prefix,
+                            remainder,
+                            source_status=month_history.status,
+                        )
+                    )
+                    allocated_prefix = set(prefix)
+                elif prefix:
+                    unavailable_ranges.append(
+                        SpGroupElectricityUnavailableRange(
+                            prefix[0],
+                            prefix[-1] + _HALF_HOUR,
+                            "30m",
+                            "ami_leading_unavailable",
+                        )
+                    )
+            elif prefix:
+                unavailable_ranges.append(
+                    SpGroupElectricityUnavailableRange(
+                        prefix[0],
+                        prefix[-1] + _HALF_HOUR,
+                        "30m",
+                        "ami_leading_unavailable",
+                    )
+                )
+            for slot in expected:
+                if slot in allocated_prefix or slot in prefix:
+                    continue
+                if slot in rows:
+                    observations.append(_ami_observation(slot, rows[slot]))
+                elif slot > last_positive and month == terminal_month:
+                    terminal_lag_ranges.append((slot, slot + _HALF_HOUR))
+                else:
+                    observations.append(
+                        _ami_gap_observation(slot, PROVENANCE_AMI_GAP_ZERO)
+                    )
             continue
-        unresolved.append(month)
     return SpGroupElectricityComposition(
         observations=tuple(sorted(observations, key=lambda item: item.start)),
-        unresolved_months=tuple(sorted(set(unresolved))),
-        unavailable_months=tuple(sorted(set(unavailable))),
-        history_invalid=history_invalid,
+        terminal_lag_ranges=_coalesce_ranges(terminal_lag_ranges),
+        known_unavailable_ranges=_coalesce_unavailable_ranges(unavailable_ranges),
     )
 
 
@@ -298,10 +397,17 @@ def classify_electricity_ami_month(
     month: datetime,
     rows: dict[datetime, Decimal],
     *,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
     duplicate: bool = False,
 ) -> SpGroupElectricityMonthClassification:
     """Classify AMI coverage without consulting history totals."""
-    expected = tuple(_slots(month, _next_month(month)))
+    expected = tuple(
+        slot
+        for slot in _slots(month, _next_month(month))
+        if (window_start is None or slot >= window_start)
+        and (window_end is None or slot + _HALF_HOUR <= window_end)
+    )
     ordered = tuple(sorted(rows.items()))
     if not ordered:
         return SpGroupElectricityMonthClassification(month, AMI_COVERAGE_NONE)
@@ -309,33 +415,23 @@ def classify_electricity_ami_month(
         return SpGroupElectricityMonthClassification(
             month, AMI_COVERAGE_INVALID, ordered, "duplicate_timestamp"
         )
-    expected_set = set(expected)
+    expected_set = set(_slots(month, _next_month(month)))
     actual_set = set(rows)
+    if not actual_set <= expected_set:
+        return SpGroupElectricityMonthClassification(
+            month, AMI_COVERAGE_INVALID, ordered, "out_of_month_timestamp"
+        )
     positive = [(start, value) for start, value in ordered if value > 0]
     if not positive:
-        if actual_set == expected_set:
-            return SpGroupElectricityMonthClassification(
-                month, AMI_COVERAGE_FULL, ordered
-            )
         return SpGroupElectricityMonthClassification(
             month, AMI_COVERAGE_NONE, ordered, "placeholder_rows"
         )
-    if actual_set != expected_set:
-        return SpGroupElectricityMonthClassification(
-            month, AMI_COVERAGE_INVALID, ordered, "missing_timestamp"
-        )
     first_positive = positive[0][0]
-    if first_positive == month:
+    expected_window_set = set(expected)
+    effective_start = expected[0] if expected else month
+    if actual_set == expected_window_set and first_positive == effective_start:
         return SpGroupElectricityMonthClassification(
             month, AMI_COVERAGE_FULL, ordered
-        )
-    if any(
-        value <= 0
-        for start, value in ordered
-        if start >= first_positive
-    ):
-        return SpGroupElectricityMonthClassification(
-            month, AMI_COVERAGE_INVALID, ordered, "internal_or_trailing_zero"
         )
     return SpGroupElectricityMonthClassification(
         month, AMI_COVERAGE_PARTIAL, ordered
@@ -350,6 +446,8 @@ def _history_payload_shape_valid(payload: dict[str, Any]) -> bool:
 def _allocated_observations(
     slots: tuple[datetime, ...],
     remainder: Decimal,
+    *,
+    source_status: str,
 ) -> tuple[SpGroupBucketObservation, ...]:
     from .ledger import SpGroupBucketObservation
 
@@ -368,9 +466,47 @@ def _allocated_observations(
             end=slot + _HALF_HOUR,
             value=base + (_ALLOCATION_PLACES if index < units else Decimal("0")),
             provenance=PROVENANCE_HISTORY_ALLOCATED,
+            source_status=source_status,
         )
         for index, slot in enumerate(slots)
     )
+
+
+def _coalesce_ranges(
+    ranges: list[tuple[datetime, datetime]],
+) -> tuple[tuple[datetime, datetime], ...]:
+    """Merge adjacent half-hour ranges into one diagnostic suffix."""
+    merged: list[list[datetime]] = []
+    for start, end in sorted(ranges):
+        if merged and merged[-1][1] == start:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return tuple((start, end) for start, end in merged)
+
+
+def _coalesce_unavailable_ranges(
+    ranges: list[SpGroupElectricityUnavailableRange],
+) -> tuple[SpGroupElectricityUnavailableRange, ...]:
+    """Merge adjacent unavailable ranges with the same contract."""
+    merged: list[SpGroupElectricityUnavailableRange] = []
+    for item in sorted(ranges, key=lambda value: value.start):
+        if (
+            merged
+            and merged[-1].end == item.start
+            and merged[-1].cadence == item.cadence
+            and merged[-1].reason == item.reason
+        ):
+            previous = merged[-1]
+            merged[-1] = SpGroupElectricityUnavailableRange(
+                previous.start,
+                item.end,
+                previous.cadence,
+                previous.reason,
+            )
+        else:
+            merged.append(item)
+    return tuple(merged)
 
 
 def _ami_observation(start: datetime, value: Decimal) -> SpGroupBucketObservation:
@@ -381,7 +517,27 @@ def _ami_observation(start: datetime, value: Decimal) -> SpGroupBucketObservatio
         start=start,
         end=start + _HALF_HOUR,
         value=value,
-        provenance=PROVENANCE_AMI_OBSERVED,
+        provenance=(
+            PROVENANCE_AMI_OBSERVED_ZERO
+            if value == 0
+            else PROVENANCE_AMI_OBSERVED
+        ),
+    )
+
+
+def _ami_gap_observation(
+    start: datetime,
+    provenance: str,
+) -> SpGroupBucketObservation:
+    """Create an explicit zero bucket for an inferred source gap."""
+    from .ledger import SpGroupBucketObservation
+
+    return SpGroupBucketObservation(
+        bucket_key=start.isoformat(),
+        start=start,
+        end=start + _HALF_HOUR,
+        value=Decimal("0"),
+        provenance=provenance,
     )
 
 
@@ -394,6 +550,7 @@ def _monthly_observation(month: SpGroupHistoryMonth) -> SpGroupBucketObservation
         end=_next_month(month.start),
         value=month.total_kwh,
         provenance=PROVENANCE_HISTORY_MONTHLY,
+        source_status=month.status,
     )
 
 
@@ -530,13 +687,16 @@ __all__ = [
     "AMI_COVERAGE_NONE",
     "AMI_COVERAGE_PARTIAL",
     "AMI_COVERAGE_INVALID",
+    "ElectricitySourceError",
     "SpGroupElectricityCandidate",
     "SpGroupElectricityMonthClassification",
+    "SpGroupElectricityUnavailableRange",
     "SpGroupElectricityParseResult",
     "SpGroupHistoryMonth",
     "SpGroupElectricityComposition",
     "classify_electricity_ami_month",
     "compose_electricity_history_and_ami",
+    "normalize_history_electricity_months",
     "parse_history_electricity_months",
     "parse_ami_electricity_chart",
     "parse_history_electricity_chart",

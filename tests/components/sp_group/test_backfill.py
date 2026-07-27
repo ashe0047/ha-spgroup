@@ -198,7 +198,9 @@ async def _entry_with_source_ledger(
     entry = MockConfigEntry(domain=DOMAIN, unique_id="auth0|account-1")
     entry.runtime_data = SimpleNamespace(
         ledger_store=ledger_store,
-        electricity_coordinator=SimpleNamespace(async_poll_now=AsyncMock(), require_two_sightings=True),
+        electricity_coordinator=SimpleNamespace(
+            async_poll_now=AsyncMock(), require_two_sightings=True
+        ),
         water_coordinator=SimpleNamespace(async_poll_now=AsyncMock()),
     )
     return entry, ledger_store

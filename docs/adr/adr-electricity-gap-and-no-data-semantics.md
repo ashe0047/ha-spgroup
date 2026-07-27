@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted decision — 2026-07-26; implementation pending
+Accepted — precedence realignment 2026-07-27; implementation realignment required
 
 ## Context
 
@@ -16,11 +16,14 @@ The key distinction is between:
 
 - an explicit provider zero-valued AMI bucket;
 - an AMI interval omitted by the provider and intentionally treated as zero;
+- a leading AMI zero/omitted prefix that represents unavailable coverage;
 - a month for which neither source provides data;
 - a source failure that must be retried.
 
 The first two have the same consumption consequence (`0 kWh`) but must remain
-distinguishable in persisted provenance for diagnostics and future repair.
+distinguishable in persisted provenance for diagnostics and future repair. A
+leading unavailable prefix has no consumption bucket and is represented as
+known-unavailable coverage instead.
 
 ## Decision
 
@@ -28,19 +31,27 @@ distinguishable in persisted provenance for diagnostics and future repair.
 
 For each calendar month in the polling window:
 
-1. Full AMI coverage takes precedence over History. History is ignored.
-2. No usable AMI plus valid History produces one `history_monthly` bucket.
+1. Full usable AMI coverage takes precedence over History. History is ignored.
+   Leading zero/placeholder rows do not establish usable AMI coverage.
+2. No usable AMI plus valid History produces one `history_monthly` bucket. A
+   zero-only or placeholder-only AMI month is no usable AMI. History rows with
+   provider status `Actual` or `Estimated` are both valid backfill evidence;
+   the status must be retained as provenance for diagnostics.
 3. Partial AMI plus valid History retains AMI and allocates only the calculated
    History-minus-AMI remainder across the leading gap.
 4. Partial AMI without History is accepted as AMI-only. No remainder is
-   allocated; every gap is handled as a zero-valued gap.
+   allocated; the leading unavailable prefix is persisted as known-unavailable
+   coverage, while middle and permitted trailing gaps are handled as
+   zero-valued gaps.
 5. No AMI and no History follows the no-source rule below.
 
 ### AMI gap handling
 
 AMI gaps are classified by position relative to the polling window:
 
-- **Leading gap**: the interval before the first positive AMI bucket.
+- **Leading unavailable prefix**: explicit zero rows or omitted intervals before
+  the first positive AMI bucket. These rows do not establish AMI coverage and
+  are not accepted as zero-consumption observations.
 - **Middle gap**: an interval between positive AMI buckets.
 - **Trailing gap**: the interval after the last positive AMI bucket.
 
@@ -49,26 +60,37 @@ end. The **leading month** is the calendar month containing the polling window
 start. These definitions are request-scoped and are not global calendar
 properties.
 
-For a non-terminal month, leading, middle, and trailing gaps are accepted as
+For a non-terminal month, the leading unavailable prefix is represented as
+known-unavailable coverage; middle and trailing gaps are accepted as explicit
 zero-valued gap buckets.
 
 For the terminal month:
 
-- leading and middle gaps are accepted as zero-valued gap buckets;
+- the leading unavailable prefix is represented as known-unavailable coverage;
+- middle gaps are accepted as zero-valued gap buckets;
 - a trailing gap remains a provider-lag range and is retried by normal
   polling from the last accepted bucket end.
 
-An explicit zero-valued provider row and an inferred gap treated as zero have
-the same statistical effect, but use different provenance:
+An explicit zero-valued provider row after AMI coverage begins and an inferred
+middle/trailing gap treated as zero have the same statistical effect, but use
+different provenance. Leading zero rows are unavailable and are not persisted
+as consumption buckets:
 
 | Provenance | Meaning |
 | --- | --- |
 | `ami_observed` | Positive AMI consumption observed from the provider. |
-| `ami_observed_zero` | Explicit zero-valued AMI bucket returned by the provider. |
+| `ami_observed_zero` | Explicit zero-valued AMI bucket returned after positive AMI coverage begins. |
 | `ami_gap_zero` | Missing AMI interval treated as zero within an AMI month. |
 | `no_source_gap_zero` | Missing interval treated as zero because neither source supplied data. |
 | `history_allocated` | Synthetic leading-prefix allocation from a History remainder. |
 | `history_monthly` | History-only calendar-month bucket. |
+
+History status is provider-supplied metadata, not a value inferred by the
+integration. Both `Actual` and `Estimated` rows are eligible for backfill
+selection and History remainder allocation. The selected status must be
+persisted alongside the source decision, either on the accepted bucket or in
+the associated source-coverage diagnostics. An empty, unknown, or unsupported
+status is not valid History evidence unless a later provider contract adds it.
 
 Zero-valued buckets are persisted explicitly so the source timeline, cursor,
 and Recorder projection can represent the decision durably. They contribute
@@ -78,8 +100,9 @@ zero consumption and must not be confused with observed positive AMI.
 
 When AMI has valid positive coverage for a month but no valid History total is
 available, accept the positive AMI buckets. Do not create allocated prefix
-values. Leading, middle, and permitted trailing gaps are persisted as zero
-gap buckets according to the terminal-month rule.
+values. Persist the leading unavailable prefix as known-unavailable coverage;
+middle and permitted trailing gaps are persisted as zero gap buckets according
+to the terminal-month rule.
 
 ### No AMI and no History
 
@@ -154,18 +177,20 @@ proven source coverage and allow the cursor to advance.
 The composer classifies each requested closed calendar month using the
 expected 30-minute grid and row presence:
 
-- `full_ami`: every expected slot is represented, including a complete
-  all-zero grid;
-- `no_ami`: no usable AMI rows (including sparse/placeholder-only rows);
-- `partial_ami`: usable positive AMI evidence whose missing intervals can be
-  positioned as leading, middle, or trailing gaps for the polling-window
-  rules;
+- `full_ami`: every expected slot is represented and usable positive AMI
+  coverage exists; explicit internal zero rows after coverage begins remain
+  part of the full grid;
+- `no_ami`: no usable positive AMI coverage exists, including zero-only,
+  leading-zero-only, sparse, or placeholder-only rows;
+- `partial_ami`: usable positive AMI evidence exists but a leading unavailable
+  prefix or other positional gaps prevent full usable coverage;
 - `invalid_ami`: evidence that cannot be safely placed on the grid, such as
   duplicate timestamps, malformed values, unsupported units, or an untrusted
   payload shape.
 
-An omitted slot is not automatically a provider failure. Once the response is
-otherwise valid, it is a zero gap bucket except when it is the terminal
+An omitted slot is not automatically a provider failure. A leading omitted or
+explicit-zero slot is unavailable prefix coverage. Once AMI coverage has begun,
+an omitted middle slot is a zero gap bucket except when it is the terminal
 month's trailing provider-lag interval. Duplicate timestamps, malformed
 values, unsupported units, invalid payload structure, and malformed History
 are failures and do not produce synthetic zero coverage.
@@ -175,6 +200,11 @@ are failures and do not produce synthetic zero coverage.
 Tests must prove:
 
 - partial AMI with and without History;
+- zero-only AMI with valid History selecting `history_monthly`;
+- `Actual` and `Estimated` History rows both selecting valid backfill output,
+  with status retained for diagnostics;
+- leading-zero AMI with positive suffix selecting partial precedence rather
+  than discarding History;
 - leading, middle, and trailing gaps in terminal and non-terminal months;
 - explicit provider zeros versus inferred gap zeros;
 - no AMI and no History for leading and non-leading months;
@@ -182,8 +212,9 @@ Tests must prove:
 - terminal trailing retry starts from the last accepted end;
 - no electricity gap other than terminal trailing lag creates an unresolved
   range;
-- legacy blocking electricity unresolved ranges force explicit rebuild rather
-  than changing cursor meaning in place;
+- development ledgers created before this contract are not migration targets;
+  discard/reset them and run a fresh backfill rather than reinterpreting their
+  accepted buckets or unresolved ranges;
 - known-unavailable ranges do not block the cursor;
 - zero buckets preserve contiguous Recorder projection and non-negative sums;
 - rerunning the same composition is idempotent and cannot overlap accepted

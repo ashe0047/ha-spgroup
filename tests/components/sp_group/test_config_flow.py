@@ -531,7 +531,9 @@ async def test_dev_cached_session_refresh_failure_error(
     assert client.login_calls == []
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_dev_cached_session_create_entry_excludes_dev_fields(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -588,7 +590,9 @@ async def test_dev_cached_session_duplicate_configured_aborts(
     assert result["reason"] == "already_configured"
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_password_login_creates_entry_without_secrets(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -677,7 +681,9 @@ async def test_seed_step_uses_number_and_datetime_selectors(
     assert isinstance(validators["backfill_from"], selector.DateTimeSelector)
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_seed_timestamp_without_timezone_uses_singapore_time(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -711,7 +717,9 @@ async def test_seed_timestamp_without_timezone_uses_singapore_time(
     assert source_config["seed_observed_at"] == "2026-07-15T00:00:00+08:00"
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_seed_datetime_selector_split_payload_is_normalized(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -746,7 +754,9 @@ async def test_seed_datetime_selector_split_payload_is_normalized(
     assert source_config["seed_effective_from"] == "2026-07-15T22:00:00+08:00"
 
 
-@pytest.mark.skip(reason="Seed time is now validated to 30-min boundaries; no approximate confirmation step")
+@pytest.mark.skip(
+    reason="30-minute boundary validation removed confirmation step"
+)
 async def test_approximate_seed_requires_confirmation(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -789,7 +799,9 @@ async def test_approximate_seed_requires_confirmation(
     assert source_config["seed_effective_from"] == "2026-07-15T00:30:00+08:00"
 
 
-@pytest.mark.skip(reason="Seed time is now validated to 30-min boundaries; no approximate confirmation step")
+@pytest.mark.skip(
+    reason="30-minute boundary validation removed confirmation step"
+)
 async def test_declined_approximate_seed_returns_to_seed_form(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -1139,7 +1151,9 @@ async def test_otp_duplicate_in_progress_requires_reset(
     assert mfa_client.otp_calls == [("mfa-token", "oob-email-auth", "123456")]
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_mfa_prefers_email_and_completes_otp(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -1182,7 +1196,9 @@ async def test_mfa_prefers_email_and_completes_otp(
     assert "oob-email-auth" not in repr(result["data"])
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_mfa_email_challenge_error_falls_back_to_sms(
     hass: HomeAssistant,
     patch_auth_client: Any,
@@ -1320,7 +1336,9 @@ async def test_reauth_wrong_account_aborts(
     assert entry.data[CONF_ACCOUNT_ID] == "auth0|account-1"
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_options_flow_confirms_lower_replacement() -> None:
     """Lower reseed requires explicit reset/replacement confirmation."""
     data = SpGroupCoordinatorData(
@@ -1598,7 +1616,9 @@ async def test_options_flow_maintenance_none_updates_enabled_selection() -> None
     assert result["data"][CONF_SOURCE_CONFIG] == {}
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_options_flow_enables_skipped_utility_with_seed() -> None:
     """A previously skipped discovered utility can be enabled from options."""
     data = _single_electric_discovery()
@@ -1640,7 +1660,9 @@ async def test_options_flow_enables_skipped_utility_with_seed() -> None:
     assert source_config["seed_value"] == "42.5"
 
 
-@pytest.mark.skip(reason="Seed time must match floor of current time; this test uses a fixed timestamp")
+@pytest.mark.skip(
+    reason="Fixed timestamp does not match current floor"
+)
 async def test_options_flow_seed_accepts_split_datetime_selector_payload() -> None:
     """Options seed entry accepts the HA frontend split date/time value too."""
     data = _single_electric_discovery()

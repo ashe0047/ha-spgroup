@@ -133,8 +133,10 @@ inconsistencies:
 ## Decision
 
 The 2-hour overlap is removed from `source_poll_cursor_start`. The cursor
-returns the exact boundary — proven unresolved range, `pending_start`,
-`accepted_end`, or `seed_effective_from` — without subtracting the overlap.
+returns the exact boundary without subtracting the overlap. Water continues
+to prioritize blocking unresolved ranges; electricity ignores its
+non-blocking terminal provider-lag range and continues from the last accepted
+bucket end.
 
 ### Changes required
 
@@ -142,8 +144,7 @@ returns the exact boundary — proven unresolved range, `pending_start`,
    from `source_poll_cursor_start` and the subtraction in all branches.
 
 2. **`custom_components/sp_group/coordinator.py`**: Use the exact persisted
-   cursor for electricity and water. The cursor prioritizes proven unresolved
-   ranges, pending buckets, and the latest accepted bucket end.
+   utility-specific cursor for electricity and water.
 
 ### What stays the same
 

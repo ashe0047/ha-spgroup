@@ -24,7 +24,7 @@ from .sources import SINGAPORE_TZ, UTILITY_ELECTRIC, SpGroupSourceConfig
 LOGGER = logging.getLogger(__name__)
 
 _STORE_VERSION = 1
-_STORE_MINOR_VERSION = 2
+_STORE_MINOR_VERSION = 3
 _WATER_GRACE_DAYS = 3
 STATISTICS_STRATEGY_NATIVE_ANCHORED_V1 = "native_anchored_v1"
 STATISTICS_STRATEGY_NATIVE_OFFSET_V2 = "native_offset_v2"
@@ -60,8 +60,11 @@ SOURCE_COVERAGE_STATUSES = frozenset(
     }
 )
 _MAX_CORRECTION_RECORDS = 32
-ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1 = "hybrid_electricity_v1"
+ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2 = "hybrid_electricity_v2"
 PROVENANCE_AMI_OBSERVED = "ami_observed"
+PROVENANCE_AMI_OBSERVED_ZERO = "ami_observed_zero"
+PROVENANCE_AMI_GAP_ZERO = "ami_gap_zero"
+PROVENANCE_NO_SOURCE_GAP_ZERO = "no_source_gap_zero"
 PROVENANCE_HISTORY_ALLOCATED = "history_allocated"
 PROVENANCE_HISTORY_MONTHLY = "history_monthly"
 
@@ -81,6 +84,7 @@ class SpGroupAcceptedBucket:
     first_seen_at: datetime
     accepted_at: datetime
     provenance: str = PROVENANCE_AMI_OBSERVED
+    source_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the accepted bucket."""
@@ -92,6 +96,7 @@ class SpGroupAcceptedBucket:
             "first_seen_at": self.first_seen_at.isoformat(),
             "accepted_at": self.accepted_at.isoformat(),
             "provenance": self.provenance,
+            "source_status": self.source_status,
         }
 
     @classmethod
@@ -111,6 +116,11 @@ class SpGroupAcceptedBucket:
             first_seen_at=_parse_datetime(_required_string(payload, "first_seen_at")),
             accepted_at=_parse_datetime(_required_string(payload, "accepted_at")),
             provenance=provenance,
+            source_status=(
+                payload.get("source_status")
+                if isinstance(payload.get("source_status"), str)
+                else None
+            ),
         )
 
 
@@ -188,6 +198,41 @@ class SpGroupUnresolvedRange:
 
 
 @dataclass(frozen=True, slots=True)
+class SpGroupKnownUnavailableRange:
+    """A proven range with no available provider source data."""
+
+    cadence: str
+    start: datetime
+    end: datetime
+    reason: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the known-unavailable range."""
+        return {
+            "cadence": self.cadence,
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "reason": self.reason,
+            "first_seen_at": self.first_seen_at.isoformat(),
+            "last_seen_at": self.last_seen_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> SpGroupKnownUnavailableRange:
+        """Deserialize the known-unavailable range."""
+        return cls(
+            cadence=_required_string(payload, "cadence"),
+            start=_parse_datetime(_required_string(payload, "start")),
+            end=_parse_datetime(_required_string(payload, "end")),
+            reason=_required_string(payload, "reason"),
+            first_seen_at=_parse_datetime(_required_string(payload, "first_seen_at")),
+            last_seen_at=_parse_datetime(_required_string(payload, "last_seen_at")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SpGroupCorrection:
     """A detected provider correction awaiting explicit user review."""
 
@@ -237,6 +282,9 @@ class SpGroupLedgerEntry:
     accepted: tuple[SpGroupAcceptedBucket, ...] = field(default_factory=tuple)
     pending: tuple[SpGroupPendingBucket, ...] = field(default_factory=tuple)
     unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = field(default_factory=tuple)
+    known_unavailable_ranges: tuple[SpGroupKnownUnavailableRange, ...] = field(
+        default_factory=tuple
+    )
     source_coverage_status: str = SOURCE_COVERAGE_UNKNOWN
     source_coverage_start: datetime | None = None
     source_coverage_end: datetime | None = None
@@ -285,6 +333,9 @@ class SpGroupLedgerEntry:
             "accepted": [bucket.to_dict() for bucket in self.accepted],
             "pending": [bucket.to_dict() for bucket in self.pending],
             "unresolved_ranges": [item.to_dict() for item in self.unresolved_ranges],
+            "known_unavailable_ranges": [
+                item.to_dict() for item in self.known_unavailable_ranges
+            ],
             "source_coverage_status": self.source_coverage_status,
             "source_coverage_start": (
                 self.source_coverage_start.isoformat()
@@ -376,6 +427,11 @@ class SpGroupLedgerEntry:
         unresolved_ranges = tuple(
             SpGroupUnresolvedRange.from_dict(item)
             for item in payload.get("unresolved_ranges", [])
+            if isinstance(item, dict)
+        )
+        known_unavailable_ranges = tuple(
+            SpGroupKnownUnavailableRange.from_dict(item)
+            for item in payload.get("known_unavailable_ranges", [])
             if isinstance(item, dict)
         )
         source_coverage_status = payload.get(
@@ -517,6 +573,7 @@ class SpGroupLedgerEntry:
             accepted=accepted_tuple,
             pending=pending_tuple,
             unresolved_ranges=unresolved_ranges,
+            known_unavailable_ranges=known_unavailable_ranges,
             source_coverage_status=source_coverage_status,
             source_coverage_start=source_coverage_start,
             source_coverage_end=source_coverage_end,
@@ -572,6 +629,18 @@ class SpGroupLedgerEntry:
 
     def source_poll_cursor_start(self) -> datetime:
         """Return the cursor start anchored to the last proven data boundary."""
+        if self.utility_type == UTILITY_ELECTRIC:
+            legacy_ranges = tuple(
+                item
+                for item in self.unresolved_ranges
+                if item.reason != "terminal_provider_lag"
+            )
+            if legacy_ranges:
+                raise LedgerError("electricity_rebuild_required_for_legacy_ranges")
+            pending_start = min((bucket.start for bucket in self.pending), default=None)
+            if pending_start is not None:
+                return pending_start
+            return _electricity_coverage_cursor(self)
         unresolved_start = min(
             (item.start for item in self.unresolved_ranges),
             default=None,
@@ -630,6 +699,7 @@ class SpGroupBucketObservation:
     end: datetime
     value: Decimal
     provenance: str = PROVENANCE_AMI_OBSERVED
+    source_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,6 +710,9 @@ class SpGroupSourceCoverage:
     start: datetime | None = None
     end: datetime | None = None
     unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = field(default_factory=tuple)
+    known_unavailable_ranges: tuple[SpGroupKnownUnavailableRange, ...] = field(
+        default_factory=tuple
+    )
 
     def __post_init__(self) -> None:
         """Validate coverage status at the adapter boundary."""
@@ -706,23 +779,28 @@ class SpGroupLedgerStore:
                     changed = True
                     continue
                 if current.epoch_id == config.epoch_id:
-                    if (
-                        current.utility_type == UTILITY_ELECTRIC
-                        and current.electricity_backfill_strategy
-                        != ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1
-                    ):
-                        if current.accepted:
+                    if current.utility_type == UTILITY_ELECTRIC:
+                        if current.electricity_backfill_strategy != (
+                            ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
+                        ) and (
+                            current.accepted
+                            or current.pending
+                            or current.unresolved_ranges
+                            or current.known_unavailable_ranges
+                        ):
                             warning = "hybrid_strategy_rebuild_required"
                             if warning not in current.warnings:
                                 entries[sensor_key] = _copy_entry_with_warnings(
                                     current, (*current.warnings, warning)
                                 )
                                 changed = True
-                        else:
+                        elif current.electricity_backfill_strategy != (
+                            ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
+                        ):
                             entries[sensor_key] = replace(
                                 current,
                                 electricity_backfill_strategy=(
-                                    ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1
+                                    ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
                                 ),
                             )
                             changed = True
@@ -1078,6 +1156,19 @@ def _apply_observations_to_entry(
     require_two_sightings: bool,
     coverage: SpGroupSourceCoverage | None = None,
 ) -> SpGroupLedgerEntry:
+    discovered_unresolved = coverage.unresolved_ranges if coverage is not None else ()
+    if entry.utility_type == UTILITY_ELECTRIC and any(
+        item.reason != "terminal_provider_lag"
+        for item in (*entry.unresolved_ranges, *discovered_unresolved)
+    ):
+        raise LedgerError("electricity_rebuild_required_for_legacy_ranges")
+    if (
+        entry.utility_type == UTILITY_ELECTRIC
+        and entry.electricity_backfill_strategy
+        != ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
+        and (entry.accepted or entry.pending or entry.unresolved_ranges)
+    ):
+        raise LedgerError("hybrid_strategy_rebuild_required")
     _validate_observation_spans(entry.accepted, observations)
     accepted_by_key = {bucket.bucket_key: bucket for bucket in entry.accepted}
     pending_by_key = {bucket.bucket_key: bucket for bucket in entry.pending}
@@ -1129,6 +1220,7 @@ def _apply_observations_to_entry(
                     first_seen_at=current_pending.first_seen_at,
                     accepted_at=now,
                     provenance=observation.provenance,
+                    source_status=observation.source_status,
                 )
             )
             changed = True
@@ -1164,6 +1256,7 @@ def _apply_observations_to_entry(
                     first_seen_at=now,
                     accepted_at=now,
                     provenance=observation.provenance,
+                    source_status=observation.source_status,
                 )
             )
             changed = True
@@ -1184,9 +1277,14 @@ def _apply_observations_to_entry(
     )
     unresolved_ranges = _merge_unresolved_ranges(
         entry.unresolved_ranges,
-        coverage.unresolved_ranges if coverage is not None else (),
+        discovered_unresolved,
         now=now,
         accepted=accepted,
+    )
+    known_unavailable_ranges = _merge_known_unavailable_ranges(
+        entry.known_unavailable_ranges,
+        coverage.known_unavailable_ranges if coverage is not None else (),
+        now=now,
     )
     resolved_ranges = _resolve_unresolved_ranges(unresolved_ranges, accepted)
     coverage_start = entry.source_coverage_start
@@ -1197,10 +1295,22 @@ def _apply_observations_to_entry(
     updated = replace(
         entry,
         latest_total=latest_total,
+        electricity_backfill_strategy=(
+            ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
+            if entry.utility_type == UTILITY_ELECTRIC
+            and entry.electricity_backfill_strategy
+            != ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
+            and not entry.accepted
+            and not entry.pending
+            and not entry.unresolved_ranges
+            and not entry.known_unavailable_ranges
+            else entry.electricity_backfill_strategy
+        ),
         latest_accepted_at=latest_accepted_at,
         accepted=tuple(sorted(accepted, key=lambda item: item.start)),
         pending=tuple(sorted(pending, key=lambda item: item.start)),
         unresolved_ranges=resolved_ranges,
+        known_unavailable_ranges=known_unavailable_ranges,
         source_coverage_status=(
             coverage.status if coverage is not None else entry.source_coverage_status
         ),
@@ -1281,6 +1391,30 @@ def _merge_unresolved_ranges(
     return tuple(sorted(merged.values(), key=lambda item: item.start))
 
 
+def _merge_known_unavailable_ranges(
+    existing: tuple[SpGroupKnownUnavailableRange, ...],
+    discovered: tuple[SpGroupKnownUnavailableRange, ...],
+    *,
+    now: datetime,
+) -> tuple[SpGroupKnownUnavailableRange, ...]:
+    """Merge known-unavailable coverage while preserving first-seen time."""
+    merged: dict[tuple[str, datetime, datetime], SpGroupKnownUnavailableRange] = {
+        (item.cadence, item.start, item.end): item for item in existing
+    }
+    for item in discovered:
+        key = (item.cadence, item.start, item.end)
+        previous = merged.get(key)
+        merged[key] = SpGroupKnownUnavailableRange(
+            cadence=item.cadence,
+            start=item.start,
+            end=item.end,
+            reason=item.reason,
+            first_seen_at=previous.first_seen_at if previous else now,
+            last_seen_at=now,
+        )
+    return tuple(sorted(merged.values(), key=lambda item: item.start))
+
+
 def _resolve_unresolved_ranges(
     ranges: tuple[SpGroupUnresolvedRange, ...],
     accepted: list[SpGroupAcceptedBucket],
@@ -1301,6 +1435,27 @@ def _copy_entry_with_warnings(
     warnings: tuple[str, ...],
 ) -> SpGroupLedgerEntry:
     return replace(entry, warnings=warnings)
+
+
+def _electricity_coverage_cursor(entry: SpGroupLedgerEntry) -> datetime:
+    """Return the next electricity cursor after proven coverage."""
+    accepted = tuple(
+        (bucket.start, bucket.end) for bucket in entry.accepted
+    )
+    unavailable = tuple(
+        (item.start, item.end) for item in entry.known_unavailable_ranges
+    )
+    spans = tuple(sorted((*accepted, *unavailable)))
+    if not spans:
+        return entry.seed_effective_from
+    cursor = entry.backfill_from if unavailable else spans[0][0]
+    for start, end in spans:
+        if end <= cursor:
+            continue
+        if start > cursor:
+            raise LedgerError("electricity_coverage_not_contiguous")
+        cursor = max(cursor, end)
+    return cursor
 
 
 def _entry_from_config(
@@ -1327,7 +1482,7 @@ def _entry_from_config(
         statistics_strategy_version=EXTERNAL_STATISTICS_STRATEGY,
         statistics_dirty_from=config.backfill_from,
         electricity_backfill_strategy=(
-            ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1
+            ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2
             if config.utility_type == UTILITY_ELECTRIC
             else None
         ),
@@ -1424,11 +1579,15 @@ def _optional_epoch_id(payload: dict[str, Any]) -> str:
 
 __all__ = [
     "LedgerError",
-    "ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V1",
+    "ELECTRICITY_BACKFILL_STRATEGY_HYBRID_V2",
     "PROVENANCE_AMI_OBSERVED",
+    "PROVENANCE_AMI_OBSERVED_ZERO",
+    "PROVENANCE_AMI_GAP_ZERO",
+    "PROVENANCE_NO_SOURCE_GAP_ZERO",
     "PROVENANCE_HISTORY_ALLOCATED",
     "PROVENANCE_HISTORY_MONTHLY",
     "SpGroupBucketObservation",
+    "SpGroupKnownUnavailableRange",
     "SpGroupLedgerEntry",
     "SpGroupLedgerSnapshot",
     "SpGroupLedgerStore",

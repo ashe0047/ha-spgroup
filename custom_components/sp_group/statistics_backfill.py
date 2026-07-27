@@ -250,6 +250,13 @@ async def _async_backfill_external(
         return StatisticsImportResult(warning_count=len(bridge_warnings))
 
     statistic_id = ledger_entry.external_statistic_id
+    if statistic_id is None:
+        LOGGER.warning(
+            "SP Group external statistics skipped: utility=%s "
+            "reason=missing_statistic_id",
+            ledger_entry.utility_type,
+        )
+        return StatisticsImportResult(warning_count=len(bridge_warnings) + 1)
     metadata = _metadata(statistic_id, ledger_entry.utility_type)
     async_import_statistics(
         hass,
@@ -648,8 +655,7 @@ def _electricity_statistics(
         )
     starts = [row.start for row in rows]
     if len(starts) != len(set(starts)):
-        warnings.append("statistics_duplicate_projected_start")
-        rows = []
+        return (), ("statistics_duplicate_projected_start",)
     return (
         tuple(sorted(rows, key=lambda item: item.start)),
         tuple(dict.fromkeys(warnings)),

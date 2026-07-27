@@ -51,7 +51,9 @@ re-configuration).
 2. Calls `_async_poll_sources(backfill=False)`
 3. For each source, calls `_request_start()` to get the cursor
 4. Calls `get_ami_charts()` with the cursor date and current date
-5. Parses the response through `_electricity_ami_source_poll()`
+5. Parses the response through the electricity normalization/composition path
+   (the legacy `_electricity_ami_source_poll()` adapter must not create
+   internal unresolved ranges)
 6. Applies observations to the ledger via `async_apply_observations()`
 7. If `accepted_delta > 0`, schedules a statistics retry
 

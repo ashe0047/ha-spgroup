@@ -51,7 +51,9 @@ SpGroupLedgerEntry:
   pending             — (deprecated) legacy pending buckets
   latest_total        — seed + sum of post-seed accepted bucket values
   latest_accepted_at  — end time of the most recently accepted bucket
-  unresolved_ranges   — periods where provider coverage is known missing
+  unresolved_ranges   — retryable provider gaps (electricity terminal lag;
+                         water blocking gaps)
+  known_unavailable_ranges — leading electricity months with no source data
   source_coverage_status / start / end — provider data boundaries
   warnings            — non-fatal conditions (corrections, duplicates)
   statistics_*        — statistics import tracking metadata
@@ -66,8 +68,12 @@ Each `SpGroupAcceptedBucket` stores:
 
 ### Cursor Derivation (`source_poll_cursor_start()`)
 
-The cursor determines where the next poll starts. It uses the first
-available source in this order:
+The cursor determines where the next poll starts. Water retains the generic
+ordering below. Electricity uses its accepted end after validating that any
+unresolved range is terminal provider lag; terminal lag must not pull the
+cursor backwards.
+
+Water ordering:
 
 1. Earliest `unresolved_ranges.start` — retry provider coverage gaps
 2. Earliest `pending.start` — (legacy, now empty)
@@ -92,6 +98,8 @@ object with:
 - `status` — `"covered"`, `"lagging"`, or `"malformed"`
 - `start`, `end` — the date range of returned data
 - `unresolved_ranges` — gaps within the returned data
+- `known_unavailable_ranges` — proven leading electricity coverage with no
+  source evidence; these are not retryable gaps
 
 This coverage is persisted and used by the cursor to prioritize unresolved
 ranges on the next poll.

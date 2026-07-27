@@ -102,6 +102,10 @@ def _ledger_summary(runtime: Any) -> dict[str, Any]:
         "unresolved_range_count": sum(
             len(getattr(entry, "unresolved_ranges", ())) for entry in entries.values()
         ),
+        "known_unavailable_range_count": sum(
+            len(getattr(entry, "known_unavailable_ranges", ()))
+            for entry in entries.values()
+        ),
         "source_coverage_statuses": dict(
             Counter(
                 str(getattr(entry, "source_coverage_status", "unknown"))

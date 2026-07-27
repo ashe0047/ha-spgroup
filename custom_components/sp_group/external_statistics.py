@@ -8,8 +8,8 @@ from homeassistant.components.recorder.models.statistics import (
     StatisticMeanType,
     StatisticMetaData,
 )
-from homeassistant.components.recorder.statistics import valid_entity_id
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
+from homeassistant.core import valid_entity_id
 from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
 from .const import DOMAIN

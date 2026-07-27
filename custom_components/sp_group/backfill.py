@@ -152,12 +152,9 @@ def _statistics_backfill_ready(entry: SpGroupConfigEntry, *, force: bool) -> boo
         return False
     for ledger_entry in getattr(snapshot, "entries", {}).values():
         status = getattr(ledger_entry, "source_backfill_status", None)
-        if (
-            status in {"never_attempted", "running", "failed"}
-            or (
-                status is None
-                and getattr(ledger_entry, "source_backfill_attempted_at", None) is None
-            )
+        if status in {"never_attempted", "running", "failed"} or (
+            status is None
+            and getattr(ledger_entry, "source_backfill_attempted_at", None) is None
         ):
             continue
         if force:
@@ -197,10 +194,14 @@ def _statistics_backfill_blocked(entry: SpGroupConfigEntry) -> bool:
         statistics_warnings = getattr(ledger_entry, "statistics_warnings", ()) or ()
         entry_warnings = getattr(ledger_entry, "warnings", ()) or ()
         for warning in (*statistics_warnings, *entry_warnings):
-            if warning in _HARD_STATISTICS_WARNINGS or any(
-                warning.startswith(prefix)
-                for prefix in _HARD_STATISTICS_WARNING_PREFIXES
-            ) or warning.startswith("corrected_bucket:"):
+            if (
+                warning in _HARD_STATISTICS_WARNINGS
+                or any(
+                    warning.startswith(prefix)
+                    for prefix in _HARD_STATISTICS_WARNING_PREFIXES
+                )
+                or warning.startswith("corrected_bucket:")
+            ):
                 return True
     return False
 
@@ -315,7 +316,9 @@ async def _run_backfill_with_retry(
                 entry,
                 "electric",
                 runtime.electricity_coordinator.async_poll_now,
-                poll_count=2 if runtime.electricity_coordinator.require_two_sightings else 1,
+                poll_count=(
+                    2 if runtime.electricity_coordinator.require_two_sightings else 1
+                ),
             )
             or any_utility_failed
         )
