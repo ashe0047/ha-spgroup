@@ -19,6 +19,7 @@ from homeassistant.components.recorder.models.statistics import (
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
     async_import_statistics,
     statistics_during_period,
 )
@@ -28,6 +29,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 
 from .const import DOMAIN
+from .external_statistics import external_metadata
 from .ledger import (
     PROVENANCE_HISTORY_MONTHLY,
     STATISTICS_STRATEGY_NATIVE_OFFSET_V2,
@@ -257,8 +259,8 @@ async def _async_backfill_external(
             ledger_entry.utility_type,
         )
         return StatisticsImportResult(warning_count=len(bridge_warnings) + 1)
-    metadata = _metadata(statistic_id, ledger_entry.utility_type)
-    async_import_statistics(
+    metadata = external_metadata(statistic_id, ledger_entry.utility_type)
+    async_add_external_statistics(
         hass,
         metadata,
         [_statistic_data(row) for row in planned],

@@ -2,15 +2,25 @@
 
 ## Status
 
-Accepted — precedence realignment 2026-07-27; implementation realignment required
+Accepted — implementation aligned 2026-07-27
 
 ## Context
 
-The hybrid electricity backfill combines 30-minute AMI data with monthly
+The historical electricity backfill combines 30-minute AMI data with monthly
 History data. The existing hybrid ADR defines source precedence and History
 remainder allocation for a valid partial AMI month. This ADR records the
 additional decisions for provider gaps, missing History evidence, terminal
 polling windows, and cursor behavior.
+
+Electricity has two intentionally separate processing policies:
+
+- **Historical backfill** is the configured backfill lifecycle. It composes
+  closed calendar months from AMI and History and may span timestamps both
+  before and after the configured seed boundary.
+- **Normal post-seed polling** starts from the persisted ledger cursor and is
+  AMI-only. It does not fetch History or invoke month-level composition. Any
+  historical correction requiring History belongs to an explicit rebuild or
+  reconciliation workflow.
 
 The key distinction is between:
 
@@ -29,7 +39,7 @@ known-unavailable coverage instead.
 
 ### Source precedence
 
-For each calendar month in the polling window:
+For each calendar month in the historical backfill window:
 
 1. Full usable AMI coverage takes precedence over History. History is ignored.
    Leading zero/placeholder rows do not establish usable AMI coverage.
@@ -96,6 +106,27 @@ Zero-valued buckets are persisted explicitly so the source timeline, cursor,
 and Recorder projection can represent the decision durably. They contribute
 zero consumption and must not be confused with observed positive AMI.
 
+### Normal post-seed AMI polling
+
+Normal polling uses only completed half-hour slots in the requested
+cursor-to-now window. It does not classify calendar-month coverage or consult
+History:
+
+- positive rows are accepted as `ami_observed`;
+- explicit zeros before or between positive rows are accepted as
+  `ami_observed_zero`;
+- omitted non-trailing slots are accepted as `ami_gap_zero`;
+- explicit or omitted slots after the last positive completed row are not
+  accepted and are coalesced into one `terminal_provider_lag` range;
+- a completed window with no positive row remains lagging, creates no accepted
+  observations, and does not advance the cursor;
+- incomplete/future slots are excluded from both observations and lag ranges.
+
+Normal trailing classification is relative to the actual polling window, not
+to a calendar month. A trailing range may cross a month boundary. The normal
+parser does not call `classify_electricity_ami_month()` or
+`compose_electricity_history_and_ami()`.
+
 ### Partial AMI without History
 
 When AMI has valid positive coverage for a month but no valid History total is
@@ -128,10 +159,15 @@ gap.
 
 ### Cursor and retry behavior
 
-For electricity, the normal result of a missing interval is either an
+For historical electricity backfill, the normal result of a missing interval is either an
 accepted explicit zero bucket or a persisted known-unavailable range. Neither
 creates a blocking unresolved range. Consequently, a clean ledger produced by
 this strategy has no earlier electricity unresolved ranges.
+
+For normal post-seed polling, internal missing intervals follow the same
+accepted-zero rule, while the trailing suffix is the sole unresolved range.
+When a normal response has no positive completed value, no observations are
+accepted and the cursor remains unchanged.
 
 Terminal trailing provider lag is the only electricity unresolved state. It is
 diagnostic/retryable, but non-blocking: the normal cursor continues from the
@@ -156,8 +192,10 @@ proven source coverage and allow the cursor to advance.
   provenance.
 - The ledger must persist known-unavailable ranges separately from blocking
   unresolved ranges and terminal provider-lag ranges.
-- Composition must receive the polling window start and end so leading and
-  terminal classification is deterministic.
+- Historical composition must receive the polling window start and end so
+  leading and terminal classification is deterministic. Normal parsing
+  receives the clipped cursor-to-now window and applies its independent
+  trailing policy.
 - Explicit zero and no-source zero buckets are clipped to the requested
   polling window; they must not create buckets outside that window merely to
   complete a calendar month.
@@ -174,7 +212,7 @@ proven source coverage and allow the cursor to advance.
 
 ### Coverage classification contract
 
-The composer classifies each requested closed calendar month using the
+The historical composer classifies each requested closed calendar month using the
 expected 30-minute grid and row presence:
 
 - `full_ami`: every expected slot is represented and usable positive AMI
@@ -198,6 +236,13 @@ are failures and do not produce synthetic zero coverage.
 ## Required verification
 
 Tests must prove:
+
+- historical and normal parser policies are dispatched independently;
+- normal polling never fetches History or invokes month-level composition;
+- normal explicit and omitted trailing slots coalesce into terminal lag,
+  including across a calendar-month boundary;
+- normal internal explicit and inferred zeros retain their provenance;
+- a normal all-zero completed window leaves the cursor unchanged;
 
 - partial AMI with and without History;
 - zero-only AMI with valid History selecting `history_monthly`;

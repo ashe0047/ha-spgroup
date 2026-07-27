@@ -8,8 +8,8 @@ from homeassistant.components.recorder.models.statistics import (
     StatisticMeanType,
     StatisticMetaData,
 )
+from homeassistant.components.recorder.statistics import valid_statistic_id
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
-from homeassistant.core import valid_entity_id
 from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
 from .const import DOMAIN
@@ -21,8 +21,8 @@ EXTERNAL_STATISTICS_SOURCE = DOMAIN
 
 def external_statistic_id(sensor_key: str) -> str:
     """Return the stable external statistic ID for an opaque sensor key."""
-    statistic_id = f"{DOMAIN}.{sensor_key}_consumption"
-    if not valid_entity_id(statistic_id):
+    statistic_id = f"{DOMAIN}:{sensor_key}_consumption"
+    if not valid_statistic_id(statistic_id):
         raise ValueError("invalid_external_statistic_id")
     return statistic_id
 

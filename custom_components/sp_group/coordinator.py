@@ -487,7 +487,7 @@ class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
         now: datetime,
     ) -> SpGroupParsedSource:
         """Parse AMI data and retain provider coverage evidence."""
-        return _electricity_ami_source_poll(
+        return _normal_electricity_ami_source_poll(
             payload,
             backfill_from=backfill_from,
             now=now,
@@ -503,44 +503,34 @@ class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
         now: datetime,
         backfill: bool,
     ) -> SpGroupParsedSource:
-        """Compose history only when closed AMI evidence needs it."""
-        if not _electricity_ami_needs_history(
+        """Use independent historical and normal electricity policies."""
+        if not backfill:
+            return self._parse_source(payload, backfill_from=backfill_from, now=now)
+        jarvis_client = self.entry.runtime_data.jarvis_client
+        history_payload: dict[str, Any] = {"elec": {"data": []}}
+        rows = _normalize_electricity_ami_rows(
             payload,
             backfill_from=backfill_from,
             now=now,
-            backfill=backfill,
+        )
+        if _electricity_ami_needs_history(
+            payload,
+            backfill_from=backfill_from,
+            now=now,
+            backfill=True,
         ):
-            return self._parse_source(payload, backfill_from=backfill_from, now=now)
-        jarvis_client = self.entry.runtime_data.jarvis_client
-        history_payload = self._history_payload_cache.get(premise_id)
-        if history_payload is None:
-            history_payload = await jarvis_client.get_history_charts(
-                session, premise_id
-            )
-            self._history_payload_cache[premise_id] = history_payload
-        unit = payload.get("unit")
-        if isinstance(unit, str) and unit.strip().lower() not in {
-            "kwh",
-            "kw h",
-            "kilowatt-hour",
-            "kilowatt-hours",
-        }:
-            raise LedgerError("unsupported_electricity_ami_unit")
-        rows: list[tuple[datetime, Decimal]] = []
-        seen_starts: set[datetime] = set()
-        for row in _ami_rows(payload):
-            start = _parse_bucket_start(row.get("date"))
-            value = _parse_decimal(row.get("consumption", row.get("amount")))
-            if start is None or value is None or value < 0:
-                raise LedgerError("invalid_electricity_ami_row")
-            if start in seen_starts:
-                raise LedgerError("duplicate_electricity_ami_timestamp")
-            seen_starts.add(start)
-            rows.append((start, value))
+            cached_history = self._history_payload_cache.get(premise_id)
+            if cached_history is None:
+                history_payload = await jarvis_client.get_history_charts(
+                    session, premise_id
+                )
+                self._history_payload_cache[premise_id] = history_payload
+            else:
+                history_payload = cached_history
         try:
             composition = compose_electricity_history_and_ami(
                 history_payload,
-                tuple(rows),
+                rows,
                 backfill_from=backfill_from,
                 now=now,
             )
@@ -1121,18 +1111,16 @@ def _monthly_missing_ranges(
     return tuple(ranges)
 
 
-def _electricity_ami_source_poll(
+def _normalize_electricity_ami_rows(
     payload: dict[str, Any],
     *,
     backfill_from: datetime,
     now: datetime,
-) -> SpGroupParsedSource:
-    """Parse AMI data for open/full months without History composition."""
+) -> tuple[tuple[datetime, Decimal], ...]:
+    """Validate and clip completed AMI rows to a polling window."""
     raw_history = payload.get("history")
     if not isinstance(raw_history, list):
-        return SpGroupParsedSource(
-            coverage=SpGroupSourceCoverage(status=SOURCE_COVERAGE_MALFORMED)
-        )
+        raise LedgerError("malformed_electricity_source_response")
     unit = payload.get("unit")
     if isinstance(unit, str) and unit.strip().lower() not in {
         "kwh",
@@ -1140,63 +1128,46 @@ def _electricity_ami_source_poll(
         "kilowatt-hour",
         "kilowatt-hours",
     }:
-        return SpGroupParsedSource(
-            coverage=SpGroupSourceCoverage(status=SOURCE_COVERAGE_MALFORMED)
-        )
+        raise LedgerError("unsupported_electricity_ami_unit")
     rows: list[tuple[datetime, Decimal]] = []
-    malformed_row = False
+    seen_starts: set[datetime] = set()
     for row in _ami_rows(payload):
         start = _parse_bucket_start(row.get("date"))
         value = _parse_decimal(row.get("consumption", row.get("amount")))
         if start is None or value is None or value < 0:
-            malformed_row = True
-            continue
-        rows.append((start, value))
-    if malformed_row or len({start for start, _ in rows}) != len(rows):
+            raise LedgerError("invalid_electricity_ami_row")
+        if start in seen_starts:
+            raise LedgerError("duplicate_electricity_ami_timestamp")
+        seen_starts.add(start)
+        if start >= backfill_from and start + timedelta(minutes=30) <= now:
+            rows.append((start, value))
+    return tuple(sorted(rows))
+
+
+def _normal_electricity_ami_source_poll(
+    payload: dict[str, Any],
+    *,
+    backfill_from: datetime,
+    now: datetime,
+) -> SpGroupParsedSource:
+    """Parse a normal post-seed AMI window without History composition."""
+    try:
+        completed_rows = _normalize_electricity_ami_rows(
+            payload,
+            backfill_from=backfill_from,
+            now=now,
+        )
+    except LedgerError:
         return SpGroupParsedSource(
             coverage=SpGroupSourceCoverage(status=SOURCE_COVERAGE_MALFORMED)
         )
-    rows.sort(key=lambda item: item[0])
-    completed_rows = [
-        (start, value) for start, value in rows if start + timedelta(minutes=30) <= now
-    ]
     positive = [(start, value) for start, value in completed_rows if value > 0]
     if not positive:
-        rows_by_month: dict[datetime, dict[datetime, Decimal]] = {}
-        for start, value in completed_rows:
-            month = _parse_month_start(start.isoformat())
-            if month is not None:
-                rows_by_month.setdefault(month, {})[start] = value
-        full_zero_observations: list[SpGroupBucketObservation] = []
-        for month, month_rows in rows_by_month.items():
-            classification = classify_electricity_ami_month(month, month_rows)
-            if classification.coverage == "full_ami":
-                full_zero_observations.extend(
-                    SpGroupBucketObservation(
-                        bucket_key=start.isoformat(),
-                        start=start,
-                        end=start + timedelta(minutes=30),
-                        value=Decimal("0"),
-                        provenance=PROVENANCE_AMI_OBSERVED_ZERO,
-                    )
-                    for start in month_rows
-                )
-        if full_zero_observations:
-            return SpGroupParsedSource(
-                observations=tuple(
-                    sorted(full_zero_observations, key=lambda item: item.start)
-                ),
-                coverage=SpGroupSourceCoverage(
-                    status=SOURCE_COVERAGE_COVERED,
-                    start=full_zero_observations[0].start,
-                    end=full_zero_observations[-1].end,
-                ),
-            )
-        status = SOURCE_COVERAGE_LAGGING
-        return SpGroupParsedSource(coverage=SpGroupSourceCoverage(status=status))
+        return SpGroupParsedSource(
+            coverage=SpGroupSourceCoverage(status=SOURCE_COVERAGE_LAGGING)
+        )
 
     row_by_start = dict(completed_rows)
-    first_positive = positive[0][0]
     last_positive = positive[-1][0]
     slots = tuple(
         slot
@@ -1205,9 +1176,19 @@ def _electricity_ami_source_poll(
     )
     unresolved: list[SpGroupUnresolvedRange] = []
     observations_list: list[SpGroupBucketObservation] = []
-    terminal_month = _parse_month_start(now.isoformat())
     for slot in slots:
-        if slot in row_by_start:
+        if slot > last_positive:
+            unresolved.append(
+                SpGroupUnresolvedRange(
+                    cadence="30m",
+                    start=slot,
+                    end=slot + timedelta(minutes=30),
+                    reason="terminal_provider_lag",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                )
+            )
+        elif slot in row_by_start:
             value = row_by_start[slot]
             observations_list.append(
                 SpGroupBucketObservation(
@@ -1222,7 +1203,7 @@ def _electricity_ami_source_poll(
                     ),
                 )
             )
-        elif slot < first_positive or first_positive <= slot <= last_positive:
+        else:
             observations_list.append(
                 SpGroupBucketObservation(
                     bucket_key=slot.isoformat(),
@@ -1230,19 +1211,6 @@ def _electricity_ami_source_poll(
                     end=slot + timedelta(minutes=30),
                     value=Decimal("0"),
                     provenance=PROVENANCE_AMI_GAP_ZERO,
-                )
-            )
-        elif slot > last_positive and terminal_month == _parse_month_start(
-            last_positive.isoformat()
-        ):
-            unresolved.append(
-                SpGroupUnresolvedRange(
-                    cadence="30m",
-                    start=slot,
-                    end=slot + timedelta(minutes=30),
-                    reason="terminal_provider_lag",
-                    first_seen_at=now,
-                    last_seen_at=now,
                 )
             )
     observations = tuple(observations_list)
@@ -1349,11 +1317,25 @@ def _electricity_ami_observations(
     backfill_from: datetime,
     now: datetime,
 ) -> tuple[SpGroupBucketObservation, ...]:
-    return _electricity_ami_source_poll(
+    return _normal_electricity_ami_source_poll(
         payload,
         backfill_from=backfill_from,
         now=now,
     ).observations
+
+
+def _electricity_ami_source_poll(
+    payload: dict[str, Any],
+    *,
+    backfill_from: datetime,
+    now: datetime,
+) -> SpGroupParsedSource:
+    """Backward-compatible test helper for the normal AMI parser."""
+    return _normal_electricity_ami_source_poll(
+        payload,
+        backfill_from=backfill_from,
+        now=now,
+    )
 
 
 def _water_monthly_observations(

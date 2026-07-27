@@ -13,6 +13,7 @@ from custom_components.sp_group.const import DOMAIN
 from custom_components.sp_group.ledger import (
     PROVENANCE_HISTORY_MONTHLY,
     SpGroupLedgerEntry,
+    SpGroupUnresolvedRange,
 )
 from custom_components.sp_group.sources import SINGAPORE_TZ
 from custom_components.sp_group.statistics_backfill import (
@@ -221,6 +222,31 @@ def test_electricity_zero_provenance_values_project_with_same_statistics_effect(
     assert warnings == ()
     assert len(rows) == 2
     assert all(row.delta == 0 for row in rows)
+
+
+def test_electricity_statistics_exclude_terminal_normal_lag() -> None:
+    """Unresolved normal trailing AMI slots never become statistics rows."""
+    accepted = _accepted_bucket(
+        "2026-07-01T00:00:00+08:00",
+        "2026-07-01T00:30:00+08:00",
+        "2",
+    )
+    entry = replace(
+        _ledger_entry(ELECTRIC_KEY, "electric", "100", (accepted,)),
+        unresolved_ranges=(
+            SpGroupUnresolvedRange(
+                cadence="30m",
+                start=datetime(2026, 7, 1, 0, 30, tzinfo=SINGAPORE_TZ),
+                end=datetime(2026, 7, 1, 1, 30, tzinfo=SINGAPORE_TZ),
+                reason="terminal_provider_lag",
+                first_seen_at=datetime(2026, 7, 1, 1, 30, tzinfo=SINGAPORE_TZ),
+                last_seen_at=datetime(2026, 7, 1, 1, 30, tzinfo=SINGAPORE_TZ),
+            ),
+        ),
+    )
+    rows, warnings = _projected_statistics_with_warnings(entry)
+    assert warnings == ("statistics_missing_bridge:2026-07-01T00:00:00+08:00",)
+    assert rows == ()
 
 
 async def test_electricity_hybrid_projection_imports_monthly_and_half_hour_rows(

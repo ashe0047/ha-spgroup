@@ -4169,3 +4169,167 @@ History responses before preparing the commit plan. No commit has been
 created yet; the proposed commit should preserve the complete tested change
 set as one atomic development checkpoint, with the unrelated external
 statistics collection blocker called out separately.
+## 2026-07-27 13:30 +0800 — Production-readiness review
+
+The committed hybrid backfill implementation was reviewed across runtime
+setup, authentication, discovery, coordinators, ledger persistence, Recorder
+statistics, diagnostics, packaging, and HA quality-scale expectations. Core
+focused verification remains green (`338 passed, 12 skipped`; Ruff, mypy, and
+compile checks pass), but the full test command still fails during collection
+because `test_external_statistics.py` imports the missing
+`_classify_external_rows` helper. Production review also identified release
+risks requiring follow-up: competing vendored versus manifest SDK sources,
+silent ignoring of unsupported History statuses despite the ADR contract,
+disabled-source entities retaining stale availability, lack of CI/coverage
+gates, and incomplete production lifecycle/documentation hardening.
+## 2026-07-27 16:50 +0800 — Normal-poll statistics visibility investigation
+
+The live instance executes normal electricity polls successfully. Each recent
+poll accepted two completed half-hour AMI buckets, but the provider returned
+explicit zero values, so the ledger latest total remains at the seed value
+(`2000.0`). The external-like statistics series receives new rows, but the
+entity-backed `sensor.electricity_consumption` statistics series remains at
+zero native sum and does not visibly change. The implementation currently
+calls `async_import_statistics()` with a dotted `sp_group.*` statistic ID,
+while the provider-owned ADR requires `async_add_external_statistics()` with a
+colon-form external statistic ID and matching source domain. The ledger also
+continues to retain `statistics_dirty_from` because the external path calls
+the generic metadata updater instead of the conditional external metadata
+updater, causing repeated full re-imports on each hourly Recorder event.
+## 2026-07-27 17:10 +0800 — Late AMI values absent from historical statistics
+
+The live provider request for Jarvis premise `2000536445` on 2026-07-27
+returned positive AMI values from 05:00 through 07:30 (six half-hour rows,
+total `2.7429 kWh`). The persisted electricity ledger nevertheless contains
+accepted zero buckets for each of those starts, with provenance
+`ami_observed_zero`. The initial backfill therefore accepted the provider's
+then-current zero/placeholder response and advanced the electricity cursor past
+the interval. Subsequent normal polls requested only 12:30 onward (then
+13:30, 14:30, and 15:30), so they could not discover the late values. Even if
+the interval were fetched again, `_apply_observations_to_entry()` treats a
+changed accepted value as an immutable correction (`corrected_bucket:*`) rather
+than replacing the bucket; this requires the explicit correction/rebuild path.
+
+The statistics entity was available immediately after setup because the initial
+backfill imported a separate provider-like Recorder series with statistic ID
+`sp_group.sp_group_premise_25d45102896461d07614be96_electric_consumption` and
+5711 rows. Recorder also created the native
+`sensor.electricity_consumption` series, but it only has the seed/native rows
+and is not the historical provider series. Thus the current defect is stale
+accepted source data and correction semantics, not failure to create the
+statistics entity. The imported series currently has 5715 rows and cumulative
+sum `7959.5724`; adding the verified late interval would increase that series
+by `2.7429 kWh` subject to the correction/rebuild policy.
+## 2026-07-27 17:25 +0800 — Normal-poll trailing-zero semantics review
+
+The proposed distinction is logical and is required to separate historical
+backfill semantics from post-seed polling semantics. In a normal polling
+window, explicit zero rows after the last positive completed AMI bucket are
+provider-lag placeholders and must remain unresolved; zero rows before or
+between positive buckets are accepted `ami_observed_zero` values. A window
+with no positive completed value remains lagging and produces no accepted
+observations. This must be request-window behavior and must not change the
+historical closed-month rules.
+
+Git history confirms the regression boundary. Before commit `459bd3d`, the
+normal AMI parser in `b6597b9` emitted only positive AMI observations and did
+not persist explicit zero rows. Commit `459bd3d` introduced explicit zero
+provenance and the current parser accepts every returned zero row, including
+rows after the last positive value. It also retained omitted-suffix unresolved
+handling, creating the inconsistent behavior observed in production. The live
+ledger's accepted zero buckets for 05:00–07:30 were created by the historical
+backfill path, while normal polling then began at 12:30 and could not repair
+them.
+## 2026-07-27 17:40 +0800 — Proposed pre-seed/post-seed semantic separation
+
+The lowest-risk redesign is to keep the existing strict AMI row normalizer and
+ledger types shared, but split policy at the coordinator boundary into two
+explicit parser paths: historical backfill composition and normal post-seed
+window parsing. Historical backfill continues to use the month-level History
+precedence/allocation composer. Normal polling must not call that composer or
+fetch History implicitly; it parses only the completed AMI window, accepts
+internal/non-trailing zeros, and emits one terminal provider-lag range for
+explicit or omitted trailing slots. This prevents a future historical-policy
+change from changing normal cursor behavior (and vice versa) without duplicating
+the low-level payload validation.
+## 2026-07-27 18:05 +0800 — Historical/normal AMI processing separation implemented
+
+Electricity parsing now validates and clips AMI rows through a shared strict
+normalizer, dispatches historical backfill exclusively through the existing
+History/month composer, and dispatches normal polling through an AMI-only
+window parser. Normal parsing no longer fetches History, accepts internal
+zeros, and coalesces explicit or omitted slots after the last positive into
+`terminal_provider_lag`; an all-zero completed window remains lagging without
+accepted observations. Focused coordinator/electricity tests pass (`93
+passed`), the broader affected SP Group tests pass (`134 passed`), Ruff and
+mypy pass, and HA compile checks pass. The full suite remains blocked during
+collection by the pre-existing missing `_classify_external_rows` helper.
+## 2026-07-27 18:35 +0800 — Test closure additions completed
+
+Added direct normal-parser coverage for explicit/internal/inferred zero
+provenance, mixed trailing gaps across a calendar-month boundary, and exact
+terminal-lag coalescing. Added statistics coverage proving unresolved normal
+suffixes fail closed with the stable missing-bridge warning and produce no
+projected rows. The expanded focused set now passes (`137 passed`), with Ruff,
+mypy, compile, and diff checks passing. Full repository collection remains
+blocked only by the pre-existing `_classify_external_rows` import.
+## 2026-07-27 18:20 +0800 — Test coverage audit after mode split
+
+The implementation-focused tests pass, but coverage is not yet exhaustive for
+the separation contract. Current tests cover normal explicit trailing-zero lag,
+all-zero lag, normal History avoidance, internal/inferred gaps, and the broad
+historical composer branches. Remaining gaps include explicit-plus-omitted
+trailing ranges crossing month boundaries, provenance assertions for every
+normal branch, coordinator/ledger cursor advancement and terminal-lag
+resolution using explicit trailing zeros, malformed normal-poll rollback, and
+statistics projection exclusion of unresolved normal suffixes. The tests still
+invoke the compatibility-named `_electricity_ami_source_poll()` wrapper rather
+than enforcing the new named normal parser directly. Full-suite collection is
+still blocked by `_classify_external_rows`.
+## 2026-07-27 18:50 +0800 — Statistics identity/name alignment revisited
+
+The runtime database confirms two distinct electricity statistics series:
+native `sensor.electricity_consumption` and imported
+`sp_group.sp_group_premise_25d45102896461d07614be96_electric_consumption`, both
+with the display name `SP Group Electricity consumption`. The display name is
+not the problem; the imported statistic ID and ownership contract remain
+misaligned with `adr-provider-owned-external-statistics.md`, which requires a
+stable colon-form external ID (`sp_group:<stable_key>_consumption`), external
+source ownership, and `async_add_external_statistics()`. Current code still
+constructs a dotted entity-style ID, labels metadata as Recorder, and imports
+through `async_import_statistics()`. The existing external-statistics tests
+already encode the colon/API contract but cannot collect because
+`_classify_external_rows` is missing.
+## 2026-07-27 19:10 +0800 — External statistic identity/ownership update
+
+Aligned the active provider-series identity with Home Assistant's external
+statistics convention: `external_statistic_id()` now emits the colon-form
+`sp_group:<stable_sensor_key>_consumption` and the active external backfill path
+uses the existing `external_metadata()` contract (`source=sp_group`) together
+with `async_add_external_statistics()`. Native/internal statistics paths remain
+unchanged. The focused statistics tests, Ruff, mypy, and diff checks pass. A
+documentation audit found stale dotted-ID/`async_import_statistics()` statements
+in `adr-sensor-platform.md`, `adr-water-polling.md`, and the legacy seed
+statistics ADR; the provider-owned ADR and implementation plan already describe
+the corrected external contract.
+## 2026-07-27 19:35 +0800 — Electricity gap ADR reconciled after mode split
+
+Updated `adr-electricity-gap-and-no-data-semantics.md` to mark the implementation
+aligned and distinguish the two live policies. Historical backfill now owns all
+calendar-month AMI/History precedence, classification, allocation, and
+unavailable-range rules. Normal post-seed polling is explicitly AMI-only,
+cursor-window based, accepts internal zeros, and treats explicit or omitted
+trailing slots as coalesced `terminal_provider_lag`; all-zero completed windows
+remain lagging without advancing the cursor. The required verification section
+now includes policy dispatch isolation and cross-month normal trailing-lag
+cases.
+## 2026-07-27 19:50 +0800 — Commit planning for current changes
+
+The current worktree contains one coherent implementation checkpoint spanning
+normal/historical AMI policy isolation, expanded parser/coordinator/statistics
+tests, external statistic ID/source/API alignment, the electricity gap ADR, and
+the append-only context tracker. The recommended commit plan is to preserve
+these changes as one atomic checkpoint because the active external ID/source
+change is coupled to its Recorder writer change. Verification evidence is
+focused tests, Ruff, mypy, compile, and diff checks; the full suite remains
+blocked by the pre-existing `_classify_external_rows` collection error.

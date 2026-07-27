@@ -21,6 +21,7 @@ from custom_components.sp_group.coordinator import (
     _electricity_ami_needs_history,
     _electricity_ami_source_poll,
     _missing_closed_water_months,
+    _normal_electricity_ami_source_poll,
     _water_history_observations,
     _water_history_source_poll,
     _water_startup_catchup_needed,
@@ -35,6 +36,7 @@ from custom_components.sp_group.ledger import (
     SpGroupBucketObservation,
     SpGroupLedgerStore,
     SpGroupSourceCoverage,
+    SpGroupUnresolvedRange,
 )
 from custom_components.sp_group.sources import (
     SINGAPORE_TZ,
@@ -382,7 +384,7 @@ async def test_normal_poll_recovers_pre_seed_lag(
     )
     calls: list[str] = []
     jarvis = FakeJarvisClient(calls)
-    # API returns the lagged 14:00 bucket that was missing from the backfill
+    # API returns the lagged 14:00 bucket and a trailing zero placeholder.
     jarvis.ami_payloads = [
         {
             "unit": "kWh",
@@ -390,6 +392,7 @@ async def test_normal_poll_recovers_pre_seed_lag(
                 {
                     "data": [
                         {"date": "20260724140000", "consumption": "1.5"},
+                        {"date": "20260724143000", "consumption": "0"},
                     ]
                 },
             ],
@@ -448,6 +451,11 @@ async def test_normal_poll_recovers_pre_seed_lag(
         b.start == datetime(2026, 7, 24, 14, 0, tzinfo=SINGAPORE_TZ)
         for b in entry_ledger.accepted
     )
+    assert not any(
+        b.start == datetime(2026, 7, 24, 14, 30, tzinfo=SINGAPORE_TZ)
+        for b in entry_ledger.accepted
+    )
+    assert entry_ledger.unresolved_ranges
     # Cursor moved past the lag gap to the new accepted end
     assert entry_ledger.source_poll_cursor_start() == datetime(
         2026, 7, 24, 14, 30, tzinfo=SINGAPORE_TZ
@@ -902,6 +910,31 @@ async def test_electricity_async_parse_full_ami_does_not_fetch_history(
     )
 
 
+async def test_electricity_normal_parse_never_fetches_history(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """Post-seed normal parsing is AMI-only, even for a closed month."""
+    jarvis = runtime_entry.runtime_data.jarvis_client
+    assert isinstance(jarvis, FakeJarvisClient)
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    parsed = await coordinator._async_parse_source(
+        {
+            "unit": "kWh",
+            "history": [
+                {"data": [{"date": "20260101010000", "consumption": "1"}]}
+            ],
+        },
+        session=runtime_entry.runtime_data.session,
+        premise_id="JARVIS-PREMISE-1",
+        backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        backfill=False,
+    )
+    assert parsed.observations
+    assert not any("get_history_charts" in call for call in jarvis.calls)
+
+
 async def test_electricity_async_parse_partial_fetches_and_caches_history(
     hass: HomeAssistant,
     runtime_entry: MockConfigEntry,
@@ -934,7 +967,7 @@ async def test_electricity_async_parse_partial_fetches_and_caches_history(
             premise_id="JARVIS-PREMISE-1",
             backfill_from=month,
             now=datetime(2026, 2, 2, 0, 0, tzinfo=SINGAPORE_TZ),
-            backfill=False,
+            backfill=True,
         )
         assert parsed.observations
     history_calls = [
@@ -1024,7 +1057,7 @@ async def test_electricity_async_parse_rejects_malformed_history(
             premise_id="JARVIS-PREMISE-1",
             backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
             now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
-            backfill=False,
+            backfill=True,
         )
 
 
@@ -1054,7 +1087,7 @@ async def test_electricity_async_parse_rejects_duplicate_ami_timestamp(
             premise_id="JARVIS-PREMISE-1",
             backfill_from=datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ),
             now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
-            backfill=False,
+            backfill=True,
         )
 
 
@@ -1710,6 +1743,94 @@ def test_electricity_source_poll_with_only_zero_rows_is_lagging() -> None:
     )
     assert parsed.observations == ()
     assert parsed.coverage.status == "lagging"
+
+
+def test_normal_electricity_source_poll_treats_trailing_zero_as_lag() -> None:
+    """Normal polling does not accept explicit trailing provider placeholders."""
+    parsed = _normal_electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": "20260715130000", "consumption": "1"},
+                        {"date": "20260715133000", "consumption": "0"},
+                    ]
+                }
+            ],
+        },
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+    )
+    assert [(item.start, item.value) for item in parsed.observations] == [
+        (datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ), Decimal("1")),
+    ]
+    assert parsed.coverage.unresolved_ranges[0].start == datetime(
+        2026, 7, 15, 13, 30, tzinfo=SINGAPORE_TZ
+    )
+    assert parsed.coverage.unresolved_ranges[0].end == datetime(
+        2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ
+    )
+
+
+def test_normal_electricity_source_poll_preserves_internal_zero_provenance() -> None:
+    """Normal internal explicit and inferred zeros retain distinct provenance."""
+    parsed = _normal_electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": "20260715000000", "consumption": "0"},
+                        {"date": "20260715010000", "consumption": "1"},
+                        {"date": "20260715020000", "consumption": "2"},
+                    ]
+                }
+            ],
+        },
+        backfill_from=datetime(2026, 7, 15, 0, 0, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 7, 15, 2, 30, tzinfo=SINGAPORE_TZ),
+    )
+    assert [(item.value, item.provenance) for item in parsed.observations] == [
+        (Decimal("0"), "ami_observed_zero"),
+        (Decimal("0"), "ami_gap_zero"),
+        (Decimal("1"), "ami_observed"),
+        (Decimal("0"), "ami_gap_zero"),
+        (Decimal("2"), "ami_observed"),
+    ]
+    assert parsed.coverage.unresolved_ranges == ()
+
+
+def test_normal_electricity_source_poll_coalesces_trailing_gap_across_month() -> None:
+    """Normal trailing lag is request-window based across a month boundary."""
+    parsed = _normal_electricity_ami_source_poll(
+        {
+            "unit": "kWh",
+            "history": [
+                {
+                    "data": [
+                        {"date": "20260131233000", "consumption": "1"},
+                        {"date": "20260201000000", "consumption": "0"},
+                    ]
+                }
+            ],
+        },
+        backfill_from=datetime(2026, 1, 31, 23, 30, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 2, 1, 1, 0, tzinfo=SINGAPORE_TZ),
+    )
+    assert [item.start for item in parsed.observations] == [
+        datetime(2026, 1, 31, 23, 30, tzinfo=SINGAPORE_TZ),
+    ]
+    assert parsed.coverage.unresolved_ranges == (
+        SpGroupUnresolvedRange(
+            cadence="30m",
+            start=datetime(2026, 2, 1, 0, 0, tzinfo=SINGAPORE_TZ),
+            end=datetime(2026, 2, 1, 1, 0, tzinfo=SINGAPORE_TZ),
+            reason="terminal_provider_lag",
+            first_seen_at=datetime(2026, 2, 1, 1, 0, tzinfo=SINGAPORE_TZ),
+            last_seen_at=datetime(2026, 2, 1, 1, 0, tzinfo=SINGAPORE_TZ),
+        ),
+    )
 
 
 def test_electricity_source_poll_treats_complete_zero_grid_as_unavailable() -> None:
