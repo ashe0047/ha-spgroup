@@ -377,10 +377,14 @@ def compose_electricity_history_and_ami(
             for slot in expected:
                 if slot in allocated_prefix or slot in prefix:
                     continue
-                if slot in rows:
-                    observations.append(_ami_observation(slot, rows[slot]))
-                elif slot > last_positive and month == terminal_month:
+                # Terminal trailing placeholders are provider lag regardless
+                # of whether the provider represented them as explicit zeros
+                # or omitted the slots entirely. Check position before row
+                # presence so explicit zero placeholders cannot be accepted.
+                if slot > last_positive and month == terminal_month:
                     terminal_lag_ranges.append((slot, slot + _HALF_HOUR))
+                elif slot in rows:
+                    observations.append(_ami_observation(slot, rows[slot]))
                 else:
                     observations.append(
                         _ami_gap_observation(slot, PROVENANCE_AMI_GAP_ZERO)
@@ -427,9 +431,25 @@ def classify_electricity_ami_month(
             month, AMI_COVERAGE_NONE, ordered, "placeholder_rows"
         )
     first_positive = positive[0][0]
+    last_positive = positive[-1][0]
     expected_window_set = set(expected)
     effective_start = expected[0] if expected else month
-    if actual_set == expected_window_set and first_positive == effective_start:
+    terminal_window = window_end is not None and window_end < _next_month(month)
+    has_terminal_zero_suffix = (
+        terminal_window
+        and bool(expected)
+        and last_positive < expected[-1]
+        and all(
+            start in actual_set and rows[start] == 0
+            for start in expected
+            if start > last_positive
+        )
+    )
+    if (
+        actual_set == expected_window_set
+        and first_positive == effective_start
+        and not has_terminal_zero_suffix
+    ):
         return SpGroupElectricityMonthClassification(
             month, AMI_COVERAGE_FULL, ordered
         )

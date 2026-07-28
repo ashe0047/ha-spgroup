@@ -556,6 +556,100 @@ async def test_electricity_terminal_lag_resolves_after_exact_bucket_acceptance(
     assert entry.source_poll_cursor_start() == missing.end
 
 
+async def test_electricity_terminal_lag_retries_coalesce_and_trim_stale_prefix(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Repeated moving suffixes remain one range after accepted catch-up."""
+    from custom_components.sp_group.ledger import SpGroupLedgerStore
+
+    hass.config.config_dir = str(tmp_path)
+    store = SpGroupLedgerStore(hass, "entry-terminal-coalesce")
+    await store.async_load()
+    config = build_source_config(
+        sensor_key=SpGroupFutureSensorKey(
+            key="opaque_electric",
+            premise_key="opaque_premise",
+            utility_type="electric",
+        ),
+        seed_value="100",
+        seed_observed_at="2026-01-01T00:00:00+08:00",
+        backfill_from="2026-01-01T00:00:00+08:00",
+        now=datetime(2026, 1, 1, 3, 0, tzinfo=SINGAPORE_TZ),
+    )
+    await store.async_initialize_sources({"opaque_electric": config})
+
+    first = SpGroupBucketObservation(
+        bucket_key="first",
+        start=datetime(2026, 1, 1, 0, 0, tzinfo=SINGAPORE_TZ),
+        end=datetime(2026, 1, 1, 0, 30, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1"),
+    )
+    second = SpGroupBucketObservation(
+        bucket_key="second",
+        start=first.end,
+        end=datetime(2026, 1, 1, 1, 0, tzinfo=SINGAPORE_TZ),
+        value=Decimal("1"),
+    )
+    def lag(start: datetime, end: datetime, seen: datetime) -> SpGroupUnresolvedRange:
+        return SpGroupUnresolvedRange(
+            cadence="30m",
+            start=start,
+            end=end,
+            reason="terminal_provider_lag",
+            first_seen_at=seen,
+            last_seen_at=seen,
+        )
+
+    first_seen = datetime(2026, 1, 1, 1, 0, tzinfo=SINGAPORE_TZ)
+    second_seen = datetime(2026, 1, 1, 2, 0, tzinfo=SINGAPORE_TZ)
+    await store.async_apply_observations(
+        "opaque_electric",
+        (first,),
+        now=datetime(2026, 1, 1, 1, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+        coverage=SpGroupSourceCoverage(
+            status=SOURCE_COVERAGE_COVERED,
+            unresolved_ranges=(
+                lag(
+                    first.end,
+                    datetime(2026, 1, 1, 2, 0, tzinfo=SINGAPORE_TZ),
+                    first_seen,
+                ),
+            ),
+        ),
+    )
+    snapshot = await store.async_apply_observations(
+        "opaque_electric",
+        (second,),
+        now=datetime(2026, 1, 1, 2, 0, tzinfo=SINGAPORE_TZ),
+        require_two_sightings=False,
+        coverage=SpGroupSourceCoverage(
+            status=SOURCE_COVERAGE_COVERED,
+            unresolved_ranges=(
+                lag(
+                    second.end,
+                    datetime(2026, 1, 1, 3, 0, tzinfo=SINGAPORE_TZ),
+                    second_seen,
+                ),
+            ),
+        ),
+    )
+
+    entry = snapshot.entries["opaque_electric"]
+    assert entry.unresolved_ranges == (
+        SpGroupUnresolvedRange(
+            cadence="30m",
+            start=second.end,
+            end=datetime(2026, 1, 1, 3, 0, tzinfo=SINGAPORE_TZ),
+            reason="terminal_provider_lag",
+            first_seen_at=first_seen,
+            last_seen_at=second_seen,
+        ),
+    )
+    assert entry.source_poll_cursor_start() == second.end
+
+
 async def test_electricity_known_unavailable_persists_and_advances_after_reload(
     hass: HomeAssistant,
     tmp_path,  # noqa: ANN001

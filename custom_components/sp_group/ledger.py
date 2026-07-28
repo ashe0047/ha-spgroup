@@ -986,9 +986,18 @@ class SpGroupLedgerStore:
                 return False
             if _accepted_source_fingerprint(entry) != source_fingerprint:
                 return False
+            effective_imported_through = imported_through
+            if (
+                entry.statistics_imported_through is not None
+                and (
+                    effective_imported_through is None
+                    or effective_imported_through < entry.statistics_imported_through
+                )
+            ):
+                effective_imported_through = entry.statistics_imported_through
             updated = replace(
                 entry,
-                statistics_imported_through=imported_through,
+                statistics_imported_through=effective_imported_through,
                 statistics_strategy_version=EXTERNAL_STATISTICS_STRATEGY,
                 statistics_source_fingerprint=source_fingerprint,
                 statistics_last_verified_at=(
@@ -1373,22 +1382,81 @@ def _merge_unresolved_ranges(
     now: datetime,
     accepted: list[SpGroupAcceptedBucket],
 ) -> tuple[SpGroupUnresolvedRange, ...]:
-    """Merge adapter-proven gaps and preserve their first-seen timestamp."""
-    merged: dict[tuple[str, datetime, datetime], SpGroupUnresolvedRange] = {
-        (item.cadence, item.start, item.end): item for item in existing
+    """Merge adapter-proven gaps and preserve their first-seen timestamp.
+
+    Terminal provider-lag ranges are observations of a moving request suffix.
+    Repeated polls can therefore overlap or extend the prior suffix. Keep one
+    coalesced range per cadence/reason and subtract any buckets accepted by the
+    same poll so stale prefixes cannot remain persisted.
+    """
+    terminal_ranges: list[SpGroupUnresolvedRange] = []
+    discovered_keys = {
+        (item.cadence, item.start, item.end, item.reason) for item in discovered
     }
-    for item in discovered:
-        key = (item.cadence, item.start, item.end)
-        previous = merged.get(key)
-        merged[key] = SpGroupUnresolvedRange(
-            cadence=item.cadence,
-            start=item.start,
-            end=item.end,
-            reason=item.reason,
-            first_seen_at=previous.first_seen_at if previous else now,
-            last_seen_at=now,
+    other_ranges: dict[tuple[str, datetime, datetime], SpGroupUnresolvedRange] = {
+        (item.cadence, item.start, item.end): item
+        for item in existing
+        if item.reason != "terminal_provider_lag"
+    }
+    for item in (*existing, *discovered):
+        if item.reason != "terminal_provider_lag":
+            continue
+        item_key = (item.cadence, item.start, item.end, item.reason)
+        terminal_ranges.append(
+            SpGroupUnresolvedRange(
+                cadence=item.cadence,
+                start=item.start,
+                end=item.end,
+                reason=item.reason,
+                first_seen_at=item.first_seen_at,
+                last_seen_at=(
+                    now if item_key in discovered_keys else item.last_seen_at
+                ),
+            )
         )
-    return tuple(sorted(merged.values(), key=lambda item: item.start))
+
+    coalesced: list[SpGroupUnresolvedRange] = []
+    for item in sorted(terminal_ranges, key=lambda value: (value.cadence, value.start)):
+        if (
+            coalesced
+            and coalesced[-1].cadence == item.cadence
+            and item.start <= coalesced[-1].end
+        ):
+            previous = coalesced[-1]
+            coalesced[-1] = SpGroupUnresolvedRange(
+                cadence=previous.cadence,
+                start=previous.start,
+                end=max(previous.end, item.end),
+                reason=previous.reason,
+                first_seen_at=min(previous.first_seen_at, item.first_seen_at),
+                last_seen_at=max(previous.last_seen_at, item.last_seen_at),
+            )
+        else:
+            coalesced.append(item)
+
+    accepted_spans = tuple(
+        sorted((item.start, item.end) for item in accepted)
+    )
+    result: list[SpGroupUnresolvedRange] = list(other_ranges.values())
+    for item in (*coalesced,):
+        fragments = [(item.start, item.end)]
+        for accepted_start, accepted_end in accepted_spans:
+            next_fragments: list[tuple[datetime, datetime]] = []
+            for fragment_start, fragment_end in fragments:
+                if accepted_end <= fragment_start or accepted_start >= fragment_end:
+                    next_fragments.append((fragment_start, fragment_end))
+                    continue
+                if fragment_start < accepted_start:
+                    next_fragments.append((fragment_start, accepted_start))
+                if accepted_end < fragment_end:
+                    next_fragments.append((accepted_end, fragment_end))
+            fragments = next_fragments
+        result.extend(
+            replace(item, start=start, end=end)
+            for start, end in fragments
+            if start < end
+        )
+    return tuple(sorted(result, key=lambda item: (item.start, item.end)))
 
 
 def _merge_known_unavailable_ranges(

@@ -285,6 +285,72 @@ def test_ami_month_classifier_covers_full_none_partial_and_invalid() -> None:
     )
 
 
+def test_terminal_complete_grid_with_zero_suffix_is_partial() -> None:
+    """Terminal explicit-zero placeholders do not establish full coverage."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(16))
+    rows = {
+        slot: Decimal("1") if index < 8 else Decimal("0")
+        for index, slot in enumerate(slots)
+    }
+
+    classification = classify_electricity_ami_month(
+        month,
+        rows,
+        window_start=month,
+        window_end=month + timedelta(hours=8),
+    )
+
+    assert classification.coverage == AMI_COVERAGE_PARTIAL
+
+
+def test_terminal_explicit_zero_suffix_becomes_provider_lag() -> None:
+    """Explicit terminal placeholders are withheld for normal retry."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(16))
+    rows = tuple(
+        (slot, Decimal("1") if index < 8 else Decimal("0"))
+        for index, slot in enumerate(slots)
+    )
+
+    composition = compose_electricity_history_and_ami(
+        {"elec": {"data": []}},
+        rows,
+        backfill_from=month,
+        now=month + timedelta(hours=8),
+    )
+
+    assert tuple(item.start for item in composition.observations) == slots[:8]
+    assert composition.terminal_lag_ranges == (
+        (slots[8], slots[-1] + timedelta(minutes=30)),
+    )
+    assert all(item.value > 0 for item in composition.observations)
+
+
+def test_non_terminal_explicit_zero_suffix_remains_accepted() -> None:
+    """Trailing zeros in a closed non-terminal month remain valid coverage."""
+    month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    slots = tuple(month + timedelta(minutes=30 * index) for index in range(16))
+    rows = tuple(
+        (slot, Decimal("1") if index < 8 else Decimal("0"))
+        for index, slot in enumerate(slots)
+    )
+
+    composition = compose_electricity_history_and_ami(
+        {"elec": {"data": []}},
+        rows,
+        backfill_from=month,
+        now=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+    )
+
+    assert composition.terminal_lag_ranges == ()
+    assert len(composition.observations) == 31 * 48
+    assert all(
+        item.provenance == "ami_observed_zero"
+        for item in composition.observations[8:16]
+    )
+
+
 def test_month_composer_uses_history_when_ami_is_absent() -> None:
     """A history month absent from AMI becomes one monthly bucket."""
     month = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)

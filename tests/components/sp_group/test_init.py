@@ -1114,7 +1114,7 @@ def test_schedule_statistics_backfill_blocks_manual_review_warnings(
     [
         "statistics_missing_bridge:2026-07-14T02:00:00+08:00",
         "statistics_waiting_for_native_reference",
-        "statistics_recorder_rows_pending:2026-07-14T02:00:00+08:00",
+        "statistics_recorder_rows_pending:2026-07-14T02:00:00+08:00:count=1",
     ],
 )
 async def test_schedule_statistics_backfill_allows_non_blocking_warnings(

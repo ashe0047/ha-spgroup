@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from bisect import bisect_left
 from collections import defaultdict
@@ -36,6 +37,7 @@ from .ledger import (
     WARNING_LEGACY_STATISTICS_STRATEGY_MIGRATED,
     SpGroupAcceptedBucket,
     SpGroupLedgerEntry,
+    _accepted_source_fingerprint,
 )
 from .sources import SINGAPORE_TZ, UTILITY_ELECTRIC, UTILITY_WATER
 
@@ -91,6 +93,29 @@ class StatisticsImportResult:
     importable_count: int = 0
     processed_count: int = 0
     warning_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalVerificationResult:
+    """Recorder readback classification for an external batch."""
+
+    verified: tuple[PlannedStatistic, ...] = ()
+    pending_starts: tuple[datetime, ...] = ()
+    conflict_starts: tuple[datetime, ...] = ()
+    verified_through: datetime | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedExternalRows:
+    """Validated Recorder rows keyed by their normalized start time."""
+
+    by_start: dict[datetime, dict[str, Any]]
+    duplicate_starts: frozenset[datetime]
+    malformed_starts: frozenset[datetime]
+
+
+_RECORDER_WATCHDOG_TIMEOUT = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,10 +255,28 @@ async def _async_backfill_external(
     )
     if not projected:
         if bridge_warnings:
-            await _update_statistics_metadata(
+            await _persist_external_metadata(
                 ledger_store,
                 sensor_key,
+                ledger_entry,
+                imported_through=ledger_entry.statistics_imported_through,
+                source_fingerprint=_external_source_fingerprint(ledger_entry),
                 warnings=bridge_warnings,
+                dirty_from=ledger_entry.statistics_dirty_from,
+                clear_dirty=False,
+                external_status="pending",
+            )
+        else:
+            await _persist_external_metadata(
+                ledger_store,
+                sensor_key,
+                ledger_entry,
+                imported_through=ledger_entry.statistics_imported_through,
+                source_fingerprint=_external_source_fingerprint(ledger_entry),
+                warnings=(),
+                dirty_from=None,
+                clear_dirty=True,
+                external_status="complete",
             )
         LOGGER.info(
             "SP Group external statistics skipped: utility=%s projected=0 warnings=%d",
@@ -242,7 +285,7 @@ async def _async_backfill_external(
         )
         return StatisticsImportResult(warning_count=len(bridge_warnings))
 
-    planned = _planned_statistics(ledger_entry)
+    planned = _external_planned_rows(projected)
     if not planned:
         LOGGER.info(
             "SP Group external statistics skipped: utility=%s projected=%d planned=0",
@@ -250,6 +293,34 @@ async def _async_backfill_external(
             len(projected),
         )
         return StatisticsImportResult(warning_count=len(bridge_warnings))
+
+    blocking_warnings = tuple(
+        warning
+        for warning in (*ledger_entry.warnings, *ledger_entry.statistics_warnings)
+        if warning.startswith("corrected_bucket:")
+        or warning.startswith("statistics_conflict:")
+        or warning.startswith("statistics_existing_negative_delta:")
+        or warning == "statistics_legacy_rows_need_manual_rebuild"
+    )
+    if blocking_warnings:
+        await _persist_external_metadata(
+            ledger_store,
+            sensor_key,
+            ledger_entry,
+            imported_through=ledger_entry.statistics_imported_through,
+            source_fingerprint=_external_source_fingerprint(ledger_entry),
+            warnings=blocking_warnings,
+            dirty_from=ledger_entry.statistics_dirty_from,
+            clear_dirty=False,
+            external_status="pending",
+        )
+        _create_or_clear_statistics_issues(
+            hass, entry_id, sensor_key, blocking_warnings
+        )
+        return StatisticsImportResult(
+            planned_count=len(planned),
+            warning_count=len(blocking_warnings),
+        )
 
     statistic_id = ledger_entry.external_statistic_id
     if statistic_id is None:
@@ -259,34 +330,150 @@ async def _async_backfill_external(
             ledger_entry.utility_type,
         )
         return StatisticsImportResult(warning_count=len(bridge_warnings) + 1)
-    metadata = external_metadata(statistic_id, ledger_entry.utility_type)
-    async_add_external_statistics(
+    source_fingerprint = _external_source_fingerprint(ledger_entry)
+    verification_planned = _unverified_planned_rows(planned, ledger_entry)
+    if not verification_planned:
+        await _persist_external_metadata(
+            ledger_store,
+            sensor_key,
+            ledger_entry,
+            imported_through=ledger_entry.statistics_imported_through,
+            source_fingerprint=source_fingerprint,
+            warnings=bridge_warnings,
+            dirty_from=ledger_entry.statistics_dirty_from,
+            clear_dirty=not bridge_warnings,
+            external_status="complete" if not bridge_warnings else "pending",
+        )
+        return StatisticsImportResult(
+            planned_count=len(planned),
+            processed_count=len(planned),
+            warning_count=len(bridge_warnings),
+        )
+    existing = await _read_external_statistics_with_watchdog(
         hass,
-        metadata,
-        [_statistic_data(row) for row in planned],
+        statistic_id,
+        verification_planned,
     )
+    if existing is None:
+        pending = _pending_verification(verification_planned)
+        pending_warnings = tuple(
+            dict.fromkeys((*bridge_warnings, *pending.warnings))
+        )
+        await _persist_external_metadata(
+            ledger_store,
+            sensor_key,
+            ledger_entry,
+            imported_through=ledger_entry.statistics_imported_through,
+            source_fingerprint=source_fingerprint,
+            warnings=pending_warnings,
+            dirty_from=pending.pending_starts[0]
+            if pending.pending_starts
+            else ledger_entry.statistics_dirty_from,
+            clear_dirty=False,
+            external_status="pending",
+        )
+        return StatisticsImportResult(
+            planned_count=len(planned),
+            warning_count=len(pending_warnings),
+        )
+    importable, _processed, preflight_warnings = await hass.async_add_executor_job(
+        _reconcile_external_rows,
+        verification_planned,
+        existing,
+        ledger_entry.statistics_dirty_from,
+    )
+    all_preflight_warnings = tuple(
+        dict.fromkeys((*bridge_warnings, *preflight_warnings))
+    )
+    if preflight_warnings:
+        await _persist_external_metadata(
+            ledger_store,
+            sensor_key,
+            ledger_entry,
+            imported_through=ledger_entry.statistics_imported_through,
+            source_fingerprint=source_fingerprint,
+            warnings=all_preflight_warnings,
+            dirty_from=ledger_entry.statistics_dirty_from,
+            clear_dirty=False,
+            external_status="pending",
+        )
+        _create_or_clear_statistics_issues(
+            hass, entry_id, sensor_key, all_preflight_warnings
+        )
+        return StatisticsImportResult(
+            planned_count=len(planned),
+            importable_count=0,
+            processed_count=0,
+            warning_count=len(all_preflight_warnings),
+        )
 
-    last_start = max(row.start for row in planned)
-    await _update_statistics_metadata(
+    metadata = external_metadata(statistic_id, ledger_entry.utility_type)
+    if importable:
+        async_add_external_statistics(
+            hass,
+            metadata,
+            [_statistic_data(row) for row in importable],
+        )
+    if not importable:
+        verification = await hass.async_add_executor_job(
+            _verification_from_processed,
+            verification_planned,
+            _processed,
+        )
+    else:
+        verification = await _verify_external_statistics(
+            hass,
+            statistic_id,
+            verification_planned,
+        )
+    verification_warnings = tuple(
+        dict.fromkeys((*all_preflight_warnings, *verification.warnings))
+    )
+    complete = not verification.pending_starts and not verification.conflict_starts
+    imported_through = verification.verified_through
+    if imported_through is None and complete:
+        imported_through = ledger_entry.statistics_imported_through
+    updated = await _persist_external_metadata(
         ledger_store,
         sensor_key,
-        imported_through=last_start,
-        warnings=bridge_warnings,
+        ledger_entry,
+        imported_through=imported_through,
+        source_fingerprint=source_fingerprint,
+        warnings=verification_warnings,
+        dirty_from=(
+            verification.pending_starts[0]
+            if verification.pending_starts
+            else ledger_entry.statistics_dirty_from
+        ),
+        clear_dirty=complete and not bridge_warnings,
+        external_status="complete" if complete and not bridge_warnings else "pending",
+    )
+    if not updated:
+        LOGGER.info(
+            "SP Group external statistics progress discarded: utility=%s "
+            "reason=stale_ledger",
+            ledger_entry.utility_type,
+        )
+    _create_or_clear_statistics_issues(
+        hass, entry_id, sensor_key, verification_warnings
     )
 
     LOGGER.info(
         "SP Group external statistics reconciled: utility=%s "
-        "statistic_id=%s planned=%d imported=%d",
+        "statistic_id=%s planned=%d queued=%d verified=%d pending=%d conflicts=%d",
         ledger_entry.utility_type,
         statistic_id,
         len(planned),
-        len(planned),
+        len(importable),
+        len(verification.verified),
+        len(verification.pending_starts),
+        len(verification.conflict_starts),
     )
     return StatisticsImportResult(
         planned_count=len(planned),
-        importable_count=len(planned),
-        processed_count=len(planned),
-        warning_count=len(bridge_warnings),
+        importable_count=len(importable),
+        processed_count=len(verification.verified),
+        warning_count=len(verification_warnings),
     )
 
 
@@ -1085,6 +1272,372 @@ def _half_hour_slot(value: datetime) -> int:
     return int((local - _SLOT_EPOCH).total_seconds() // _HALF_HOUR_SECONDS)
 
 
+def _external_planned_rows(
+    projected: tuple[ProjectedStatistic | Any, ...],
+) -> tuple[PlannedStatistic, ...]:
+    """Project provider periods into external consumption rows."""
+    running_sum = Decimal("0")
+    rows: list[PlannedStatistic] = []
+    for item in sorted(projected, key=lambda row: row.start):
+        delta = Decimal(str(item.delta))
+        running_sum += delta
+        rows.append(
+            PlannedStatistic(
+                start=item.start,
+                state=delta,
+                sum=running_sum,
+            )
+        )
+    return tuple(rows)
+
+
+def _external_source_fingerprint(entry: SpGroupLedgerEntry) -> str:
+    """Return the accepted-bucket fingerprint for external progress guards."""
+    return _accepted_source_fingerprint(entry)
+
+
+def _projected_before_first_gap(
+    projected: tuple[ProjectedStatistic, ...],
+    warnings: tuple[str, ...],
+) -> tuple[ProjectedStatistic, ...]:
+    """Return the safe projected prefix before a missing bridge warning."""
+    gap_warnings = tuple(
+        warning
+        for warning in warnings
+        if warning.startswith("statistics_missing_bridge:")
+    )
+    if not gap_warnings:
+        return projected
+    first_gap = gap_warnings[0].partition(":")[2]
+    try:
+        gap_start = datetime.fromisoformat(first_gap)
+    except ValueError:
+        return ()
+    return tuple(row for row in projected if row.start < gap_start)
+
+
+def _reconcile_external_rows(
+    planned: tuple[PlannedStatistic, ...],
+    existing_rows: list[dict[str, Any]],
+    dirty_from: datetime | None,
+) -> tuple[
+    tuple[PlannedStatistic, ...],
+    tuple[PlannedStatistic, ...],
+    tuple[str, ...],
+]:
+    """Classify existing rows before submitting an external batch."""
+    del dirty_from
+    indexed = _index_external_rows(existing_rows)
+    importable: list[PlannedStatistic] = []
+    processed: list[PlannedStatistic] = []
+    warnings: list[str] = []
+    for row in planned:
+        if (
+            row.start in indexed.duplicate_starts
+            or row.start in indexed.malformed_starts
+        ):
+            warnings.append(f"statistics_conflict:{row.start.isoformat()}")
+            break
+        current = indexed.by_start.get(row.start)
+        if current is None:
+            importable.append(row)
+            continue
+        if _float_equal(current.get("state"), row.state) and _float_equal(
+            current.get("sum"), row.sum
+        ):
+            processed.append(row)
+            continue
+        warnings.append(f"statistics_conflict:{row.start.isoformat()}")
+        break
+    return tuple(importable), tuple(processed), tuple(warnings)
+
+
+def _classify_external_rows(
+    planned: tuple[PlannedStatistic, ...],
+    existing_rows: list[dict[str, Any]],
+) -> ExternalVerificationResult:
+    """Classify Recorder rows against a planned external batch."""
+    indexed = _index_external_rows(existing_rows)
+    verified: list[PlannedStatistic] = []
+    pending: list[datetime] = []
+    conflicts: list[datetime] = []
+    for row in planned:
+        if (
+            row.start in indexed.duplicate_starts
+            or row.start in indexed.malformed_starts
+        ):
+            conflicts.append(row.start)
+            continue
+        current = indexed.by_start.get(row.start)
+        if current is None:
+            pending.append(row.start)
+            continue
+        if _float_equal(current.get("state"), row.state) and _float_equal(
+            current.get("sum"), row.sum
+        ):
+            verified.append(row)
+        else:
+            conflicts.append(row.start)
+    verified_through: datetime | None = None
+    if not pending and not conflicts and verified:
+        verified_through = verified[-1].start
+    else:
+        blocked = set((*pending, *conflicts))
+        for row in planned:
+            if row.start in blocked:
+                break
+            verified_through = row.start
+    warnings = tuple(
+        dict.fromkeys(
+            [
+                *_pending_warnings(tuple(pending)),
+                *(f"statistics_conflict:{start.isoformat()}" for start in conflicts),
+            ]
+        )
+    )
+    return ExternalVerificationResult(
+        verified=tuple(verified),
+        pending_starts=tuple(pending),
+        conflict_starts=tuple(conflicts),
+        verified_through=verified_through,
+        warnings=warnings,
+    )
+
+
+def _index_external_rows(existing_rows: list[dict[str, Any]]) -> _IndexedExternalRows:
+    """Index Recorder rows without silently collapsing duplicate starts."""
+    by_start: dict[datetime, dict[str, Any]] = {}
+    duplicate_starts: set[datetime] = set()
+    malformed_starts: set[datetime] = set()
+    for row in existing_rows:
+        start = _statistics_start_datetime(row.get("start"))
+        if start is None:
+            continue
+        if start in by_start:
+            duplicate_starts.add(start)
+            continue
+        by_start[start] = row
+        if not _is_finite_number(row.get("state")) or not _is_finite_number(
+            row.get("sum")
+        ):
+            malformed_starts.add(start)
+    return _IndexedExternalRows(
+        by_start=by_start,
+        duplicate_starts=frozenset(duplicate_starts),
+        malformed_starts=frozenset(malformed_starts),
+    )
+
+
+def _pending_warnings(starts: tuple[datetime, ...]) -> tuple[str, ...]:
+    """Return a compact retryable diagnostic for missing Recorder rows."""
+    if not starts:
+        return ()
+    return (
+        "statistics_recorder_rows_pending:"
+        f"{starts[0].isoformat()}:count={len(starts)}",
+    )
+
+
+async def _existing_external_statistics(
+    hass: HomeAssistant,
+    statistic_id: str,
+    planned: tuple[PlannedStatistic, ...],
+) -> list[dict[str, Any]]:
+    """Read existing rows for an external statistic on the Recorder executor."""
+    if not planned:
+        return []
+    start = min(row.start for row in planned)
+    end = max(row.start for row in planned) + timedelta(hours=1)
+    existing = await get_instance(hass).async_add_executor_job(
+        partial(
+            statistics_during_period,
+            hass,
+            start.astimezone(UTC),
+            end.astimezone(UTC),
+            {statistic_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+    )
+    rows = cast(list[dict[str, Any]], existing.get(statistic_id, []))
+    LOGGER.debug(
+        "SP Group external statistics readback query: statistic_id=%s "
+        "start=%s end=%s result_keys=%s row_count=%d",
+        statistic_id,
+        start.isoformat(),
+        end.isoformat(),
+        tuple(sorted(existing)),
+        len(rows),
+    )
+    return rows
+
+
+def _unverified_planned_rows(
+    planned: tuple[PlannedStatistic, ...],
+    entry: SpGroupLedgerEntry,
+) -> tuple[PlannedStatistic, ...]:
+    """Return the planned suffix that has not reached a verified watermark."""
+    boundary = entry.statistics_dirty_from
+    if boundary is None and entry.statistics_imported_through is not None:
+        boundary = entry.statistics_imported_through + timedelta(hours=1)
+    if boundary is None:
+        return planned
+    return tuple(row for row in planned if row.start >= boundary)
+
+
+def _verification_from_processed(
+    planned: tuple[PlannedStatistic, ...],
+    processed: tuple[PlannedStatistic, ...],
+) -> ExternalVerificationResult:
+    """Build a complete verification result from exact preflight rows."""
+    if len(processed) != len(planned):
+        raise ValueError("processed rows must cover planned rows")
+    return ExternalVerificationResult(
+        verified=processed,
+        verified_through=processed[-1].start if processed else None,
+    )
+
+
+async def _verify_external_statistics(
+    hass: HomeAssistant,
+    statistic_id: str,
+    planned: tuple[PlannedStatistic, ...],
+) -> ExternalVerificationResult:
+    """Verify a queued external batch once after the Recorder barrier."""
+    recorder = get_instance(hass)
+    barrier = asyncio.create_task(recorder.async_block_till_done())
+    barrier.add_done_callback(_consume_recorder_barrier_result)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(barrier),
+            timeout=_RECORDER_WATCHDOG_TIMEOUT,
+        )
+    except TimeoutError:
+        LOGGER.warning(
+            "SP Group external statistics verification deferred: "
+            "statistic_id=%s reason=recorder_barrier_timeout planned=%d",
+            statistic_id,
+            len(planned),
+        )
+        return _pending_verification(planned)
+    existing = await _read_external_statistics_with_watchdog(
+        hass,
+        statistic_id,
+        planned,
+    )
+    if existing is None:
+        return _pending_verification(planned)
+    result = await hass.async_add_executor_job(
+        _classify_external_rows,
+        planned,
+        existing,
+    )
+    LOGGER.debug(
+        "SP Group external statistics readback classification: "
+        "statistic_id=%s planned=%d existing=%d verified=%d pending=%d "
+        "conflicts=%d",
+        statistic_id,
+        len(planned),
+        len(existing),
+        len(result.verified),
+        len(result.pending_starts),
+        len(result.conflict_starts),
+    )
+    return result
+
+
+async def _read_external_statistics_with_watchdog(
+    hass: HomeAssistant,
+    statistic_id: str,
+    planned: tuple[PlannedStatistic, ...],
+) -> list[dict[str, Any]] | None:
+    """Read external rows with a shielded, bounded Recorder watchdog."""
+    readback = asyncio.create_task(
+        _existing_external_statistics(hass, statistic_id, planned)
+    )
+    readback.add_done_callback(_consume_external_readback_result)
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(readback),
+            timeout=_RECORDER_WATCHDOG_TIMEOUT,
+        )
+    except TimeoutError:
+        LOGGER.warning(
+            "SP Group external statistics verification deferred: "
+            "statistic_id=%s reason=recorder_readback_timeout planned=%d",
+            statistic_id,
+            len(planned),
+        )
+        return None
+
+
+def _consume_external_readback_result(
+    task: asyncio.Task[list[dict[str, Any]]],
+) -> None:
+    """Consume a detached readback result after a watchdog timeout."""
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:  # noqa: BLE001
+        LOGGER.debug(
+            "SP Group external statistics readback failed after watchdog return",
+            exc_info=True,
+        )
+
+
+def _consume_recorder_barrier_result(task: asyncio.Task[None]) -> None:
+    """Consume a detached Recorder barrier result after a watchdog timeout."""
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:  # noqa: BLE001
+        LOGGER.debug(
+            "SP Group Recorder barrier failed after watchdog return",
+            exc_info=True,
+        )
+
+
+def _pending_verification(
+    planned: tuple[PlannedStatistic, ...],
+) -> ExternalVerificationResult:
+    """Return a pending result without advancing the watermark."""
+    return ExternalVerificationResult(
+        pending_starts=tuple(row.start for row in planned),
+        warnings=_pending_warnings(tuple(row.start for row in planned)),
+    )
+
+
+async def _persist_external_metadata(
+    ledger_store: Any,
+    sensor_key: str,
+    entry: SpGroupLedgerEntry,
+    *,
+    imported_through: datetime | None,
+    source_fingerprint: str,
+    warnings: tuple[str, ...],
+    dirty_from: datetime | None,
+    clear_dirty: bool,
+    external_status: str,
+) -> bool:
+    """Persist externally verified progress conditionally."""
+    return bool(await ledger_store.async_update_external_statistics_metadata(
+        sensor_key,
+        imported_through=imported_through,
+        source_fingerprint=source_fingerprint,
+        verified_at=(
+            datetime.now(SINGAPORE_TZ) if imported_through is not None else None
+        ),
+        warnings=warnings,
+        dirty_from=dirty_from,
+        clear_dirty=clear_dirty,
+        external_status=external_status,
+        expected_epoch_id=entry.epoch_id,
+    ))
+
+
 async def _filter_conflicts(
     hass: HomeAssistant,
     entity_id: str,
@@ -1168,6 +1721,14 @@ def _statistic_data(row: PlannedStatistic) -> StatisticData:
 def _float_equal(value: object, expected: Decimal) -> bool:
     try:
         return abs(Decimal(str(value)) - expected) < Decimal("0.000001")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_finite_number(value: object) -> bool:
+    """Return whether a Recorder numeric field is finite and parseable."""
+    try:
+        return Decimal(str(value)).is_finite()
     except Exception:  # noqa: BLE001
         return False
 

@@ -79,17 +79,20 @@ For the terminal month:
 - the leading unavailable prefix is represented as known-unavailable coverage;
 - middle gaps are accepted as zero-valued gap buckets;
 - a trailing gap remains a provider-lag range and is retried by normal
-  polling from the last accepted bucket end.
+  polling from the last accepted bucket end. This includes explicit zero
+  placeholder rows after the last positive completed AMI bucket; those rows
+  must not be persisted as consumption.
 
-An explicit zero-valued provider row after AMI coverage begins and an inferred
-middle/trailing gap treated as zero have the same statistical effect, but use
-different provenance. Leading zero rows are unavailable and are not persisted
-as consumption buckets:
+An explicit zero-valued provider row before or between positive AMI buckets and
+an inferred middle gap treated as zero have the same statistical effect, but
+use different provenance. Explicit or omitted terminal trailing placeholders
+are provider lag, not consumption. Leading zero rows are unavailable and are
+not persisted as consumption buckets:
 
 | Provenance | Meaning |
 | --- | --- |
 | `ami_observed` | Positive AMI consumption observed from the provider. |
-| `ami_observed_zero` | Explicit zero-valued AMI bucket returned after positive AMI coverage begins. |
+| `ami_observed_zero` | Explicit zero-valued AMI bucket returned between positive AMI buckets. |
 | `ami_gap_zero` | Missing AMI interval treated as zero within an AMI month. |
 | `no_source_gap_zero` | Missing interval treated as zero because neither source supplied data. |
 | `history_allocated` | Synthetic leading-prefix allocation from a History remainder. |
@@ -206,6 +209,11 @@ proven source coverage and allow the cursor to advance.
 - Existing persisted ledgers created before these provenance and range states
   require the explicit rebuild flow. No automatic migration or silent rewrite
   is permitted.
+- If an existing development ledger has already imported statistics from an
+  incorrect decision, rebuilding the ledger alone is insufficient because the
+  external Recorder series is immutable through normal reconciliation. The
+  development instance must explicitly reset that external series (or use a
+  fresh Recorder database) before running the corrected backfill.
 - The rebuild is also required for any persisted electricity ledger containing
   pre-decision `missing_internal_bucket` or hybrid-month unresolved ranges;
   those ranges must never be silently reinterpreted as terminal lag.
@@ -216,8 +224,9 @@ The historical composer classifies each requested closed calendar month using th
 expected 30-minute grid and row presence:
 
 - `full_ami`: every expected slot is represented and usable positive AMI
-  coverage exists; explicit internal zero rows after coverage begins remain
-  part of the full grid;
+  coverage exists through the final completed slot; explicit internal zero
+  rows before or between positive coverage remain part of the full grid. A
+  terminal trailing explicit-zero suffix is not full coverage.
 - `no_ami`: no usable positive AMI coverage exists, including zero-only,
   leading-zero-only, sparse, or placeholder-only rows;
 - `partial_ami`: usable positive AMI evidence exists but a leading unavailable

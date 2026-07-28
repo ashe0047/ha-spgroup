@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from custom_components.sp_group.external_statistics import (
     EXTERNAL_STATISTICS_STRATEGY,
 )
@@ -25,10 +26,21 @@ from custom_components.sp_group.statistics_backfill import (
     _projected_before_first_gap,
     _projected_statistics_with_warnings,
     _reconcile_external_rows,
+    _unverified_planned_rows,
+    _verify_external_statistics,
     async_backfill_statistics,
 )
-from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN
+from homeassistant.components.recorder import (
+    DOMAIN as RECORDER_DOMAIN,
+)
+from homeassistant.components.recorder import (
+    get_instance,
+)
+from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.const import EVENT_RECORDER_HOURLY_STATISTICS_GENERATED
 from homeassistant.core import HomeAssistant
+
+from .test_recorder_statistics import _recorder_job, _setup_recorder
 
 
 def test_external_projection_is_positive_and_provider_period_based() -> None:
@@ -69,7 +81,7 @@ def test_external_readback_missing_rows_are_pending_and_do_not_cross_gap() -> No
     assert result.pending_starts == (planned[0].start,)
     assert result.conflict_starts == ()
     assert result.warnings == (
-        "statistics_recorder_rows_pending:2026-07-01T00:00:00+08:00",
+        "statistics_recorder_rows_pending:2026-07-01T00:00:00+08:00:count=1",
     )
 
 
@@ -106,6 +118,32 @@ def test_external_readback_verified_prefix_stops_at_pending_row() -> None:
     assert result.pending_starts == (planned[1].start,)
 
 
+def test_external_readback_compacts_pending_warning() -> None:
+    """Many missing rows produce one bounded retry diagnostic."""
+    planned = tuple(
+        _row(f"2026-07-01T0{hour}:00:00+08:00", "1", str(hour + 1))
+        for hour in range(3)
+    )
+
+    result = _classify_external_rows(planned, [])
+
+    assert result.warnings == (
+        "statistics_recorder_rows_pending:2026-07-01T00:00:00+08:00:count=3",
+    )
+
+
+def test_external_retry_suffix_uses_dirty_boundary() -> None:
+    """Retries plan only the suffix at and after the dirty boundary."""
+    planned = tuple(
+        _row(f"2026-07-01T0{hour}:00:00+08:00", "1", str(hour + 1))
+        for hour in range(3)
+    )
+    entry = _entry("sp_group:test_suffix_water_consumption", (), utility_type="water")
+    entry = replace(entry, statistics_dirty_from=planned[1].start)
+
+    assert _unverified_planned_rows(planned, entry) == planned[1:]
+
+
 async def test_ledger_external_metadata_preserves_pending_state(
     hass: HomeAssistant,
     tmp_path: Any,
@@ -128,7 +166,9 @@ async def test_ledger_external_metadata_preserves_pending_state(
         imported_through=None,
         source_fingerprint=_external_source_fingerprint(entry),
         verified_at=None,
-        warnings=(f"statistics_recorder_rows_pending:{pending_from.isoformat()}",),
+        warnings=(
+            f"statistics_recorder_rows_pending:{pending_from.isoformat()}:count=1",
+        ),
         dirty_from=pending_from,
         clear_dirty=False,
         external_status="pending",
@@ -142,9 +182,18 @@ async def test_ledger_external_metadata_preserves_pending_state(
     assert persisted.statistics_imported_through is None
     assert persisted.statistics_last_verified_at is None
 
+    reloaded = SpGroupLedgerStore(hass, "pending-metadata")
+    await reloaded.async_load()
+    restored = reloaded.snapshot.entries[entry.sensor_key]
+    assert restored.external_migration_status == "pending"
+    assert restored.statistics_dirty_from == pending_from
+    assert restored.statistics_warnings == (
+        f"statistics_recorder_rows_pending:{pending_from.isoformat()}:count=1",
+    )
 
-def test_external_reconciliation_allows_only_dirty_suffix_rewrites() -> None:
-    """Unexpected old rows conflict, while accepted late data rewrites its suffix."""
+
+def test_external_reconciliation_rejects_dirty_suffix_conflicts() -> None:
+    """A dirty boundary never authorizes overwriting a visible Recorder row."""
     planned = (
         _row("2026-07-01T00:00:00+08:00", "1", "1"),
         _row("2026-07-01T01:00:00+08:00", "2", "3"),
@@ -166,9 +215,58 @@ def test_external_reconciliation_allows_only_dirty_suffix_rewrites() -> None:
         existing,
         planned[0].start,
     )
-    assert warnings == ()
-    assert importable == (planned[0],)
-    assert processed == (planned[1],)
+    assert warnings == ("statistics_conflict:2026-07-01T00:00:00+08:00",)
+    assert importable == ()
+    assert processed == ()
+
+
+def test_external_readback_duplicate_start_is_a_conflict() -> None:
+    """Duplicate Recorder starts are never silently collapsed."""
+    planned = (_row("2026-07-01T00:00:00+08:00", "1", "1"),)
+
+    result = _classify_external_rows(
+        planned,
+        [
+            {"start": planned[0].start, "state": 1.0, "sum": 1.0},
+            {"start": planned[0].start, "state": 1.0, "sum": 1.0},
+        ],
+    )
+
+    assert result.conflict_starts == (planned[0].start,)
+    assert result.pending_starts == ()
+    assert result.warnings == (
+        "statistics_conflict:2026-07-01T00:00:00+08:00",
+    )
+
+
+def test_external_readback_malformed_values_are_a_conflict() -> None:
+    """Malformed values at a planned start cannot be treated as verified."""
+    planned = (_row("2026-07-01T00:00:00+08:00", "1", "1"),)
+
+    for value in (None, "not-a-number", "NaN", "Infinity"):
+        result = _classify_external_rows(
+            planned,
+            [{"start": planned[0].start, "state": value, "sum": 1.0}],
+        )
+        assert result.conflict_starts == (planned[0].start,)
+        assert result.pending_starts == ()
+
+
+def test_external_reconciliation_duplicate_start_is_not_importable() -> None:
+    """Preflight duplicates are rejected before any writer call."""
+    planned = (_row("2026-07-01T00:00:00+08:00", "1", "1"),)
+    importable, processed, warnings = _reconcile_external_rows(
+        planned,
+        [
+            {"start": planned[0].start, "state": 1.0, "sum": 1.0},
+            {"start": planned[0].start, "state": 1.0, "sum": 1.0},
+        ],
+        None,
+    )
+
+    assert importable == ()
+    assert processed == ()
+    assert warnings == ("statistics_conflict:2026-07-01T00:00:00+08:00",)
 
 
 async def test_external_statistics_import_uses_public_recorder_api(
@@ -222,10 +320,6 @@ async def test_external_statistics_import_uses_public_recorder_api(
             return_value=recorder,
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             side_effect=query,
         ),
@@ -251,6 +345,71 @@ async def test_external_statistics_import_uses_public_recorder_api(
     )
 
 
+async def test_external_retry_queries_only_unverified_suffix(
+    hass: HomeAssistant,
+) -> None:
+    """A retry bounds the Recorder query to rows after its watermark."""
+    hass.config.components.add(RECORDER_DOMAIN)
+    statistic_id = "sp_group:test_suffix_query_water_consumption"
+    first_start = datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ)
+    second_start = datetime(2026, 8, 31, 23, tzinfo=SINGAPORE_TZ)
+    entry = replace(
+        _entry(
+            statistic_id,
+            (
+                _bucket(
+                    "2026-07-01T00:00:00+08:00",
+                    "2026-08-01T00:00:00+08:00",
+                    "1",
+                ),
+                _bucket(
+                    "2026-08-01T00:00:00+08:00",
+                    "2026-09-01T00:00:00+08:00",
+                    "2",
+                ),
+            ),
+            utility_type="water",
+        ),
+        statistics_imported_through=first_start,
+        statistics_dirty_from=None,
+    )
+    store = _Store(entry)
+    query_bounds: list[tuple[datetime, datetime]] = []
+
+    def query(*args: Any, **_kwargs: Any) -> dict[str, list[dict[str, Any]]]:
+        query_bounds.append((args[1], args[2]))
+        return {
+            statistic_id: [
+                {"start": second_start, "state": 2.0, "sum": 3.0},
+            ]
+        }
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            side_effect=query,
+        ) as query_mock,
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+        ) as add_mock,
+    ):
+        result = await async_backfill_statistics(hass, _entry_with_store(store))
+
+    assert result.warning_count == 0
+    assert query_mock.call_count == 1
+    assert query_bounds == [
+        (
+            second_start.astimezone(UTC),
+            (second_start + timedelta(hours=1)).astimezone(UTC),
+        )
+    ]
+    add_mock.assert_not_called()
+
+
 async def test_external_statistics_delayed_readback_does_not_create_conflict(
     hass: HomeAssistant,
 ) -> None:
@@ -271,6 +430,7 @@ async def test_external_statistics_delayed_readback_does_not_create_conflict(
     store = _Store(entry)
     recorder_rows: list[dict[str, Any]] = []
     query_count = 0
+    visible = False
 
     def add_external(
         _hass: HomeAssistant,
@@ -284,7 +444,7 @@ async def test_external_statistics_delayed_readback_does_not_create_conflict(
         query_count += 1
         # Initial reconciliation and the first post-import read-back race with
         # Recorder visibility. The next read sees the committed rows.
-        if query_count <= 2:
+        if not visible:
             return {statistic_id: []}
         return {statistic_id: list(recorder_rows)}
 
@@ -294,10 +454,6 @@ async def test_external_statistics_delayed_readback_does_not_create_conflict(
             return_value=_Recorder(),
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             side_effect=query,
         ),
@@ -305,24 +461,182 @@ async def test_external_statistics_delayed_readback_does_not_create_conflict(
             "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
             side_effect=add_external,
         ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_BACKOFF",
-            (0.0,),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_TIMEOUT",
-            0.1,
-        ),
     ):
         result = await async_backfill_statistics(hass, _entry_with_store(store))
 
-    assert query_count >= 3
+    assert query_count == 2
+    assert result.warning_count == 1
+    assert store.entry.external_migration_status == "pending"
+    visible = True
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            side_effect=query,
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+        ) as add_mock,
+    ):
+        result = await async_backfill_statistics(hass, _entry_with_store(store))
+
     assert result.warning_count == 0
+    assert add_mock.call_count == 0
     assert store.entry.statistics_warnings == ()
     assert store.entry.external_migration_status == "complete"
     assert store.entry.statistics_imported_through == datetime(
         2026, 7, 31, 23, tzinfo=SINGAPORE_TZ
     )
+
+
+async def test_external_statistics_retry_is_provider_free(
+    hass: HomeAssistant,
+) -> None:
+    """Statistics-only retries reconcile persisted rows without provider calls."""
+    from custom_components.sp_group.backfill import async_run_statistics_backfill
+
+    hass.config.components.add(RECORDER_DOMAIN)
+    statistic_id = "sp_group:test_provider_free_retry_water"
+    bucket = _bucket(
+        "2026-07-01T00:00:00+08:00",
+        "2026-08-01T00:00:00+08:00",
+        "2",
+    )
+    entry = replace(
+        _entry(statistic_id, (bucket,), utility_type="water"),
+        statistics_dirty_from=datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ),
+        statistics_warnings=(
+            "statistics_recorder_rows_pending:2026-07-31T23:00:00+08:00:count=1",
+        ),
+        external_migration_status="pending",
+    )
+    store = _Store(entry)
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            return_value={
+                statistic_id: [
+                    {
+                        "start": datetime(
+                            2026, 7, 31, 23, tzinfo=SINGAPORE_TZ
+                        ),
+                        "state": 2.0,
+                        "sum": 2.0,
+                    },
+                ]
+            },
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+        ) as add_mock,
+    ):
+        await async_run_statistics_backfill(
+            hass,
+            _entry_with_store(store),
+            trigger="recorder",
+        )
+
+    add_mock.assert_not_called()
+    assert store.entry.external_migration_status == "complete"
+    assert store.entry.statistics_dirty_from is None
+
+
+async def test_external_statistics_recorder_event_runs_real_retry(
+    hass: HomeAssistant,
+) -> None:
+    """The Recorder event executes a real provider-free external retry."""
+    from custom_components.sp_group import _async_register_statistics_retry_listener
+
+    hass.config.components.add(RECORDER_DOMAIN)
+    statistic_id = "sp_group:test_event_retry_water"
+    pending_start = datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ)
+    entry = replace(
+        _entry(
+            statistic_id,
+            (
+                _bucket(
+                    "2026-07-01T00:00:00+08:00",
+                    "2026-08-01T00:00:00+08:00",
+                    "2",
+                ),
+            ),
+            utility_type="water",
+        ),
+        source_backfill_attempted_at=pending_start,
+        statistics_dirty_from=pending_start,
+        statistics_warnings=(
+            "statistics_recorder_rows_pending:2026-07-31T23:00:00+08:00:count=1",
+        ),
+        external_migration_status="pending",
+    )
+    store = _Store(entry)
+    runtime_entry = _entry_with_store(store)
+    runtime_entry.async_on_unload = lambda _callback: None
+    delayed: list[Any] = []
+    tasks: list[Any] = []
+
+    def schedule_retry(
+        hass_arg: HomeAssistant,
+        entry_arg: Any,
+        **_kwargs: Any,
+    ) -> object:
+        from custom_components.sp_group.backfill import async_run_statistics_backfill
+
+        task = hass_arg.async_create_task(
+            async_run_statistics_backfill(hass_arg, entry_arg, trigger="recorder")
+        )
+        tasks.append(task)
+        return object()
+
+    with (
+        patch(
+            "custom_components.sp_group.async_call_later",
+            side_effect=lambda _hass, _delay, action: delayed.append(action)
+            or (lambda: None),
+        ),
+        patch(
+            "custom_components.sp_group.async_schedule_statistics_backfill",
+            side_effect=schedule_retry,
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            return_value={
+                statistic_id: [
+                    {
+                        "start": pending_start,
+                        "state": 2.0,
+                        "sum": 2.0,
+                    }
+                ]
+            },
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+        ) as add_mock,
+    ):
+        _async_register_statistics_retry_listener(hass, runtime_entry)
+        hass.bus.async_fire(EVENT_RECORDER_HOURLY_STATISTICS_GENERATED)
+        await hass.async_block_till_done()
+        assert len(delayed) == 1
+        delayed[0](None)
+        await hass.async_block_till_done()
+
+    assert len(tasks) == 1
+    assert store.entry.external_migration_status == "complete"
+    assert store.entry.statistics_dirty_from is None
+    add_mock.assert_not_called()
 
 
 async def test_external_statistics_readback_timeout_is_retryable(
@@ -350,10 +664,6 @@ async def test_external_statistics_readback_timeout_is_retryable(
             return_value=_Recorder(),
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             return_value={statistic_id: []},
         ),
@@ -363,20 +673,12 @@ async def test_external_statistics_readback_timeout_is_retryable(
         patch(
             "custom_components.sp_group.statistics_backfill.ir.async_create_issue",
         ) as create_issue,
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_BACKOFF",
-            (0.0,),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_TIMEOUT",
-            0.01,
-        ),
     ):
         result = await async_backfill_statistics(hass, _entry_with_store(store))
 
     assert result.warning_count == 1
     assert store.entry.statistics_warnings == (
-        "statistics_recorder_rows_pending:2026-07-31T23:00:00+08:00",
+        "statistics_recorder_rows_pending:2026-07-31T23:00:00+08:00:count=1",
     )
     assert store.entry.statistics_imported_through is None
     assert store.entry.external_migration_status == "pending"
@@ -384,6 +686,325 @@ async def test_external_statistics_readback_timeout_is_retryable(
         2026, 7, 31, 23, tzinfo=SINGAPORE_TZ
     )
     create_issue.assert_not_called()
+
+
+async def test_external_statistics_initial_preflight_timeout_is_retryable(
+    hass: HomeAssistant,
+) -> None:
+    """A stalled initial Recorder query does not queue or advance state."""
+    import asyncio
+
+    hass.config.components.add(RECORDER_DOMAIN)
+    statistic_id = "sp_group:test_initial_readback_timeout_water"
+    entry = _entry(
+        statistic_id,
+        (
+            _bucket(
+                "2026-07-01T00:00:00+08:00",
+                "2026-08-01T00:00:00+08:00",
+                "2",
+            ),
+        ),
+        utility_type="water",
+    )
+    store = _Store(entry)
+    release = asyncio.Event()
+
+    async def stalled_readback(*_args: Any) -> list[dict[str, Any]]:
+        await release.wait()
+        return []
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill._existing_external_statistics",
+            side_effect=stalled_readback,
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+        ) as add_mock,
+        patch(
+            "custom_components.sp_group.statistics_backfill._RECORDER_WATCHDOG_TIMEOUT",
+            0.01,
+        ),
+    ):
+        result = await async_backfill_statistics(hass, _entry_with_store(store))
+
+    assert result.warning_count == 1
+    assert store.entry.external_migration_status == "pending"
+    assert store.entry.statistics_imported_through is None
+    add_mock.assert_not_called()
+    release.set()
+    await asyncio.sleep(0)
+
+
+async def test_external_statistics_recorder_watchdog_does_not_requeue(
+    hass: HomeAssistant,
+) -> None:
+    """A stalled Recorder barrier leaves pending state after one queue call."""
+    import asyncio
+
+    hass.config.components.add(RECORDER_DOMAIN)
+    statistic_id = "sp_group:test_watchdog_water_consumption"
+    entry = _entry(
+        statistic_id,
+        (
+            _bucket(
+                "2026-07-01T00:00:00+08:00",
+                "2026-08-01T00:00:00+08:00",
+                "2",
+            ),
+        ),
+        utility_type="water",
+    )
+    store = _Store(entry)
+
+    class _SlowRecorder(_Recorder):
+        async def async_block_till_done(self) -> None:
+            await asyncio.sleep(1)
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_SlowRecorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            return_value={statistic_id: []},
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+        ) as add_mock,
+        patch(
+            "custom_components.sp_group.statistics_backfill._RECORDER_WATCHDOG_TIMEOUT",
+            0.01,
+        ),
+    ):
+        result = await async_backfill_statistics(hass, _entry_with_store(store))
+        await asyncio.sleep(1.05)
+
+    assert result.warning_count == 1
+    add_mock.assert_called_once()
+    assert store.entry.external_migration_status == "pending"
+    assert store.entry.statistics_imported_through is None
+
+
+async def test_external_readback_watchdog_returns_pending_without_requeue(
+    hass: HomeAssistant,
+) -> None:
+    """A stalled readback is pending and does not advance verification."""
+    import asyncio
+
+    planned = (_row("2026-07-01T00:00:00+08:00", "1", "1"),)
+    release = asyncio.Event()
+
+    async def stalled_readback(*_args: Any) -> list[dict[str, Any]]:
+        await release.wait()
+        return []
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill._existing_external_statistics",
+            side_effect=stalled_readback,
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill._RECORDER_WATCHDOG_TIMEOUT",
+            0.01,
+        ),
+    ):
+        result = await _verify_external_statistics(
+            hass,
+            "sp_group:test_readback_watchdog",
+            planned,
+        )
+
+    assert result.pending_starts == (planned[0].start,)
+    assert result.verified_through is None
+    release.set()
+    await asyncio.sleep(0)
+
+
+async def test_external_barrier_exception_does_not_look_verified(
+    hass: HomeAssistant,
+) -> None:
+    """Recorder barrier failures propagate instead of advancing metadata."""
+    planned = (_row("2026-07-01T00:00:00+08:00", "1", "1"),)
+
+    class _FailingRecorder(_Recorder):
+        async def async_block_till_done(self) -> None:
+            raise RuntimeError("recorder failure")
+
+    with patch(
+        "custom_components.sp_group.statistics_backfill.get_instance",
+        return_value=_FailingRecorder(),
+    ):
+        with pytest.raises(RuntimeError, match="recorder failure"):
+            await _verify_external_statistics(
+                hass,
+                "sp_group:test_barrier_failure",
+                planned,
+            )
+
+
+async def test_external_readback_exception_does_not_look_verified(
+    hass: HomeAssistant,
+) -> None:
+    """Recorder query failures propagate instead of advancing metadata."""
+    planned = (_row("2026-07-01T00:00:00+08:00", "1", "1"),)
+
+    async def failing_readback(*_args: Any) -> list[dict[str, Any]]:
+        raise RuntimeError("readback failure")
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill._existing_external_statistics",
+            side_effect=failing_readback,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="readback failure"):
+            await _verify_external_statistics(
+                hass,
+                "sp_group:test_readback_failure",
+                planned,
+            )
+
+
+async def test_external_writer_exception_preserves_ledger_state(
+    hass: HomeAssistant,
+) -> None:
+    """A writer failure does not persist a partial external watermark."""
+    hass.config.components.add(RECORDER_DOMAIN)
+    statistic_id = "sp_group:test_writer_failure_water_consumption"
+    entry = _entry(
+        statistic_id,
+        (
+            _bucket(
+                "2026-07-01T00:00:00+08:00",
+                "2026-08-01T00:00:00+08:00",
+                "2",
+            ),
+        ),
+        utility_type="water",
+    )
+    store = _Store(entry)
+    before = store.entry
+
+    with (
+        patch(
+            "custom_components.sp_group.statistics_backfill.get_instance",
+            return_value=_Recorder(),
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.statistics_during_period",
+            return_value={statistic_id: []},
+        ),
+        patch(
+            "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
+            side_effect=RuntimeError("writer failure"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="writer failure"):
+            await async_backfill_statistics(hass, _entry_with_store(store))
+
+    assert store.entry == before
+
+
+async def test_external_statistics_large_batch_eventual_recorder_visibility(
+    hass: HomeAssistant,
+    tmp_path: Any,
+) -> None:
+    """A multi-thousand-row batch converges without duplicate writes."""
+    await _setup_recorder(hass, tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    buckets = tuple(
+        _bucket(
+            (start + timedelta(minutes=30 * index)).isoformat(),
+            (start + timedelta(minutes=30 * (index + 1))).isoformat(),
+            "0.1",
+        )
+        for index in range(6000)
+    )
+    entry = _entry(
+        "sp_group:test_large_electric_consumption",
+        buckets,
+        utility_type="electric",
+    )
+    store = _Store(entry)
+
+    first = await async_backfill_statistics(hass, _entry_with_store(store))
+    await hass.async_block_till_done()
+    await get_instance(hass).async_block_till_done()
+    second = await async_backfill_statistics(hass, _entry_with_store(store))
+    await hass.async_block_till_done()
+    await get_instance(hass).async_block_till_done()
+
+    assert first.warning_count in (0, 1)
+    assert second.warning_count == 0
+    assert store.entry.external_migration_status == "complete"
+    assert store.entry.statistics_imported_through is not None
+    rows = await _recorder_job(
+        hass,
+        statistics_during_period,
+        hass,
+        start,
+        start + timedelta(minutes=30 * 6000),
+        {entry.external_statistic_id},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    assert len(rows[entry.external_statistic_id]) == 3000
+
+
+async def test_external_statistics_water_month_end_recorder_rows(
+    hass: HomeAssistant,
+    tmp_path: Any,
+) -> None:
+    """Month-end water rows use the same verified external path."""
+    await _setup_recorder(hass, tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=SINGAPORE_TZ)
+    entry = _entry(
+        "sp_group:test_water_month_end_external",
+        (
+            _bucket("2026-01-01T00:00:00+08:00", "2026-02-01T00:00:00+08:00", "2"),
+            _bucket("2026-02-01T00:00:00+08:00", "2026-03-01T00:00:00+08:00", "3"),
+        ),
+        utility_type="water",
+    )
+    store = _Store(entry)
+
+    first = await async_backfill_statistics(hass, _entry_with_store(store))
+    await hass.async_block_till_done()
+    await get_instance(hass).async_block_till_done()
+
+    rows = await _recorder_job(
+        hass,
+        statistics_during_period,
+        hass,
+        start,
+        datetime(2026, 4, 1, tzinfo=SINGAPORE_TZ),
+        {entry.external_statistic_id},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    visible = rows[entry.external_statistic_id]
+    assert first.warning_count == 0
+    assert [(row["state"], row["sum"]) for row in visible] == [
+        (2.0, 2.0),
+        (3.0, 5.0),
+    ]
 
 
 async def test_external_statistics_visible_mismatch_creates_conflict_repair(
@@ -427,10 +1048,6 @@ async def test_external_statistics_visible_mismatch_creates_conflict_repair(
             return_value=_Recorder(),
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             side_effect=query,
         ),
@@ -471,6 +1088,7 @@ async def test_external_statistics_retry_clears_pending_after_rows_appear(
     )
     store = _Store(entry)
     visible = False
+    query_count = 0
     recorder_rows = [
         {
             "start": datetime(2026, 7, 31, 23, tzinfo=SINGAPORE_TZ),
@@ -480,6 +1098,8 @@ async def test_external_statistics_retry_clears_pending_after_rows_appear(
     ]
 
     def query(*_args: Any, **_kwargs: Any) -> dict[str, list[dict[str, Any]]]:
+        nonlocal query_count
+        query_count += 1
         return {statistic_id: list(recorder_rows) if visible else []}
 
     with (
@@ -488,24 +1108,12 @@ async def test_external_statistics_retry_clears_pending_after_rows_appear(
             return_value=_Recorder(),
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             side_effect=query,
         ),
         patch(
             "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
         ) as add_mock,
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_BACKOFF",
-            (0.0,),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_TIMEOUT",
-            0.01,
-        ),
     ):
         first = await async_backfill_statistics(hass, _entry_with_store(store))
         assert first.warning_count == 1
@@ -519,6 +1127,7 @@ async def test_external_statistics_retry_clears_pending_after_rows_appear(
         2026, 7, 31, 23, tzinfo=SINGAPORE_TZ
     )
     assert add_mock.call_count == 1
+    assert query_count == 3
 
 
 async def test_external_statistics_waits_at_first_missing_bridge(
@@ -798,20 +1407,8 @@ async def test_external_readback_partial_acknowledgement_retryable(
             side_effect=add_external,
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             side_effect=query,
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_BACKOFF",
-            (0.0,),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_TIMEOUT",
-            0.1,
         ),
     ):
         result = await async_backfill_statistics(hass, _entry_with_store(store))
@@ -850,20 +1447,8 @@ async def test_external_readback_partial_acknowledgement_retryable(
             return_value=_Recorder(),
         ),
         patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
-        ),
-        patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
             side_effect=query,
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_BACKOFF",
-            (0.0,),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill._RECORDER_VERIFY_TIMEOUT",
-            0.1,
         ),
         patch(
             "custom_components.sp_group.statistics_backfill.async_add_external_statistics",
@@ -897,10 +1482,6 @@ async def test_external_readback_partial_ack_out_of_order(
         patch(
             "custom_components.sp_group.statistics_backfill.get_instance",
             return_value=_Recorder(),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
         ),
         patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
@@ -951,10 +1532,6 @@ async def test_external_readback_first_row_conflict_with_partial_ack(
         patch(
             "custom_components.sp_group.statistics_backfill.get_instance",
             return_value=_Recorder(),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
         ),
         patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
@@ -1034,10 +1611,6 @@ async def test_external_poll_completes_during_import_metadata_update_rejected(
         patch(
             "custom_components.sp_group.statistics_backfill.get_instance",
             return_value=_Recorder(),
-        ),
-        patch(
-            "custom_components.sp_group.statistics_backfill.get_metadata",
-            return_value={},
         ),
         patch(
             "custom_components.sp_group.statistics_backfill.statistics_during_period",
