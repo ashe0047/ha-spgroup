@@ -1,5 +1,14 @@
 # Statistics Backfill Full Coverage Hardening Plan
 
+## Status
+
+Needs implementation audit — several coverage tests exist, but the remaining
+acceptance cases must be checked before marking this plan implemented.
+
+## Authority
+
+Implementation plan; active statistics behavior is governed by `adr/adr-provider-owned-external-statistics.md`.
+
 ## Summary
 
 The current statistics backfill tests are not complete enough for the core

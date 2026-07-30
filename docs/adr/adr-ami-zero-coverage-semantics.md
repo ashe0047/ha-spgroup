@@ -2,7 +2,23 @@
 
 ## Status
 
-Locked — 2026-07-22
+Superseded by the positional rules in
+[`adr-electricity-gap-and-no-data-semantics.md`](adr-electricity-gap-and-no-data-semantics.md)
+— retained as historical rationale.
+
+## Authority
+
+Historical only. The electricity gap ADR is authoritative for current AMI zero semantics.
+
+## Current implementation amendment — 2026-07-30
+
+The current electricity ADR and implementation are authoritative. Internal
+explicit zero rows between positive AMI buckets are accepted as
+`ami_observed_zero`; omitted middle intervals are accepted as `ami_gap_zero`.
+Leading zero/omitted prefixes are unavailable, and only the terminal trailing
+suffix in the clipped polling window is provider lag. Zero-only historical
+months have no usable AMI coverage and may select History. Normal polling is
+AMI-only and treats trailing placeholders as terminal lag.
 
 ## Context
 
@@ -45,11 +61,14 @@ the current time:
    - They are not observations for the current poll and must be excluded until
      the period is closed and provider data is available.
 
-4. **Any zero row after AMI coverage begins**
-   - Means that the provider has not supplied usable data for that period yet,
-     including an isolated zero between populated rows.
-   - It is not accepted as a real zero-usage bucket unless a future provider
-     contract explicitly introduces a separate coverage signal.
+4. **Internal zero rows after AMI coverage begins**
+   - An explicit zero between positive AMI buckets is accepted as
+     `ami_observed_zero`.
+   - An omitted interval between positive buckets is accepted as
+     `ami_gap_zero`.
+   - Only a trailing suffix in the terminal clipped polling window is treated
+     as provider lag; non-terminal trailing gaps follow the historical
+     zero-gap rules.
 
 The source freshness model remains variable and provider-dependent. There is
 no fixed delay that converts a zero into valid data. A zero suffix is resolved
@@ -71,6 +90,7 @@ source-coverage signal for that bucket.
 
 ## Scope
 
-This ADR defines the meaning of AMI zero rows. It does not yet implement the
-parser, cursor, source-freshness metadata, or historical hybrid-backfill
-changes required to enforce the decision.
+This ADR is retained as the historical zero-semantics decision. The executable
+contract is maintained in `adr-electricity-gap-and-no-data-semantics.md`,
+which covers parser, cursor, provenance, source-failure, and hybrid-backfill
+behavior.

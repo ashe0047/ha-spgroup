@@ -1,5 +1,17 @@
 # Provider-Owned External Statistics Refactor Plan
 
+## Status
+
+Superseded — implemented in the current provider-owned external statistics
+path. The design and migration notes below are retained as historical
+planning context. Current code uses `async_add_external_statistics()`, the
+shared colon-form statistic ID, exact Recorder reconciliation, monotonic
+watermarks, and event-driven pending retries.
+
+## Authority
+
+Historical implementation plan; current behavior is governed by the provider-owned statistics ADR.
+
 ## Summary
 
 Move SP Group's authoritative historical electricity and water statistics from

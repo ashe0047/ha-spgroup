@@ -1,5 +1,16 @@
 # External Statistics Recorder Read-Back Fix Plan
 
+## Status
+
+Implemented and superseded by the event-driven reconciliation implementation.
+The historical plan below records the original bounded-readback design; the
+current path uses exact preflight, one queue attempt, one post-queue readback,
+watchdog-bounded pending state, and Recorder-event retry without sleep loops.
+
+## Authority
+
+Historical implementation plan; current external reconciliation is governed by `adr/adr-provider-owned-external-statistics.md`.
+
 ## Summary
 
 Fix the false `statistics_conflict:*` warnings produced when SP Group queues
@@ -11,7 +22,7 @@ the existing statistics-only retry path.
 The fix has two inseparable parts:
 
 1. classify Recorder read-back outcomes as `verified`, `pending`, or
-   `conflict`, with bounded retry for pending visibility;
+   `conflict`, with event-driven retry for pending visibility;
 2. persist the watermark and completion state only after the expected rows are
    verified.
 
@@ -97,7 +108,7 @@ Keep the existing `_reconcile_external_rows()` contract focused on deciding
 which rows to submit. Add a separate pure read-back classifier instead of
 overloading reconciliation with Recorder timing behavior.
 
-### 2. Add bounded Recorder read-back helper
+### 2. Add state-based Recorder read-back helper
 
 Add an async helper that:
 
@@ -107,12 +118,14 @@ Add an async helper that:
    timeout;
 3. reads the affected range through `_existing_external_statistics()`;
 4. classifies the result;
-5. retries only pending visibility with short non-blocking backoff;
-6. returns the final verification result without raising a conflict for missing
+5. performs one exact suffix readback after the Recorder barrier;
+6. leaves missing visibility pending for the Recorder-generated statistics
+   event; it does not sleep or requeue within the same attempt;
+7. returns the final verification result without raising a conflict for missing
    rows.
 
-Use one centralized deadline/backoff configuration so tests can shorten it.
-The retry must run on HA's event loop only for orchestration and sleep; all
+The barrier and readback are wrapped in a shielded watchdog. A watchdog
+timeout is a pending result and does not cancel the underlying Recorder task.
 Recorder reads remain on `async_add_executor_job`.
 
 Do not requeue the same batch during read-back retries. Recorder import is
@@ -176,9 +189,9 @@ Do not change:
 
 ### Async external importer tests
 
-- Recorder query returns empty once, then exact rows: bounded retry succeeds,
-  clears warnings, and advances the watermark;
-- Recorder rows remain absent through the deadline: pending warning is stored,
+- Recorder query returns empty once, then exact rows become visible on the
+  Recorder-event retry: the pending warning clears and the watermark advances;
+- Recorder rows remain absent after the watchdog-bounded attempt: pending warning is stored,
   no conflict Repair is created, and status remains incomplete;
 - Recorder returns visible mismatched values: conflict Repair is created and
   progress does not pass the mismatch;

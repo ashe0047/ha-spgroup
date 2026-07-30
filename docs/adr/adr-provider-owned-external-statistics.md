@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-22
 
+## Authority
+
+Normative and canonical for provider-owned statistic identity, ownership, projection, reconciliation, and retry.
+
+## Implementation
+
+`custom_components/sp_group/external_statistics.py`, `statistics_backfill.py`, and Recorder/statistics tests.
+
 ## Context
 
 SP Group's provider does not guarantee that a poll returns only the most recent
@@ -24,9 +32,11 @@ accepts many older buckets, HA's native sensor compiler sees one large state
 transition at the poll time and cannot infer the timestamps of the individual
 provider buckets.
 
-The current statistics importer writes to the entity statistic ID using
-`async_import_statistics()` and uses `source=recorder`. This makes the
-imported series share ownership with HA's native sensor statistics compiler.
+The former statistics importer wrote to the entity statistic ID using
+`async_import_statistics()` and `source=recorder`. The active importer owns a
+separate external series through `async_add_external_statistics()` with
+`source=sp_group`, so it does not share ownership with HA's native sensor
+statistics compiler.
 The native-reference and native-offset logic in
 `custom_components/sp_group/statistics_backfill.py` exists to connect those two
 writers, but it creates unnecessary ordering, reference, conflict, and

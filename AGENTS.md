@@ -53,8 +53,8 @@ instructions.
 This repo is set up for HACS distribution as a custom integration. Two docs
 define the alignment and conventions:
 
-- `docs/hacs-integration-checklist.md` — HACS alignment requirements
-- `docs/repo-conventions.md` — Repo naming, domain, versioning, and GitHub
+- `docs/guides/hacs-integration-checklist.md` — HACS alignment requirements
+- `docs/guides/repo-conventions.md` — Repo naming, domain, versioning, and GitHub
   conventions
 
 ## Agent-Specific Instructions

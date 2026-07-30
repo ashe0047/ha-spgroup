@@ -1,6 +1,15 @@
 # Phase A: HA Startup Blocking During Discovery
 
-## Status: Proposed Refactor
+## Status: Historical investigation — implemented/superseded where noted
+
+The statistics-writer details later in this document describe the former
+native `async_import_statistics()` path. New provider-owned imports use
+`async_add_external_statistics()` and the dedicated external statistic ID;
+the legacy details are retained only for historical context.
+
+## Authority
+
+Historical investigation; current setup behavior is governed by the coordinator and config-flow ADRs.
 
 ## Problem
 

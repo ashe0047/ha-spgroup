@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for session storage, refresh, authentication failure, and reauth behavior.
+
+## Implementation
+
+`custom_components/sp_group/auth.py`, `__init__.py`, and config-flow/session tests.
+
 ## Context
 
 The SP Group integration authenticates with the SP Group mobile API through

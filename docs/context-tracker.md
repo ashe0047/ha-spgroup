@@ -170,7 +170,7 @@
 
 ## 2026-07-13 21:52:24 +08 - Testing Guidelines Documented
 
-- Added `docs/testing-guidelines.md` as the canonical testing approach for the Python SDK and Home Assistant custom integration.
+- Added `docs/guides/testing.md` as the canonical testing approach for the Python SDK and Home Assistant custom integration.
 - The guideline captures:
   - Home Assistant docs grounding for integration test structure, config-flow coverage, public HA interface testing, and custom-component fixture support.
   - Current scaffold checks and their limits.
@@ -996,7 +996,7 @@
   measurement-unit allowlisting, redaction of unit/address identifiers, APK
   chart contract checks, cumulative-read contract checks, and HA parser behavior
   against live-shaped chart fixtures.
-- Updated `docs/api/live-e2e.md` and `docs/ha-integration-roadmap.md` to make
+- Updated `docs/api/live-e2e.md` and `docs/guides/ha-integration-roadmap.md` to make
   the readiness gates explicit.
 - Verification passed:
   - `python -m pytest packages/spgroup/tests/e2e -vv -rs` returned 10 passed,
@@ -1044,7 +1044,7 @@
   totals, dedupe buckets across refreshes/restarts, and keep source switching
   explicit and continuity-checked.
 - Added design reference:
-  `docs/manual-seed-ami-accumulation-design.md`.
+  `docs/guides/manual-seed-ami-accumulation-design.md`.
 
 ## 2026-07-15 00:00:56 +0800 - Water Monthly Bucket Source Decision
 
@@ -1081,7 +1081,7 @@
 - Continue investigating those API candidates opportunistically, especially
   Skalbox meter-reading history and Jarvis latest-reading fields, but the first
   full-utility implementation path is manual seed plus bucket ledger.
-- Updated `docs/manual-seed-ami-accumulation-design.md` with the explicit Track
+- Updated `docs/guides/manual-seed-ami-accumulation-design.md` with the explicit Track
   2 closure decision and candidate future API cumulative source names.
 
 ## 2026-07-15 00:19:12 +0800 - Manual Seed Ledger Design Tightened
@@ -1465,7 +1465,7 @@
 
 ## 2026-07-15 19:05:31 +08:00 - Closed Discovery Correlation Issue Doc
 
-- Added `docs/issues/ha-config-flow-jarvis-contestable-correlation.md` to
+- Added `docs/issues/issue-ha-config-flow-jarvis-contestable-correlation.md` to
   document the frontend setup failure after OTP, the live Jarvis/Yggdrasil
   shape mismatch, the implemented contestable-details correlation fix, and the
   verification results.
@@ -1548,11 +1548,11 @@
     creation path as real auth;
   - pre-creating `.storage/core.config_entries` is not preferred for testing the
     setup wizard because it skips too much of the post-auth config flow.
-- Added `docs/dev-guidelines.md` with guardrails and operational notes.
+- Added `docs/guides/development.md` with guardrails and operational notes.
 
 ## 2026-07-15 22:09:42 +08:00 - Expanded Development Guidelines
 
-- Expanded `docs/dev-guidelines.md` from the cached-session concept into the
+- Expanded `docs/guides/development.md` from the cached-session concept into the
   complete local development operator guide.
 - Covered:
   - `mise` Python/tool setup;
@@ -1760,7 +1760,7 @@ The AMI 30-min data for that month is discarded. This keeps implementation simpl
 avoids artificial synthetic data, and treats June consistently with the 11 pre-AMI
 months.
 
-**ADR:** `docs/adr-hybrid-backfill-partial-month.md`
+**ADR:** `docs/adr/adr-hybrid-backfill-partial-month.md`
 
 **Locked by:** User after evaluating Approach A (monthly), B (pro-rata), D (gap bucket).
 ## 2026-07-17 - Production Readiness Evaluation
@@ -1772,7 +1772,7 @@ months.
 - Full findings captured in conversation thread for action planning.
 ## 2026-07-17 - Production Readiness Checklist Created
 
-- Created `docs/issues/production-readiness-checklist.md` with ~40 checklist items
+- Created `docs/issues/issue-production-readiness-checklist.md` with ~40 checklist items
   across 8 categories: Critical, Security, HA Quality Scale (Bronze/Silver/Gold/Platinum),
   Code Quality, Test Coverage, Distribution, Missing Features, Monitoring, Documentation.
 - All items are checkbox-formatted for tracking.
@@ -2452,7 +2452,7 @@ synthetic baseline row.
   statistics/dashboard semantics, and one focused on code execution-path
   coverage. Both independently identified the electricity baseline-visible gap
   and recommended a coverage matrix rather than scenario-only tests.
-- Added `docs/plans/statistics-backfill-full-coverage-hardening.md` with the
+- Added `docs/plans/plan-statistics-backfill-full-coverage-hardening.md` with the
   corrected oracle, required red tests for electricity and water, cross-utility
   paths, force-mode parity, real Recorder-backed regressions, and a final gate
   requiring every matrix row to be tested or explicitly marked unreachable.
@@ -2861,7 +2861,7 @@ Current-code grounding:
   silently mutated.
 
 ADR added: `docs/adr/adr-provider-owned-external-statistics.md`.
-Implementation plan added: `docs/plans/provider-owned-external-statistics.md`.
+Implementation plan added: `docs/plans/plan-provider-owned-external-statistics.md`.
 Legacy entity-backed rows remain immutable; migration rebuilds a new external
 series from accepted ledger buckets and provides explicit dashboard migration
 guidance.
@@ -3038,7 +3038,7 @@ claiming the full refactor is already absent or complete.
 
 ### 2026-07-22 19:33 +08 - HA Store Startup Fix Implemented And Reviewed
 
-Implemented the missing restart path from `docs/plans/auth-store-refactor.md`.
+Implemented the missing restart path from `docs/plans/plan-auth-store-refactor.md`.
 `async_setup_entry()` now uses a Store-first loader, attaches the loaded Store
 to runtime data, migrates a legacy `entry.data` session when no Store payload
 exists, and falls back to legacy entry data when the Store payload is invalid
@@ -3125,7 +3125,7 @@ native-offset checkpoint and its documented migration plan.
 
 ### 2026-07-22 20:05 +08 - Provider-Owned Statistics Implementation Started
 
-Started implementing `docs/plans/provider-owned-external-statistics.md` as a
+Started implementing `docs/plans/plan-provider-owned-external-statistics.md` as a
 separate strategy boundary. New ledger entries now receive deterministic
 `sp_group:<sensor_key>_consumption` statistic IDs, an identity fingerprint, the
 `external_provider_v3` strategy, and a dirty-from marker. Existing entries are
@@ -3267,7 +3267,7 @@ itself, proof that the full source history was imported.
 
 ### 2026-07-22 20:50 +08 - External Read-Back Fix Planning
 
-Created `docs/plans/statistics-recorder-readback-fix.md` for the false external
+Created `docs/plans/plan-statistics-recorder-readback-fix.md` for the false external
 statistics conflict. The plan separates pure row classification from Recorder
 orchestration, classifying visible value mismatches as conflicts and absent rows
 as bounded, retryable pending visibility. It retains
@@ -3283,7 +3283,7 @@ implemented or adversarially reviewed in this turn.
 ### 2026-07-22 21:08 +08 - External Read-Back Fix Implemented
 
 Implemented the read-back fix from
-`docs/plans/statistics-recorder-readback-fix.md`. The external statistics
+`docs/plans/plan-statistics-recorder-readback-fix.md`. The external statistics
 importer now classifies Recorder rows as exact, pending, or conflicting and
 retries pending visibility for a bounded five-second deadline without
 requeueing the import batch. Missing rows persist bounded
@@ -3454,7 +3454,7 @@ gate is still required to prevent setup from consuming the gap.
 ## 2026-07-22 23:35 +08 - Source Timeline Recovery and Water Parity Issue Documented
 
 - Grounding confirmed the existing design intent already requires water to use the same seed-plus-delta architecture as electricity with monthly buckets, but the current water coordinator does not share electricity's derived cursor or unresolved-gap behavior.
-- Documented the proposed fix in `docs/issues/source-timeline-recovery-and-water-parity.md`.
+- Documented the proposed fix in `docs/issues/issue-source-timeline-recovery-and-water-parity.md`.
 - The proposal adds a cadence-aware common source timeline, persisted unresolved gaps, ADR-compliant AMI zero handling, all-month water gap scanning, lifecycle-safe retries, and explicit provider-owned correction remediation.
 - No production implementation changes were made for this issue.
 ## 2026-07-22 23:57 +0800 - Cadence-aware recovery implementation
@@ -3586,7 +3586,7 @@ cohesive, uncommitted fix:
   seed-boundary electricity hour when both half-hour sides are contiguous.
 - `tests/components/sp_group/test_statistics_backfill_electricity_invariants.py`
   adds the regression coverage for the continuous boundary chain.
-- `docs/issues/statistics-seed-boundary-hour-gap.md` records the issue, root
+- `docs/issues/issue-statistics-seed-boundary-hour-gap.md` records the issue, root
   cause, impact, and proposed behavior.
 
 Validation: the focused invariant suite passes (`4 passed`) and `git diff
@@ -4437,7 +4437,7 @@ blocked by the pre-existing `_classify_external_rows` collection error.
 - Medium-priority cleanup issue: 11 config-flow tests are permanently skipped. Nine use `Fixed timestamp does not match current floor`, and two use `30-minute boundary validation removed confirmation step`. These should be either rewritten with deterministic time/freezing and current contracts or removed with the obsolete scenarios; leaving them in the normal suite makes the test inventory falsely appear complete.
 - Medium-priority normalization issue: 26 tests/classes still use explicit `@pytest.mark.asyncio` even though the project has `asyncio_mode = "auto"`, while most async tests do not. Standardize on the configured mode unless a documented exception is required.
 - Medium-priority fixture issue: shared support is uneven. `helpers.py` contains only the mobile-session builder, while fake clients, Recorder fakes, entity assertions, payload builders, privacy assertions, and entry factories remain embedded in test modules. Consolidate only genuinely cross-cutting helpers into named support modules; keep behavior-specific builders local.
-- Documentation drift: `docs/testing-guidelines.md` still describes the HA harness as a future foundation and calls the current suite a scaffold, although the harness, shared `conftest.py`, `MockConfigEntry`, live marker, Recorder coverage, privacy tests, and runtime tests are present. Refresh the document after cleanup so it describes the actual test contract.
+- Documentation drift: `docs/guides/testing.md` still describes the HA harness as a future foundation and calls the current suite a scaffold, although the harness, shared `conftest.py`, `MockConfigEntry`, live marker, Recorder coverage, privacy tests, and runtime tests are present. Refresh the document after cleanup so it describes the actual test contract.
 - Configuration consistency note: runtime is pinned to Python 3.14.2 while Ruff targets `py313`; this is not currently failing, but the target should be aligned or explicitly documented as intentional.
 - No non-Python fixture files exist under the test tree. This is not inherently wrong, but repeated API-shape payloads are currently code builders/imported from test modules rather than a clearly organized redacted fixture corpus, so fixture extraction should be considered where payload reuse or provenance matters.
 
@@ -4455,8 +4455,33 @@ blocked by the pre-existing `_classify_external_rows` collection error.
 - Several issue/plan documents are historical but still presented as proposed or pending, including the retry-robustness issue, phase-A setup issue, Recorder readback plan, and production checklist entries. These should be marked superseded/implemented rather than silently rewritten unless their intended archival role is clarified.
 - No conflicting document was edited during this audit; authority and archival treatment require confirmation before stale-document updates.
 
+## 2026-07-30 — Documentation alignment completed
+
+- Confirmed implementation is the source of truth for the requested conflicts.
+- Updated the AMI-zero, hybrid-backfill, coordinator, polling-window, sensor-platform, seed-statistics, provider-owned-statistics, and two-sighting ADRs with current semantics or explicit historical amendments.
+- Updated testing guidance, Energy Dashboard direction, roadmap, and the statistics interaction reference for provider no-op failures, the established HA test harness, and provider-owned external statistics.
+- Marked the historical retry/readback/setup issue and plan documents as implemented/superseded while preserving their investigation evidence; corrected their current-status statements where they claimed the work was unimplemented.
+
 ## 2026-07-30 — Commit planning for provider-failure boundary
 
 - Current uncommitted scope is limited to utility provider-failure no-op handling, typed source-backfill failure propagation, the electricity ADR amendment, entity/backfill/coordinator regression tests, and this tracker entry.
 - The broader documentation audit identified unrelated conflicting ADRs and historical plans; those are intentionally excluded from this commit until their authority/archival treatment is confirmed.
 - Proposed commit boundary: one atomic change because the runtime behavior, backfill orchestration, ADR contract, and regression tests are mutually dependent.
+
+## 2026-07-30 — Final documentation cleanup
+
+- Updated `adr-water-polling.md` to use the shared provider-owned statistic ID `sp_group:<stable_sensor_key>_consumption` with `source=sp_group`.
+- Marked `plans/plan-provider-owned-external-statistics.md` superseded by the implemented external statistics path.
+- Reconciled the remaining Recorder readback plan and false-conflict issue text with the event-driven watchdog/readback/retry behavior, removing claims of same-attempt sleep/backoff loops.
+
+## 2026-07-30 — Documentation governance implementation
+
+- Added `docs/README.md` with the complete 45-file inventory, canonical authority map, lifecycle classifications, maintained-guidance index, and documentation maintenance rules.
+- Added consistent `Authority` metadata to ADRs, plans, and issue records; unresolved auth/session and seed-boundary documents remain explicitly marked `Needs implementation audit`.
+- Added `scripts/check_docs.py` and the `mise docs:check` task for lifecycle-heading and local-link validation without third-party dependencies.
+- Verification: documentation validation passed for all 45 Markdown files; Ruff passed for the checker; `git diff --check` passed; SP Group tests passed (`385 passed, 12 skipped`); existing lint and HA compile checks passed.
+
+## 2026-07-30 — Documentation structure assessment
+
+- Recommended preserving `docs/adr/` as the normative decision set, adding a top-level documentation index and explicit status/authority metadata, and separating active operational/reference guidance from historical issues and superseded plans.
+- Remaining structural drift includes plans without lifecycle status, issue records without explicit resolution status, and ADRs that retain large historical amendments inline. A staged reorganization is safer than moving files immediately because many documents are cross-linked from the context tracker and each other.

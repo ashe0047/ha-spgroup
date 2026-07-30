@@ -2,8 +2,14 @@
 
 ## Status
 
-Root cause identified; fix implemented and test-verified. A live HA restart was
-not performed in this turn.
+Root cause identified; fix implemented and test-verified. The current fix uses
+event-driven exact reconciliation: one queue attempt, one post-queue readback,
+watchdog-bounded pending state, and Recorder-event retry without time-based
+sleep loops. A live HA restart was not performed in the original investigation.
+
+## Authority
+
+Implemented issue record; current behavior is governed by the provider-owned statistics ADR.
 
 ## Problem
 
@@ -68,13 +74,13 @@ retryable state.
 
 ## Proposed Fix
 
-### 1. Add bounded Recorder read-back retry
+### 1. Use event-driven Recorder read-back verification
 
 After queuing an external statistics batch, retain the existing Recorder
-acknowledgement wait, then query the expected rows repeatedly through
-`statistics_during_period()` on the Recorder executor for a short bounded
-deadline. Use a small backoff and keep the retry count/deadline configurable in
-tests.
+acknowledgement wait under a shielded watchdog, then query the expected suffix
+once through `statistics_during_period()` on the Recorder executor. Missing
+rows remain pending for the existing Recorder-event statistics retry. The same
+batch is not requeued during readback.
 
 ### 2. Separate pending rows from conflicts
 
@@ -110,8 +116,8 @@ complete the watermark without refetching provider history.
 
 - Recorder rows become visible after the first read-back attempt: no conflict
   warning or Repair is created, and the watermark advances.
-- Rows remain temporarily invisible: bounded retry occurs and the result is a
-  retryable pending warning, not a conflict.
+- Rows remain temporarily invisible: a retryable pending warning is persisted;
+  no sleep/backoff loop or second queue submission occurs in the same attempt.
 - A visible row with a mismatched `state` or `sum` still creates the conflict
   warning/Repair and does not advance progress past the conflict.
 - A later statistics-only retry observes exact existing rows, clears pending
@@ -133,7 +139,8 @@ acknowledgement boundary and the persisted progress state.
 
 Implemented in the external statistics path:
 
-- Recorder read-back now retries pending visibility for a bounded deadline;
+- Recorder read-back performs one watchdog-bounded verification attempt;
+- pending visibility is retried by the Recorder-event statistics scheduler;
 - missing rows produce retryable pending warnings rather than conflicts;
 - visible mismatches still create the conflict Repair;
 - the watermark advances only through the verified contiguous prefix;

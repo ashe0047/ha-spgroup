@@ -1,6 +1,13 @@
 # Auth Refresh Triggers Infinite Entry Reload Cycle
 
-## Status: Root Cause Identified, Fix Pending
+## Status
+
+Needs implementation audit — verify the remaining `async_update_entry` session
+persistence path before classifying this issue as resolved.
+
+## Authority
+
+Historical investigation; runtime auth behavior is governed by `adr/adr-auth-session-management.md`.
 
 ## Problem
 

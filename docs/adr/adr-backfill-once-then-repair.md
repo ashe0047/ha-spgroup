@@ -4,6 +4,14 @@
 
 Locked — 2026-07-17
 
+## Authority
+
+Normative for source-history backfill lifecycle and repair/retry handling.
+
+## Implementation
+
+`custom_components/sp_group/backfill.py`, `__init__.py`, and backfill lifecycle tests.
+
 ## Context
 
 The initial historical backfill is a one-time data import that fetches years of

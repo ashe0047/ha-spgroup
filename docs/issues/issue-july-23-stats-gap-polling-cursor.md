@@ -1,5 +1,13 @@
 # July 23 Statistics Gap: 04:00-13:00 SGT
 
+## Status
+
+Historical incident — resolved by exact cursor semantics; retained for evidence.
+
+## Authority
+
+Informational only; current cursor behavior is governed by `adr/adr-polling-window-exact-end.md`.
+
 ## Summary
 
 A 9-hour gap exists in electricity statistics on July 23, 2026 (04:00-13:00 SGT). The root cause is the old `max(seed_observation_time, accepted_end)` cursor code which set the polling window start to 12:30PM instead of 04:00AM. Although the API returns the full day's 48 data rows regardless of the polling window, the downstream parser filter `start >= backfill_from` discarded observations before 12:30PM. By the time the cursor code was fixed, the cursor had already advanced past the gap, making it unrecoverable by normal polling.

@@ -4,6 +4,10 @@
 
 Closed on 2026-07-15.
 
+## Authority
+
+Historical incident record; config-flow behavior is governed by `adr/adr-config-flow-wizard.md`.
+
 ## Observation
 
 During Home Assistant frontend setup, the SP Group config flow could complete

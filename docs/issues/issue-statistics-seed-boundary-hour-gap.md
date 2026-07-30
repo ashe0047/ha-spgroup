@@ -1,5 +1,14 @@
 # Seed-Boundary Hour Gap in External Statistics
 
+## Status
+
+Needs implementation audit — verify the current Recorder projection and seed
+boundary tests before classifying the reported gap as resolved or active.
+
+## Authority
+
+Informational issue record; active statistics behavior is governed by `adr/adr-provider-owned-external-statistics.md`.
+
 ## Issue
 
 The external statistics table has a permanent 60-minute gap in the hourly

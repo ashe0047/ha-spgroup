@@ -19,9 +19,9 @@ Use these Home Assistant docs as the governing references:
 - Home Assistant integration testing docs:
   `https://developers.home-assistant.io/docs/development_testing/`
 - Project testing guideline:
-  `docs/testing-guidelines.md`
+  `docs/guides/testing.md`
 
-## Current Scaffold Status
+## Current Implementation Status
 
 The current `sp_group` sensor scaffold is not Energy Dashboard-ready yet.
 
@@ -129,7 +129,10 @@ The Home Assistant integration should fetch SP data through a coordinator:
 - Do not issue API requests directly from sensor properties.
 - Start with a conservative update interval, such as six hours, until live API
   behavior proves a better cadence.
-- Treat temporary network/API failures as coordinator update failures.
+- Treat utility transport/API failures as successful no-op polls that preserve
+  the last trusted sensor value and create no ledger/statistics rows. Treat
+  malformed data, persistence failures, and processing errors as
+  `UpdateFailed`; authentication failures trigger reauthentication.
 - Treat expired or revoked credentials as Home Assistant reauth triggers.
 
 The SDK should own Auth0/Jarvis request details. The HA integration should own
@@ -180,7 +183,7 @@ must prove:
 - The entity registry has a stable unique ID.
 - Placeholder/no-data states do not publish misleading numeric values.
 
-See `docs/testing-guidelines.md` for the broader HA custom-integration test
+See `docs/guides/testing.md` for the broader HA custom-integration test
 harness.
 
 ## Non-Goals For The First Energy Pass

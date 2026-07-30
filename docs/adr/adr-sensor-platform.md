@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for sensor entity identity, availability, state, device class, and sensor-to-ledger behavior.
+
+## Implementation
+
+`custom_components/sp_group/sensor.py` and sensor/entity tests.
+
 ## Context
 
 The SP Group integration exposes utility consumption as HA sensor entities.
@@ -85,8 +93,9 @@ to the full state.
 
 Sensor entities track the cumulative meter reading (`seed + post-seed
 consumption`). Historical time-series data for the Energy Dashboard is
-stored in external statistics via `async_import_statistics()` using a
-separate statistic ID (`sp_group.<sensor_key>_consumption`). These are
+stored in provider-owned external statistics via
+`async_add_external_statistics()` using a separate colon-form statistic ID
+(`sp_group:<stable_sensor_key>_consumption`) with `source=sp_group`. These are
 not tied to the sensor entity — they have their own metadata and lifecycle.
 
 ## Consequences

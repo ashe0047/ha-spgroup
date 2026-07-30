@@ -1,5 +1,13 @@
 # Auth0 Session Timeout — Unverified Deduction
 
+## Status
+
+Historical, unverified observation; not a runtime contract.
+
+## Authority
+
+Informational only. Confirm behavior against the auth ADR and provider SDK before acting on it.
+
 ## Observation
 
 When logged into the SP Group web portal (`services.spservices.sg`) via a regular

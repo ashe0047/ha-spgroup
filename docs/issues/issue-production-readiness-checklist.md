@@ -5,6 +5,14 @@
 Checklist of identified gaps between the current SP Group HA integration and
 production-readiness.  Items are ordered by severity within each category.
 
+## Status
+
+Active checklist — individual items are authoritative only until verified against the current implementation.
+
+## Authority
+
+Maintained operational checklist; normative behavior remains in the ADRs.
+
 ---
 
 ## Critical
@@ -136,9 +144,10 @@ production-readiness.  Items are ordered by severity within each category.
 - [ ] **Review bare `except Exception` blocks** -- 11 instances across the
   codebase.  Narrow exception scope where possible.
 
-- [ ] **Add retry strategy for transient SP API failures** -- Utility
-  coordinators raise `UpdateFailed` on any error.  Add configurable retry
-  with backoff for 5xx and timeout errors.
+- [x] **Utility provider-failure boundary** -- Transport/API outages are
+  successful no-op polls that preserve the last trusted sensor value; source
+  backfill records them as failed/retryable. Malformed/data-integrity failures
+  still use `UpdateFailed` and authentication failures trigger reauth.
 
 - [ ] **Deduplicate `strings.json` vs `translations/en.json`** -- Both files
   contain the same translation payload.  Remove or minimize `strings.json`.

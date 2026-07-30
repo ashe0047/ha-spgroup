@@ -1,5 +1,15 @@
 # Repository Conventions
 
+## Documentation filenames
+
+Use lowercase kebab-case. The containing directory supplies the document type;
+ADR files retain the `adr-` prefix, while issue and plan files use explicit
+`issue-` and `plan-` prefixes. Maintained guidance belongs under `docs/guides/`,
+provider/HA material under `docs/references/`, and runtime test guidance under
+`docs/testing/`. Preserve `docs/README.md` and the append-only
+`docs/context-tracker.md` names. Any rename must update all local and historical
+links in the same change.
+
 This document defines conventions for Home Assistant custom integration
 repositories in this workspace. These are community-driven conventions based
 on established HA custom integration projects — neither HACS nor Home

@@ -6,6 +6,10 @@ Implemented for the cadence-aware recovery scope on 2026-07-22. Accepted-bucket
 correction remediation remains intentionally deferred and is still an explicit
 Repair/rebuild workflow.
 
+## Authority
+
+Implemented issue record; current cursor and lifecycle behavior is governed by the ledger and polling ADRs.
+
 ## Summary
 
 The implementation now persists a cadence-aware recovery record for both
@@ -84,7 +88,7 @@ for provider-owned statistics projection at the represented month's final hour.
 
 The design requires water to use the same seed-plus-delta architecture as
 electricity with a larger bucket interval. See
-[manual seed accumulation design](../manual-seed-ami-accumulation-design.md)
+[manual seed accumulation design](../guides/manual-seed-ami-accumulation-design.md)
 and [provider-owned external statistics ADR](../adr/adr-provider-owned-external-statistics.md).
 
 ## Implemented Design

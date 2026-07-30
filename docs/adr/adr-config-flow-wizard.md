@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for setup, options, seed, retry, and reauthentication flows.
+
+## Implementation
+
+`custom_components/sp_group/config_flow.py`, strings/translations, and config-flow tests.
+
 ## Context
 
 The SP Group config flow (`config_flow.py`, 1627 lines) guides the user

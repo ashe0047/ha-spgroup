@@ -74,6 +74,10 @@ run = "python scripts/ha_dev_ami_latest.py"
 description = "Run Python lint and type checks"
 run = "python -m ruff check custom_components tests && python -m mypy -p custom_components.sp_group"
 
+[tasks."docs:check"]
+description = "Validate documentation lifecycle headings and local links"
+run = "python scripts/check_docs.py"
+
 [tasks."ha:check"]
 description = "Run lightweight Home Assistant scaffold checks"
 run = "python -m compileall custom_components/sp_group tests"

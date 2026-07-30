@@ -31,7 +31,7 @@ Home Assistant references:
 - Existing project energy direction:
   `docs/references/ha-energy-dashboard-direction.md`
 - Existing project testing guidelines:
-  `docs/testing-guidelines.md`
+  `docs/guides/testing.md`
 
 SDK surfaces available for the integration:
 
@@ -212,7 +212,9 @@ real entity values.
   only needs to be loaded before the first refresh.
 - Map unrecoverable auth failures to `ConfigEntryAuthFailed` so Home Assistant
   starts reauth.
-- Map transient SDK/API/network failures to `UpdateFailed`.
+- Map utility transport/API/network outages to successful no-op poll results
+  with no ledger mutation; map malformed/data-integrity failures to
+  `UpdateFailed`, and expired credentials to `ConfigEntryAuthFailed`.
 - Use bounded API timeouts during refresh.
 - Preserve last known good coordinator data across transient refresh failures.
 - Keep the update interval conservative, starting from the existing six-hour
@@ -459,7 +461,7 @@ production use:
    read-only SDK endpoints pass opt-in production E2E checks, with optional
    `401`/`403` account-surface gaps documented as expected xfails.
 2. **Payload-shape ready:** live responses match the APK DTO contracts recorded
-   in `docs/ha-payload-contracts.md`, or mismatches are documented before
+   in `docs/guides/ha-payload-contracts.md`, or mismatches are documented before
    changing parser assumptions.
 3. **HA runtime-ready:** config-entry setup, refresh, coordinator polling,
    diagnostics, logs, and dynamic sensor creation remain privacy-preserving and
@@ -474,7 +476,7 @@ production use:
 Current status update as of 2026-07-15: history and AMI/PPMS chart payloads
 remain non-publishable period/chart evidence by themselves. The first numeric
 dashboard-ready source is now the HA-owned `manual_seed_plus_bucket_deltas`
-ledger described in `docs/manual-seed-ami-accumulation-design.md`: a user seed is
+ledger described in `docs/guides/manual-seed-ami-accumulation-design.md`: a user seed is
 the initial trusted cumulative total, and accepted electricity AMI or water
 monthly buckets advance that total only after ledger safety rules pass.
 `fetch_account_meters` plus `fetch_meter_readings` remains a future raw SP

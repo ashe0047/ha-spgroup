@@ -35,10 +35,12 @@ Use these Home Assistant references as the baseline for testing decisions:
   target `2026.7.2`. The workaround is safe — the test framework provides
   fixtures that work with newer HA versions.
 
-## Current Scaffold Checks
+## Current Harness Checks
 
-The current scaffold has lightweight checks that prove imports, basic SDK shape,
-manifest fields, and placeholder config-flow helper behavior.
+The maintained harness exercises config flow, coordinators, sensors, ledgers,
+statistics, Recorder reconciliation, and provider-failure availability
+through Home Assistant fixtures. The focused SP Group suite is the primary
+verification gate.
 
 Run them with:
 
@@ -87,7 +89,10 @@ The minimum test set should be:
   - Sensor platform forwarding is requested.
   - Unload removes runtime state and unloads platforms cleanly.
   - Auth failures map to Home Assistant reauth behavior.
-  - Temporary API failures map to setup retry or coordinator update failures.
+  - Utility transport/API failures are successful no-op polls that preserve
+    the last trusted value; discovery/authentication failures retain their
+    setup/reauth paths, and malformed/data-integrity failures map to
+    `UpdateFailed`.
 - `test_sensor.py`
   - Sensors are created through the HA setup path.
   - State is asserted through `hass.states`.
@@ -165,7 +170,7 @@ Use `python`, not `python3`, on this machine.
 
 ## Locked Direction
 
-The testing foundation should be upgraded before implementing Energy Dashboard
-metadata. The next useful change is to wire
-`pytest-homeassistant-custom-component` into the project and convert the scaffold
-tests so they exercise the custom integration through Home Assistant itself.
+The Home Assistant test harness is established. New behavior should be tested
+through public HA setup, entity, Recorder, and statistics interfaces where
+possible, with pure tests reserved for deterministic parser/composer and
+reconciliation contracts.

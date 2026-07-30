@@ -2,7 +2,16 @@
 
 ## Status
 
-Locked — revised 2026-07-26
+Accepted — implemented; superseded where it says History must be `Actual`
+only by `adr-electricity-gap-and-no-data-semantics.md`.
+
+## Authority
+
+Normative for partial-month AMI/History composition, constrained by the electricity gap ADR.
+
+## Implementation
+
+`custom_components/sp_group/electricity.py` and pure composer/coordinator tests.
 
 ## Amendment History
 
@@ -51,8 +60,8 @@ whenever it has usable coverage.**
 | AMI evidence for a closed month | History evidence | Selected result |
 | --- | --- | --- |
 | Full AMI coverage | Present or absent | Use AMI only; do not add or reconcile a history bucket. |
-| No usable AMI coverage | Valid `Actual` history total | Use history only as one `history_monthly` bucket. AMI absence includes no AMI rows or only zero/placeholder rows; a complete zero AMI grid is not required. |
-| Partial AMI coverage | Valid `Actual` history total | Retain AMI and backfill only its missing leading prefix from the calculated history remainder, as specified below. |
+| No usable AMI coverage | Valid `Actual` or `Estimated` history total | Use history only as one `history_monthly` bucket. AMI absence includes no AMI rows or only zero/placeholder rows; a complete zero AMI grid is not required. |
+| Partial AMI coverage | Valid `Actual` or `Estimated` history total | Retain AMI and backfill only its missing leading prefix from the calculated history remainder, as specified below. |
 | Partial AMI coverage | Missing or invalid history total | Accept AMI-only and represent permitted gaps as explicit zero buckets; terminal trailing provider lag is the only unresolved state. |
 
 AMI is therefore authoritative whenever it has observed monthly coverage. The
@@ -65,7 +74,7 @@ For a validated partial month:
 
 1. Fetch and normalize both AMI and history evidence for the same direct
    Jarvis premise mapping.
-2. Validate that the history row is closed, `Actual`, in a supported unit, and
+2. Validate that the history row is closed, `Actual` or `Estimated`, in a supported unit, and
    exposes a provider-validated full-month total.
 3. Validate that AMI rows are structurally usable and place any omitted
    intervals on the expected 30-minute grid as leading, middle, or trailing

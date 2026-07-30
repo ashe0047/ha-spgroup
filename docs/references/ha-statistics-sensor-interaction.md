@@ -1,5 +1,14 @@
 # Complete Data Flow: Sensor, Statistics, and Polling
 
+## Current implementation note — 2026-07-30
+
+The provider-owned external statistics path is authoritative for new SP Group
+setups. The native-reference, native-offset, and two-sighting material below
+was superseded by the external reconciliation design and is retained only as
+historical context. Current external rows use
+`sp_group:<stable_sensor_key>_consumption`, `source=sp_group`, and are written
+with `async_add_external_statistics()`.
+
 ## HA has three separate data stores
 
 ### 1. States Table (entity history)
@@ -17,7 +26,9 @@ History panel.
 ```
 Table: statistics
 Columns: metadata_id, start_ts, state, sum
-Populated by: async_import_statistics() or _periodic_statistics()
+Populated by: provider-owned external statistics through
+`async_add_external_statistics()` or by HA's native compiler for entity-backed
+series.
 ```
 
 Hourly rows with `state` (meter reading at that hour) and `sum` (cumulative).
@@ -52,7 +63,7 @@ Ledger (accepted/pending buckets)
   │
   └─→ Statistics backfill: projects buckets into hourly rows
          ↓
-     async_import_statistics() → statistics table
+     async_add_external_statistics() → provider-owned statistics table
          ↓
      "Long-term statistics" in panel → Energy Dashboard
 ```
@@ -73,28 +84,24 @@ This is the **correct cumulative meter reading** at this moment. For a
 
 ## The statistics import
 
-The statistics backfill (`async_backfill_statistics`) does:
+The active statistics backfill does:
 
 1. **Project** all accepted ledger buckets into hourly rows with correct
    timestamps, using `LedgerStatisticsIndex` to reconstruct the cumulative
    meter state at each hour.
 
-2. **Select a native reference** (`_select_native_reference`): Find an
-   HA-compiled statistics row at or after the seed boundary. This row has a
-   `state` (sensor value at that hour) and `sum` (cumulative) that were
-   compiled by HA from the sensor's state changes.
+2. Build a deterministic external plan with provider timestamps and
+   cumulative non-negative `sum` values.
+3. Preflight existing external rows. Exact rows are idempotent; missing rows
+   are importable; visible mismatches or duplicate starts are hard conflicts.
+4. Queue only missing rows through `async_add_external_statistics()`.
+5. Verify visibility and exact state/sum values through the Recorder readback
+   path. Delayed visibility remains pending and is retried from the
+   Recorder-event statistics retry without refetching provider data.
+6. Persist progress only after verification, with monotonic watermark and
+   source-fingerprint/epoch guards.
 
-3. **Validate the reference** (`_validated_reference`): Check that the
-   HA row's `state` matches the ledger's reconstructed state at that same
-   point in time. This ensures the imported statistics are continuous with
-   HA's future statistics.
-
-4. **Offset the sums** (`_native_offset`): Calculate the adjustment needed so
-   that the imported rows' `sum` values connect smoothly to the reference row.
-
-5. **Import** via `async_import_statistics()`.
-
-## The blocking condition
+## Legacy native path
 
 The reference validation (`_validated_reference`) at statistics_backfill.py:740:
 ```python
@@ -107,7 +114,8 @@ This verifies that the HA-native row's `state` (compiled from sensor state
 changes) matches the ledger's reconstructed state at the same hour. If they
 don't match, the import refuses to proceed -- avoiding silent data corruption.
 
-The mismatch happens because:
+The following mismatch analysis applies only to the legacy native path and is
+not a blocker for the provider-owned external series:
 - The **sensor state** jumped from 1000.0 → 1017.374 in one snapshot
   (latest_total was recalculated)
 - HA's compile_statistics sees this snapshot and creates a row with
@@ -117,7 +125,7 @@ The mismatch happens because:
 - The HA row's state (1017.374) doesn't match the ledger's expected state
   at the REFERENCE hour -- only at the CURRENT hour
 
-## The two-sighting rule effect
+## Historical two-sighting context
 
 The two-sighting rule requires two matching polls before data is accepted.
 This means:
@@ -127,19 +135,21 @@ This means:
 - The statistics import sees a mismatch between the HA-compiled row and the
   ledger's projected distribution
 
-## Summary of issues
+## Historical summary of issues
 
 | Issue | Root Cause | Effect |
 |---|---|---|
 | Polling overlap | source_poll_cursor_start -2h | Re-fetches accepted data |
 | Sensor one-shot jump | 52 buckets accepted at once | latest_total jumps 1000→1017 |
-| Statistics blocked | Reference validation fails | 7 hourly rows not imported |
-| No auto-retry | Metadata shows "complete" | Listener never re-triggers |
+| Statistics blocked | Reference validation fails in the legacy path | Legacy rows not imported |
+| No auto-retry | Legacy metadata showed "complete" | Legacy listener did not re-trigger |
 
-## What "working correctly" would look like
+## What the current implementation considers working correctly
 
 1. Polling window = [last_accepted_end, now] (no overlap)
-2. Each new bucket accepted individually (or in small batches)
-3. HA compiles statistics from gradual sensor state changes
-4. Reference row matches ledger state → import proceeds
-5. Energy Dashboard shows correct stepped graph
+2. Accepted ledger buckets are projected into the external series.
+3. Exact existing rows are reused; only missing rows are queued once.
+4. Recorder visibility is verified before the ledger watermark advances.
+5. Pending visibility is resolved by event-driven retry; conflicts are never
+   overwritten.
+6. The Energy Dashboard uses the provider-owned external statistic ID.

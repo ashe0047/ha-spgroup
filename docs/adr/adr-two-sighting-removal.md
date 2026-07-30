@@ -4,6 +4,20 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for direct acceptance; two-sighting details below are historical context.
+
+## Implementation
+
+`custom_components/sp_group/coordinator.py`, `backfill.py`, and acceptance tests.
+
+The `True`/`False` values in the historical context below describe the former
+configuration. The accepted decision and current implementation use
+`require_two_sightings=False` for both utilities with direct bucket
+acceptance; legacy pending observations are retained only for migration and
+diagnostics.
+
 ## Context
 
 The integration originally required two matching API responses before
@@ -12,7 +26,7 @@ was designed to prevent a single erroneous API response from corrupting
 the accumulated total.
 
 The rule was implemented via `require_two_sightings` on the coordinator:
-- Electricity: `True` (two sightings required)
+- Electricity: `True` (historical configuration; no longer active)
 - Water: `False` (always direct accept)
 
 ## Rationale for Removal

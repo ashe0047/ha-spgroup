@@ -4,6 +4,22 @@
 
 Accepted — 2026-07-22
 
+## Authority
+
+Normative for exact cursor boundaries and completed half-open polling windows; legacy two-sighting sections are historical.
+
+## Implementation
+
+`custom_components/sp_group/ledger.py`, `coordinator.py`, and cursor/polling tests.
+
+## Current implementation amendment — 2026-07-30
+
+The two-sighting discussion below is historical rationale from the earlier
+implementation. The current coordinator uses direct acceptance
+(`require_two_sightings=False`) for electricity and water. The exact-end
+cursor, terminal provider-lag retry, and half-open completed-slot semantics
+remain active.
+
 ## Context
 
 The electric coordinator's polling window determines which time range of AMI
@@ -148,7 +164,9 @@ bucket end.
 
 ### What stays the same
 
-- The two-sighting rule (`require_two_sightings=True`) is unchanged.
+- Direct acceptance is the current behavior (`require_two_sightings=False`).
+  Legacy two-sighting behavior is retained only as historical context and is
+  not part of the active polling contract.
 - The source filter uses half-open bucket semantics and excludes only buckets
   whose end is after the poll time.
 - The polling interval (DurationSelector) is unchanged.
@@ -170,7 +188,8 @@ bucket end.
 - Theoretical loss of boundary safety if the API ever returns incomplete data
   for a completed time period. Mitigated by:
   - API is authoritative (regulated utility).
-  - Two-sighting rule provides independent protection.
+- Provider positional coverage and terminal-lag retry provide the active
+  protection against incomplete trailing data.
   - If a bucket is missed, it will be included in the next date-range query
     (because the API is date-based, not window-based).
 

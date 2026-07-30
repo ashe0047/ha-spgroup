@@ -1,12 +1,24 @@
 # Historical Seed Backfill Retry Robustness
 
+## Status
+
+Implemented and superseded by the provider-failure boundary. Utility provider
+outages now produce a no-op coordinator result, while the source-backfill
+orchestrator records the attempt as failed and retains the existing repair/
+retry flow. The original investigation below is retained as historical
+context.
+
+## Authority
+
+Historical/implemented issue record; current behavior is governed by the electricity gap ADR.
+
 ## Issue
 
-The source-history backfill for electricity has no retry mechanism for
-transient API failures (HTTP 5xx, timeouts, connection resets). A single
-transient error aborts the entire backfill, marks the utility as `failed`,
-and creates a `backfill_failed` repair issue requiring manual intervention
-via the options flow.
+The source-history backfill historically had no retry mechanism for transient
+API failures. The implemented provider-failure boundary now leaves the
+utility coordinator available without ledger mutation, while the source
+backfill records the attempt as failed and retains the existing
+`backfill_failed` repair/retry flow.
 
 ## Background
 
@@ -183,4 +195,5 @@ on the first retry should not produce a repair issue at all.
 
 ## Status
 
-**Not implemented.**
+The original exponential-backoff proposal is superseded and is not part of
+the current implementation.

@@ -1,5 +1,14 @@
 # Refactor Plan: Backfill Runs Once, Then Repair on Failure
 
+## Status
+
+Implemented pending final audit — source-backfill gating and repair handling
+are present in the runtime; verification references should be kept current.
+
+## Authority
+
+Implementation plan; backfill behavior is governed by `adr/adr-backfill-once-then-repair.md`.
+
 ## Summary
 
 Stop running the historical backfill on every HA restart. Run it only once

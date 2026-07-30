@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for accepted buckets, provenance, coverage, corrections, cursor, and persistence lifecycle.
+
+## Implementation
+
+`custom_components/sp_group/ledger.py` and ledger lifecycle tests.
+
 ## Context
 
 The SP Group integration tracks utility consumption as a sequence of

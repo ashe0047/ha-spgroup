@@ -110,8 +110,8 @@ Default tests are hermetic and use mock API responses. Live tests require the
 
 Before committing changes that affect the repository structure, review:
 
-- `docs/hacs-integration-checklist.md` — HACS alignment requirements
-- `docs/repo-conventions.md` — Repo naming, domain, versioning conventions
+- `docs/guides/hacs-integration-checklist.md` — HACS alignment requirements
+- `docs/guides/repo-conventions.md` — Repo naming, domain, versioning conventions
 
 ---
 

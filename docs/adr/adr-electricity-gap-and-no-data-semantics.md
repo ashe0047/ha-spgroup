@@ -4,6 +4,15 @@
 
 Accepted — implementation aligned 2026-07-27
 
+## Authority
+
+Normative and canonical for electricity AMI gaps, no-data, source precedence,
+provider failures, and terminal lag.
+
+## Implementation
+
+`custom_components/sp_group/electricity.py`, `coordinator.py`, `ledger.py`, and electricity/coordinator tests.
+
 ## Context
 
 The historical electricity backfill combines 30-minute AMI data with monthly

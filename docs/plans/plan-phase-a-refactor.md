@@ -1,5 +1,16 @@
 # Refactor Plan: Phase A — Fast Discovery Setup
 
+## Status
+
+Implemented. `discovery_service.py` now parallelizes the independent discovery
+and enrichment requests. The remaining text is retained as the original plan;
+its API-failure statement applies to discovery, whose failures remain distinct
+from utility polling provider no-op failures.
+
+## Authority
+
+Historical implementation plan; current discovery behavior is governed by the coordinator hierarchy ADR.
+
 ## Summary
 
 Parallelize the API calls in `async_fetch_discovery_data` using `asyncio.gather`.

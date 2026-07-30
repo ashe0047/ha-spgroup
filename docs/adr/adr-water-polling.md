@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for water endpoint cadence, monthly closure, grace period, and statistics projection.
+
+## Implementation
+
+`custom_components/sp_group/coordinator.py`, `ledger.py`, `statistics_backfill.py`, and water tests.
+
 ## Context
 
 Water consumption data is provided by SP Group through a different API
@@ -88,8 +96,9 @@ intervals.
 
 ### Statistics
 
-Water statistics are imported as external statistics (same as electricity)
-with `statistic_id = "sp_group.<sensor_key>_water_consumption"`. Monthly
+Water statistics are imported as provider-owned external statistics (same as
+electricity) with the shared stable statistic ID
+`sp_group:<stable_sensor_key>_consumption` and `source=sp_group`. Monthly
 buckets are projected to hourly rows at the month boundary.
 
 ## Consequences

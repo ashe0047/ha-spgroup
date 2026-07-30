@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for discovery, electricity, water, provider-failure, and polling coordinator boundaries.
+
+## Implementation
+
+`custom_components/sp_group/coordinator.py` and coordinator/sensor tests.
+
 ## Context
 
 The integration uses Home Assistant's `DataUpdateCoordinator` pattern to
@@ -57,15 +65,20 @@ re-configuration).
 6. Applies observations to the ledger via `async_apply_observations()`
 7. If `accepted_delta > 0`, schedules a statistics retry
 
-The coordinator's `_async_update_data()` catches:
+The coordinator's `_async_update_data()` handles:
 - `ConfigEntryAuthFailed` → reauth flow
-- `TimeoutError` → `UpdateFailed`
+- provider transport/API failures and provider-request timeouts → successful
+  no-op result with no ledger mutation; the last trusted entity value remains
+  available
+- processing timeouts → `UpdateFailed`
 - `LedgerError`, `OSError` → `UpdateFailed`
-- `SpGroupMobileError` → `UpdateFailed` (with API error logged)
+- malformed payloads, duplicate/unsupported data, arithmetic failures, and
+  persistence failures → `UpdateFailed`
 
-Failure causes the coordinator to retry on the next scheduled interval.
-There is no immediate retry or backoff — the standard HA coordinator
-behavior applies.
+Provider no-op failures leave the cursor unchanged and are retried on the
+next scheduled interval. Historical source backfill records them as failed so
+its existing repair/retry flow remains active. Authentication failures remain
+reauthentication events.
 
 ### Water Coordinator
 
@@ -99,9 +112,9 @@ This provides a safety net for missed retries.
 The initial backfill runs as a tracked background task. It is not a
 coordinator refresh — it calls `async_poll_now(backfill=True)` which
 directly invokes `_async_poll_sources()` without HA's coordinator
-debounce or failure handling. Backfill is serialized per-utility:
-electricity runs first (with two-sighting poll count derived from
-`require_two_sightings`), then water.
+debounce or failure handling. Backfill is serialized per-utility: electricity
+runs first with its current direct-accept poll count, then water. Legacy
+two-sighting poll-count behavior is historical only.
 
 ## Consequences
 
@@ -115,9 +128,8 @@ electricity runs first (with two-sighting poll count derived from
 
 ### Negative
 
-- No immediate retry on transient API failures — the coordinator waits
-  for the next scheduled interval. This is acceptable for a ~60 minute
-  cadence but means a single HTTP 500 causes a ~1 hour data gap.
+- Provider outages do not create a sensor state, ledger bucket, or statistics
+  row. The last trusted value remains visible until a later poll succeeds.
 - Water polling is timer-based, which is less resilient than the
   coordinator's fixed interval (timer is set once and not re-evaluated
   on failure).

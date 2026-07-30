@@ -1,5 +1,15 @@
 # HA Store Session Persistence Refactor Plan
 
+## Status
+
+Needs implementation audit — Store persistence exists, but the refresh path
+still contains an entry-data persistence branch that must be classified before
+this plan is marked implemented or superseded.
+
+## Authority
+
+Implementation plan; session behavior is governed by `adr/adr-auth-session-management.md`.
+
 ## Summary
 
 Replace session persistence via `async_update_entry` (to `entry.data`) with

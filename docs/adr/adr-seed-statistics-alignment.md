@@ -4,6 +4,24 @@
 
 Accepted - 2026-07-24
 
+## Authority
+
+Historical/legacy for native seed-statistics alignment; the provider-owned statistics ADR governs the active external path.
+
+## Implementation
+
+Legacy native compatibility remains in `statistics_backfill.py`; active external behavior is verified by external-statistics tests.
+
+## Current implementation amendment — 2026-07-30
+
+The native `async_import_statistics()` and seed-offset discussion below is
+historical/legacy behavior. The active provider-owned path projects accepted
+ledger buckets through `async_add_external_statistics()` into the dedicated
+`sp_group:<stable_sensor_key>_consumption` series with `source=sp_group`.
+External reconciliation is exact, conflict-protecting, event-driven, and
+monotonic. Native entity statistics remain a separate legacy path and are not
+the authoritative Energy Dashboard series for new setups.
+
 ## Context
 
 The SP Group integration has two independent sources of truth for consumption
@@ -117,6 +135,10 @@ artifact), the result is negative, but the functional behavior (delta-based
 Energy Dashboard calculations) remains correct.
 
 ### How it handles Scenario B (Provider Lag Gap)
+
+For the legacy native-offset strategy, the following explanation is retained
+as historical context. The active external series instead re-projects the
+accepted ledger snapshot and reconciles the provider-owned rows.
 
 At backfill time, the provider may not have returned data for the period
 immediately before `seed_effective_from`. `state_at()` uses only the

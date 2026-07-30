@@ -4,6 +4,14 @@
 
 Accepted - 2026-07-25
 
+## Authority
+
+Normative for development-only services and runtime validation helpers.
+
+## Implementation
+
+`custom_components/sp_group/dev.py`, service registration, and developer-tool tests.
+
 ## Context
 
 The integration includes developer-only tools (`dev.py`) and registration
