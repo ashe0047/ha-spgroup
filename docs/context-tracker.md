@@ -4513,6 +4513,14 @@ blocked by the pre-existing `_classify_external_rows` collection error.
 - Updated the test, lint/mypy, docs, compile, and live-soak tasks to invoke
   `.venv/bin/python` explicitly. This makes the installed environment the
   authoritative interpreter in both local and CI runs.
+
+## 2026-07-31 — Development workflow verification
+
+- Remote HACS validation passed on the development workflow.
+- Remote Integration CI passed after the vendored-SDK and interpreter/mypy
+  fixes: tests, Ruff/mypy, docs validation, and HA compilation all completed
+  successfully. The mise action emitted only a non-blocking Node.js 20
+  deprecation warning.
 - Updated the development guide and repository instructions with the branch/
   CI contract, corrected the local SDK path, and removed the stale claim that Git
   history is unavailable. Corrected the manual seed design's stale two-sighting
