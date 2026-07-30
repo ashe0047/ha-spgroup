@@ -6,7 +6,13 @@ description = "Install Python scaffold dependencies for HA 2026.7.2"
 run = """
 python -m venv --clear .venv
 .venv/bin/python -m pip install -U pip
-.venv/bin/python -m pip install -e "${SPGROUP_SDK_PATH:-../../../python-packages/spgroup}" pytest==9.0.0 pytest-asyncio==1.3.0 ruff==0.15.21 mypy==2.3.0 homeassistant==2026.7.2 home-assistant-frontend==20260624.5 ha-ffmpeg==3.2.2 hassil==3.8.0 PyTurboJPEG==1.8.3 mutagen==1.47.0 home-assistant-intents pymicro-vad pyspeex-noise==1.0.2 aiohasupervisor rf-protocols infrared-protocols coverage==7.10.6 freezegun==1.5.2 license-expression==30.4.3 mock-open==1.4.0 paho-mqtt==2.1.0 pipdeptree==2.26.1 pydantic==2.12.2 pylint-per-file-ignores==1.4.0 pytest-aiohttp==1.1.0 pytest-cov==7.0.0 pytest-freezer==0.4.9 pytest-github-actions-annotate-failures==0.3.0 pytest-picked==0.5.1 pytest-socket==0.7.0 pytest-sugar==1.0.0 pytest-timeout==2.4.0 pytest-unordered==0.7.0 pytest-xdist==3.8.0 requests-mock==1.12.1 respx==0.22.0 syrupy==5.0.0 tqdm==4.67.1 unidiff
+sdk_path="${SPGROUP_SDK_PATH:-../../../python-packages/spgroup}"
+if [ -f "$sdk_path/pyproject.toml" ]; then
+  .venv/bin/python -m pip install -e "$sdk_path"
+else
+  echo "Using vendored SDK from $sdk_path"
+fi
+.venv/bin/python -m pip install pytest==9.0.0 pytest-asyncio==1.3.0 ruff==0.15.21 mypy==2.3.0 homeassistant==2026.7.2 home-assistant-frontend==20260624.5 ha-ffmpeg==3.2.2 hassil==3.8.0 PyTurboJPEG==1.8.3 mutagen==1.47.0 home-assistant-intents pymicro-vad pyspeex-noise==1.0.2 aiohasupervisor rf-protocols infrared-protocols coverage==7.10.6 freezegun==1.5.2 license-expression==30.4.3 mock-open==1.4.0 paho-mqtt==2.1.0 pipdeptree==2.26.1 pydantic==2.12.2 pylint-per-file-ignores==1.4.0 pytest-aiohttp==1.1.0 pytest-cov==7.0.0 pytest-freezer==0.4.9 pytest-github-actions-annotate-failures==0.3.0 pytest-picked==0.5.1 pytest-socket==0.7.0 pytest-sugar==1.0.0 pytest-timeout==2.4.0 pytest-unordered==0.7.0 pytest-xdist==3.8.0 requests-mock==1.12.1 respx==0.22.0 syrupy==5.0.0 tqdm==4.67.1 unidiff
 .venv/bin/python -m pip install --no-deps pytest-homeassistant-custom-component==0.13.346
 """
 

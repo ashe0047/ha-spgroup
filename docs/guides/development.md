@@ -61,12 +61,11 @@ endpoints. Live soak tests remain an explicit local operation:
 mise run python:test:ha-live-soak
 ```
 
-Local development keeps using the sibling SDK checkout. CI checks it out at
-`python-packages/spgroup` at the reviewed SDK commit and sets
-`SPGROUP_SDK_PATH` before running `mise run python:install`; this path
-difference is intentional and avoids requiring a multi-repository workspace on
-the runner. Update the workflow's SDK commit deliberately when changing the
-integration's SDK contract.
+Local development keeps using the sibling SDK checkout. CI uses the vendored
+SDK snapshot under `custom_components/sp_group/vendor/`, sets `PYTHONPATH` and
+`SPGROUP_SDK_PATH`, and runs the same `mise run python:install` task. This keeps
+the workflow self-contained because the SDK repository is private. Update the
+vendored snapshot deliberately when changing the integration's SDK contract.
 
 ## Repository Areas
 

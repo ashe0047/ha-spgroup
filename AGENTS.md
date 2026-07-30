@@ -49,11 +49,12 @@ runs the hermetic tests, Ruff/mypy, documentation checks, and HA compile check.
 `HACS Validation` separately checks the HACS layout and runs daily. Live
 provider tests remain opt-in and are not required CI checks.
 
-CI checks out the reviewed public SDK commit into `python-packages/spgroup` and
-sets `SPGROUP_SDK_PATH`, while local development continues using the sibling
-SDK checkout. This keeps `mise run python:install` identical in both
-environments; update the workflow commit deliberately when the SDK contract
-changes.
+CI uses the vendored SDK snapshot under
+`custom_components/sp_group/vendor/` and sets `PYTHONPATH`/`SPGROUP_SDK_PATH`,
+while local development continues using the sibling editable SDK checkout.
+This keeps CI self-contained and avoids requiring access to the private SDK
+repository. Update the vendored snapshot and its packaging boundary deliberately
+when the SDK contract changes.
 
 ## Commit & Pull Request Guidelines
 

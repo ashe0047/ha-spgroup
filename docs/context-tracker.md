@@ -4493,17 +4493,17 @@ blocked by the pre-existing `_classify_external_rows` collection error.
   and return through reviewed pull requests; promotion to `main` is the release
   boundary.
 - Added `Integration CI` for pushes and pull requests targeting `development`
-  or `main`. It checks out the public SDK, installs the pinned `mise.toml`
-  environment, and runs tests, Ruff/mypy, documentation validation, and the HA
-  compile check. Live-provider tests remain opt-in.
+  or `main`. It installs the pinned `mise.toml` environment and runs tests,
+  Ruff/mypy, documentation validation, and the HA compile check. Live-provider
+  tests remain opt-in.
 - Kept HACS validation as a separate branch-gated and scheduled workflow, with
   immutable action pins and least-privilege contents-read permissions.
-- Added `SPGROUP_SDK_PATH` override to the install task so local sibling-checkout
-  development and the single-repository CI workspace use the same installation
-  command.
-- Pinned the CI SDK checkout to the reviewed public commit
-  `283a2a391652221647a3487e3ad43cad56c1a028`; SDK upgrades are now explicit
-  workflow changes rather than silent main-branch drift.
+- Added `SPGROUP_SDK_PATH` override and a vendored-SDK fallback to the install
+  task so local sibling-checkout development and the single-repository CI
+  workspace use the same installation command.
+- The first remote run confirmed the SDK repository is private and inaccessible
+  to the default Actions token. CI therefore uses the checked-in vendored SDK
+  snapshot with `PYTHONPATH`; no private-repository credential is required.
 - Updated the development guide and repository instructions with the branch/
   CI contract, corrected the local SDK path, and removed the stale claim that Git
   history is unavailable. Corrected the manual seed design's stale two-sighting
