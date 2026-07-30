@@ -37,6 +37,8 @@ jobs:
         run: mise run python:test
 
       - name: Run lint and type checks
+        env:
+          MYPYPATH: custom_components/sp_group/vendor
         run: mise run python:lint
 
       - name: Validate documentation

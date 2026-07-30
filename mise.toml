@@ -78,7 +78,7 @@ run = "python scripts/ha_dev_ami_latest.py"
 
 [tasks."python:lint"]
 description = "Run Python lint and type checks"
-run = ".venv/bin/python -m ruff check custom_components tests && .venv/bin/python -m mypy -p custom_components.sp_group"
+run = ".venv/bin/python -m ruff check custom_components tests && .venv/bin/python -m mypy -p custom_components.sp_group --exclude 'custom_components/sp_group/vendor'"
 
 [tasks."docs:check"]
 description = "Validate documentation lifecycle headings and local links"
