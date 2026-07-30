@@ -16,6 +16,7 @@ from custom_components.sp_group.coordinator import (
     SpGroupCoordinatorData,
     SpGroupDataUpdateCoordinator,
     SpGroupElectricityCoordinator,
+    SpGroupUtilityPollResult,
     SpGroupWaterCoordinator,
     _ami_rows,
     _electricity_ami_needs_history,
@@ -131,6 +132,7 @@ class FakeJarvisClient:
         self.me_payload = me_payload
         self.chart_payload = chart_payload
         self.chart_error = chart_error
+        self.ami_error: Exception | None = None
         self.ami_payloads: list[dict[str, object]] = []
         self.ami_requests: list[tuple[object, object, str, str | None]] = []
 
@@ -162,6 +164,8 @@ class FakeJarvisClient:
         """Return fixture AMI data."""
         self.calls.append(f"jarvis.get_ami_charts:{grouped_by}:{utility_type}")
         self.ami_requests.append((start, end, grouped_by, utility_type))
+        if self.ami_error is not None:
+            raise self.ami_error
         if self.ami_payloads:
             return self.ami_payloads.pop(0)
         return {
@@ -303,6 +307,8 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
     coordinator = SpGroupElectricityCoordinator(hass, entry)  # type: ignore[arg-type]
     entry.runtime_data.electricity_coordinator = coordinator
 
+    jarvis_client = entry.runtime_data.jarvis_client
+    assert isinstance(jarvis_client, FakeJarvisClient)
     with (
         patch(
             "custom_components.sp_group.coordinator.async_refresh_runtime_session_if_needed",
@@ -329,6 +335,23 @@ async def test_coordinator_updates_seeded_ledger_after_two_ami_sightings(
     )
     source_backfill.assert_not_awaited()
     assert "jarvis.get_ami_charts:day:electric" in calls
+
+    jarvis_client.ami_error = SpGroupApiError("temporary provider outage")
+    before = ledger_store.snapshot.entries[sensor_key.key]
+    await coordinator._async_update_data()
+    after = ledger_store.snapshot.entries[sensor_key.key]
+    assert after.latest_total == before.latest_total == Decimal("101.25")
+    assert after.accepted == before.accepted
+    assert coordinator.last_update_success
+
+    jarvis_client.ami_error = None
+    jarvis_client.ami_payloads = [{"unit": "watts", "history": []}]
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
+    jarvis_client.ami_payloads = []
+    jarvis_client.ami_error = SpGroupApiError("temporary provider outage")
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
 
 
 async def test_normal_poll_recovers_pre_seed_lag(
@@ -908,6 +931,26 @@ async def test_electricity_async_parse_full_ami_does_not_fetch_history(
     assert not any(
         call.startswith("jarvis.get_history_charts") for call in jarvis.calls
     )
+
+
+async def test_manual_provider_failure_returns_noop_result(
+    hass: HomeAssistant,
+    runtime_entry: MockConfigEntry,
+) -> None:
+    """Manual utility polls expose provider failure without UpdateFailed."""
+    coordinator = SpGroupElectricityCoordinator(hass, runtime_entry)
+    expected = SpGroupUtilityPollResult(
+        provider_failure_count=1,
+        failed_source_keys=frozenset({"opaque_source"}),
+    )
+    with patch.object(
+        coordinator,
+        "_async_poll_sources",
+        AsyncMock(return_value=expected),
+    ):
+        result = await coordinator.async_poll_now()
+
+    assert result == expected
 
 
 async def test_electricity_normal_parse_never_fetches_history(

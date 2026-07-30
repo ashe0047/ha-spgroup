@@ -150,9 +150,13 @@ backfill evidence.
   `no_source_gap_zero` buckets so the source timeline and cursor can advance.
 
 This rule applies only after both source requests complete successfully and
-are validly interpreted as containing no data. Authentication, transport,
-timeout, malformed-response, and provider API failures remain retryable
-failures and must not be converted into no-data zeros.
+are validly interpreted as containing no data. Authentication failures remain
+fatal reauthentication events. Transport/API failures are retryable provider
+outages: they leave the utility entity at its last trusted value, create no
+coverage or zero buckets, and do not advance the ledger. Historical source
+backfill still records the outage as failed so its existing repair/retry flow
+remains active. Malformed responses and processing failures remain sensor
+update failures and must not be converted into no-data zeros.
 
 History validation or arithmetic failures are also poll failures. In
 particular, a negative History-minus-AMI remainder is a data-integrity error:
@@ -181,10 +185,14 @@ ledger cursor, it must first prove that the only persisted electricity
 unresolved range is this terminal range and that its start equals the last
 accepted end.
 
-Provider/API failures are not coverage ranges. They fail the poll and leave
-the cursor unchanged for the next retry. Malformed or duplicate AMI rows are
-source failures; an omitted interval in an otherwise usable response is a
-coverage gap and follows the positional zero/terminal-lag rules above.
+Provider/API failures are not coverage ranges. For utility polling they are
+successful no-op updates that leave the cursor unchanged for the next retry;
+the last trusted sensor value remains available. During historical source
+backfill, the same provider failure marks the source backfill attempt failed
+without mutating the ledger, so the existing repair/retry path can run again.
+Malformed or duplicate AMI rows are sensor/data failures; an omitted interval
+in an otherwise usable response is a coverage gap and follows the positional
+zero/terminal-lag rules above.
 
 Known-unavailable leading ranges and accepted zero-gap buckets are treated as
 proven source coverage and allow the cursor to advance.

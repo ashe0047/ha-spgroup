@@ -11,6 +11,7 @@ from custom_components.sp_group.backfill import (
     _track_backfill_task,
 )
 from custom_components.sp_group.const import DOMAIN
+from custom_components.sp_group.coordinator import SpGroupUtilityPollResult
 from custom_components.sp_group.discovery import SpGroupFutureSensorKey
 from custom_components.sp_group.ledger import (
     SOURCE_BACKFILL_FAILED,
@@ -114,6 +115,38 @@ async def test_source_backfill_success_marks_retryable_entries_and_imports_stats
         backfill=True
     )
     stats_backfill.assert_awaited_once_with(hass, entry)
+
+
+async def test_provider_noop_result_keeps_source_backfill_retryable(
+    hass: HomeAssistant,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """A coordinator no-op does not falsely complete source backfill."""
+    entry, ledger_store = await _entry_with_source_ledger(hass, tmp_path)
+    entry.runtime_data.electricity_coordinator.async_poll_now = AsyncMock(
+        return_value=SpGroupUtilityPollResult(
+            provider_failure_count=1,
+            failed_source_keys=frozenset({"opaque_electric"}),
+        )
+    )
+    entry.runtime_data.water_coordinator.async_poll_now = AsyncMock()
+
+    with patch(
+        "custom_components.sp_group.backfill.async_backfill_statistics",
+        new_callable=AsyncMock,
+    ) as stats_backfill:
+        await _run_backfill_with_retry(hass, entry)
+
+    assert (
+        ledger_store.snapshot.entries["opaque_electric"].source_backfill_status
+        == SOURCE_BACKFILL_FAILED
+    )
+    assert (
+        ledger_store.snapshot.entries["opaque_water"].source_backfill_status
+        == SOURCE_BACKFILL_SUCCEEDED
+    )
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "backfill_failed") is not None
+    stats_backfill.assert_not_awaited()
 
 
 async def test_initial_statistics_failure_is_deferred_without_parallel_retry(

@@ -4445,3 +4445,18 @@ blocked by the pre-existing `_classify_external_rows` collection error.
 
 - A provider failure at 18:31 caused the coordinator to raise `UpdateFailed`; Home Assistant therefore marked the entity unavailable for that interval. The ledger value itself was not reset or advanced incorrectly. The 19:31 recovery accepted only pre-seed buckets, which update statistics but are intentionally excluded from the live post-seed total. If continuous visible sensor states are required, availability policy must be changed separately from ledger/cursor processing.
 - Follow-up contract clarification: provider/API failures should be treated as successful no-op polls for entity availability; `UpdateFailed` remains reserved for sensor/data integrity or persistence failures. The current outer timeout and broad exception handling still conflate provider failure with ledger failure, so the boundary must be split and tested per source without mutating ledger state.
+- Implemented the provider-failure boundary: utility AMI/History transport/API failures now return explicit failed-source poll results without ledger mutation, while historical backfill consumes that result to retain failed/retryable source status. Provider-request timeouts are isolated from processing failures; ADR wording now distinguishes utility no-op outages from malformed/data-integrity failures and discovery/authentication behavior.
+- Added the entity-level continuity regression: a provider-failure no-op leaves the seeded sensor available at the same trusted value, and the next successful poll changes the value once. Full SP Group verification is now `385 passed, 12 skipped`; Ruff/mypy, HA compile checks, and diff checks pass.
+
+## 2026-07-30 — Documentation consistency audit
+
+- Audited ADRs, references, issue records, plans, roadmap, and testing guidance against the current implementation.
+- Direct conflicts remain between the current electricity gap/no-data contract and `adr-ami-zero-coverage-semantics.md` (internal zero semantics and implementation status), `adr-hybrid-backfill-partial-month.md` (Actual-only History), `adr-coordinator-hierarchy.md`/`ha-energy-dashboard-direction.md`/`ha-integration-roadmap.md` (provider failures mapped to `UpdateFailed`), `adr-polling-window-exact-end.md` and `ha-statistics-sensor-interaction.md` (two-sighting behavior), and `adr-sensor-platform.md`/`adr-seed-statistics-alignment.md`/the statistics reference (legacy native writer and statistic-ID assumptions).
+- Several issue/plan documents are historical but still presented as proposed or pending, including the retry-robustness issue, phase-A setup issue, Recorder readback plan, and production checklist entries. These should be marked superseded/implemented rather than silently rewritten unless their intended archival role is clarified.
+- No conflicting document was edited during this audit; authority and archival treatment require confirmation before stale-document updates.
+
+## 2026-07-30 — Commit planning for provider-failure boundary
+
+- Current uncommitted scope is limited to utility provider-failure no-op handling, typed source-backfill failure propagation, the electricity ADR amendment, entity/backfill/coordinator regression tests, and this tracker entry.
+- The broader documentation audit identified unrelated conflicting ADRs and historical plans; those are intentionally excluded from this commit until their authority/archival treatment is confirmed.
+- Proposed commit boundary: one atomic change because the runtime behavior, backfill orchestration, ADR contract, and regression tests are mutually dependent.

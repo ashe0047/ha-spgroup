@@ -14,7 +14,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from spgroup.mobile import MobileSession, SpGroupMobileError
+from spgroup.mobile import MobileSession, SpGroupAuthError, SpGroupMobileError
 
 from .auth import async_refresh_runtime_session_if_needed
 from .const import DEFAULT_UPDATE_TIMEOUT_SECONDS, DOMAIN
@@ -60,6 +60,21 @@ _DISCOVERY_UPDATE_FAILED = "Error refreshing SP Group discovery data"
 _LEDGER_UPDATE_FAILED = "Error refreshing SP Group accumulation ledger"
 _UTILITY_UPDATE_FAILED = "Error refreshing SP Group utility evidence"
 _TIMEOUT_UPDATE_FAILED = "Timed out refreshing SP Group data"
+_PROVIDER_MOBILE_ERROR_NAMES = frozenset(
+    {"SpGroupApiError", "SpGroupTransportError"}
+)
+
+
+def _is_provider_mobile_error(error: SpGroupMobileError) -> bool:
+    """Return whether an SDK error represents a retryable provider outage."""
+    return type(error).__name__ in _PROVIDER_MOBILE_ERROR_NAMES
+
+
+def _is_retryable_provider_error(error: Exception) -> bool:
+    """Return whether an exception belongs to the provider request boundary."""
+    return isinstance(error, TimeoutError) or (
+        isinstance(error, SpGroupMobileError) and _is_provider_mobile_error(error)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +84,8 @@ class SpGroupUtilityPollResult:
     request_count: int = 0
     source_keys: frozenset[str] = frozenset()
     accepted_delta: int = 0
+    provider_failure_count: int = 0
+    failed_source_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +177,7 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
             update_interval=update_interval,
         )
         self.entry = entry
+        self._data_failure_active = False
 
     async def _async_update_data(self) -> None:
         """Refresh this utility's ledger-backed source."""
@@ -169,13 +187,24 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
                 result = await self._async_poll_sources(backfill=False)
         except ConfigEntryAuthFailed:
             raise
+        except SpGroupAuthError as err:
+            raise ConfigEntryAuthFailed(
+                "SP Group utility authentication failed"
+            ) from err
         except TimeoutError as err:
+            self._data_failure_active = True
             raise UpdateFailed(_TIMEOUT_UPDATE_FAILED) from err
         except (LedgerError, OSError) as err:
+            self._data_failure_active = True
             raise UpdateFailed(_LEDGER_UPDATE_FAILED) from err
         except SpGroupMobileError as err:
+            self._data_failure_active = True
             LOGGER.debug("SP Group %s API error: %s", self.utility_type, err)
             raise UpdateFailed(_UTILITY_UPDATE_FAILED) from err
+        if result.provider_failure_count and self._data_failure_active:
+            raise UpdateFailed(_LEDGER_UPDATE_FAILED)
+        if not result.provider_failure_count:
+            self._data_failure_active = False
         if result.accepted_delta > 0:
             self._schedule_statistics_retry()
         return None
@@ -201,13 +230,24 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
                 )
         except ConfigEntryAuthFailed:
             raise
+        except SpGroupAuthError as err:
+            raise ConfigEntryAuthFailed(
+                "SP Group utility authentication failed"
+            ) from err
         except TimeoutError as err:
+            self._data_failure_active = True
             raise UpdateFailed(_TIMEOUT_UPDATE_FAILED) from err
         except (LedgerError, OSError) as err:
+            self._data_failure_active = True
             raise UpdateFailed(_LEDGER_UPDATE_FAILED) from err
         except SpGroupMobileError as err:
+            self._data_failure_active = True
             LOGGER.debug("SP Group %s API error: %s", self.utility_type, err)
             raise UpdateFailed(_UTILITY_UPDATE_FAILED) from err
+        if result.provider_failure_count and self._data_failure_active:
+            raise UpdateFailed(_LEDGER_UPDATE_FAILED)
+        if not result.provider_failure_count:
+            self._data_failure_active = False
         self.async_set_updated_data(None)
         if result.accepted_delta > 0:
             self._schedule_statistics_retry()
@@ -251,7 +291,23 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
             )
             return SpGroupUtilityPollResult()
 
-        session = await async_refresh_runtime_session_if_needed(self.hass, self.entry)
+        try:
+            async with asyncio.timeout(DEFAULT_UPDATE_TIMEOUT_SECONDS):
+                session = await async_refresh_runtime_session_if_needed(
+                    self.hass, self.entry
+                )
+        except (SpGroupMobileError, TimeoutError) as err:
+            if not _is_retryable_provider_error(err):
+                raise
+            LOGGER.warning(
+                "SP Group %s session refresh unavailable: mode=%s",
+                self.utility_type,
+                "backfill" if backfill else "normal",
+            )
+            return SpGroupUtilityPollResult(
+                provider_failure_count=len(source_configs),
+                failed_source_keys=frozenset(source_configs),
+            )
         premise_by_key = {premise.key: premise for premise in data.premises}
         now = now or datetime.now(SINGAPORE_TZ)
         if backfill and source_configs:
@@ -268,6 +324,7 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
         accepted_before = _accepted_count(self.entry, self.utility_type)
         pending_before = _pending_count(self.entry, self.utility_type)
         polled_keys: set[str] = set()
+        failed_source_keys: set[str] = set()
         LOGGER.debug(
             "SP Group %s poll source phase started: mode=%s source_count=%d",
             self.utility_type,
@@ -301,23 +358,48 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
                 request_start.isoformat(),
                 now.isoformat(),
             )
-            payload = await runtime.jarvis_client.get_ami_charts(
-                session,
-                premise.jarvis_premise_id,
-                _date_for_api(request_start),
-                _date_for_api(now),
-                self.grouped_by,
-                self.api_utility_type,
-            )
             request_count += 1
-            parsed = await self._async_parse_source(
-                payload,
-                session=session,
-                premise_id=premise.jarvis_premise_id,
-                backfill_from=request_start,
-                now=now,
-                backfill=backfill,
-            )
+            try:
+                async with asyncio.timeout(DEFAULT_UPDATE_TIMEOUT_SECONDS):
+                    payload = await runtime.jarvis_client.get_ami_charts(
+                        session,
+                        premise.jarvis_premise_id,
+                        _date_for_api(request_start),
+                        _date_for_api(now),
+                        self.grouped_by,
+                        self.api_utility_type,
+                    )
+            except (SpGroupMobileError, TimeoutError) as err:
+                if not _is_retryable_provider_error(err):
+                    raise
+                failed_source_keys.add(sensor_key)
+                LOGGER.warning(
+                    "SP Group %s source poll unavailable: mode=%s failure_count=%d",
+                    self.utility_type,
+                    mode,
+                    len(failed_source_keys),
+                )
+                continue
+            try:
+                parsed = await self._async_parse_source(
+                    payload,
+                    session=session,
+                    premise_id=premise.jarvis_premise_id,
+                    backfill_from=request_start,
+                    now=now,
+                    backfill=backfill,
+                )
+            except (SpGroupMobileError, TimeoutError) as err:
+                if not _is_retryable_provider_error(err):
+                    raise
+                failed_source_keys.add(sensor_key)
+                LOGGER.warning(
+                    "SP Group %s source poll unavailable: mode=%s failure_count=%d",
+                    self.utility_type,
+                    mode,
+                    len(failed_source_keys),
+                )
+                continue
             observation_count += len(parsed.observations)
             coverage = parsed.coverage
             if coverage.status == SOURCE_COVERAGE_MALFORMED:
@@ -335,7 +417,7 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
         LOGGER.info(
             "SP Group %s poll completed: mode=%s request_count=%d "
             "source_count=%d polled_count=%d observation_count=%d "
-            "accepted_delta=%d pending_delta=%d",
+            "accepted_delta=%d pending_delta=%d provider_failure_count=%d",
             self.utility_type,
             mode,
             request_count,
@@ -344,11 +426,14 @@ class SpGroupUtilityCoordinator(DataUpdateCoordinator[None]):
             observation_count,
             max(0, accepted_after - accepted_before),
             pending_after - pending_before,
+            len(failed_source_keys),
         )
         return SpGroupUtilityPollResult(
             request_count=request_count,
             source_keys=frozenset(polled_keys),
             accepted_delta=max(0, accepted_after - accepted_before),
+            provider_failure_count=len(failed_source_keys),
+            failed_source_keys=frozenset(failed_source_keys),
         )
 
     def _request_start(
@@ -521,9 +606,10 @@ class SpGroupElectricityCoordinator(SpGroupUtilityCoordinator):
         ):
             cached_history = self._history_payload_cache.get(premise_id)
             if cached_history is None:
-                history_payload = await jarvis_client.get_history_charts(
-                    session, premise_id
-                )
+                async with asyncio.timeout(DEFAULT_UPDATE_TIMEOUT_SECONDS):
+                    history_payload = await jarvis_client.get_history_charts(
+                        session, premise_id
+                    )
                 self._history_payload_cache[premise_id] = history_payload
             else:
                 history_payload = cached_history

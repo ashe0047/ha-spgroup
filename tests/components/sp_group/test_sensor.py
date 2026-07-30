@@ -8,11 +8,15 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from custom_components.sp_group import SpGroupRuntimeData
 from custom_components.sp_group.const import CONF_ACCOUNT_ID, CONF_SESSION, DOMAIN
-from custom_components.sp_group.coordinator import SpGroupDataUpdateCoordinator
+from custom_components.sp_group.coordinator import (
+    SpGroupDataUpdateCoordinator,
+    SpGroupElectricityCoordinator,
+    SpGroupUtilityPollResult,
+)
 from custom_components.sp_group.discovery import (
     SpGroupCoordinatorData,
     SpGroupFutureSensorKey,
@@ -166,6 +170,84 @@ def test_sensor_publishes_trusted_ledger_total(
 
     coordinator.last_update_success = False
     assert not electricity.available
+
+
+async def test_sensor_retains_value_across_provider_poll_failure(
+    hass: HomeAssistant,
+) -> None:
+    """Provider no-op polls do not create an entity availability/value gap."""
+    session = make_mobile_session("auth0|account-1")
+    sensor_key = SpGroupFutureSensorKey(
+        key="sp_group_premise_opaque_electric",
+        premise_key="sp_group_premise_opaque",
+        utility_type="electric",
+    )
+    ledger_entry = SimpleNamespace(
+        has_trusted_total=True,
+        latest_total=Decimal("10.0"),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="auth0|account-1",
+        data={
+            CONF_ACCOUNT_ID: "auth0|account-1",
+            CONF_SESSION: session.to_dict(),
+        },
+    )
+    entry.runtime_data = SpGroupRuntimeData(
+        auth_client=object(),  # type: ignore[arg-type]
+        jarvis_client=UtilityClientSentinel(),  # type: ignore[arg-type]
+        yggdrasil_client=UtilityClientSentinel(),  # type: ignore[arg-type]
+        profile_client=UtilityClientSentinel(),  # type: ignore[arg-type]
+        session=session,
+        account_id="auth0|account-1",
+        refresh_lock=asyncio.Lock(),
+        ledger_store=SimpleNamespace(
+            snapshot=SimpleNamespace(
+                malformed=False,
+                entries={sensor_key.key: ledger_entry},
+            )
+        ),
+    )
+    discovery = SpGroupDataUpdateCoordinator(hass, entry)  # type: ignore[arg-type]
+    discovery.async_set_updated_data(
+        discovery_data(("sp_group_premise_opaque", ("ELECTRIC",)))
+    )
+    coordinator = SpGroupElectricityCoordinator(hass, entry)  # type: ignore[arg-type]
+    entry.runtime_data.electricity_coordinator = coordinator
+    coordinator.last_update_success = True
+    sensor = SpGroupUtilitySensor(
+        coordinator,
+        discovery,
+        sensor_key,
+        SENSOR_DESCRIPTIONS["electric"],
+    )
+
+    with patch.object(
+        coordinator,
+        "_async_poll_sources",
+        AsyncMock(
+            return_value=SpGroupUtilityPollResult(
+                provider_failure_count=1,
+                failed_source_keys=frozenset({sensor_key.key}),
+            )
+        ),
+    ):
+        await coordinator._async_update_data()
+
+    assert sensor.available
+    assert sensor.native_value == Decimal("10.0")
+
+    ledger_entry.latest_total = Decimal("10.75")
+    with patch.object(
+        coordinator,
+        "_async_poll_sources",
+        AsyncMock(return_value=SpGroupUtilityPollResult(accepted_delta=1)),
+    ):
+        await coordinator._async_update_data()
+
+    assert sensor.available
+    assert sensor.native_value == Decimal("10.75")
 
 
 def test_future_sensor_keys_are_derived_from_discovery_data() -> None:

@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from homeassistant.const import EVENT_HOMEASSISTANT_START
 from homeassistant.core import CoreState, HomeAssistant
@@ -37,6 +37,13 @@ _HARD_STATISTICS_WARNING_PREFIXES = (
 _HARD_STATISTICS_WARNINGS = {
     "statistics_legacy_rows_need_manual_rebuild",
 }
+
+
+class _SourcePollResult(Protocol):
+    """Minimum result contract required by source backfill orchestration."""
+
+    @property
+    def provider_failure_count(self) -> int: ...
 
 
 class StatisticsBackfillScheduleStatus(StrEnum):
@@ -388,7 +395,7 @@ async def _run_backfill_with_retry(
 async def _run_utility_source_backfill(
     entry: SpGroupConfigEntry,
     utility_type: str,
-    poll: Callable[..., Awaitable[object]],
+    poll: Callable[..., Awaitable[_SourcePollResult]],
     *,
     poll_count: int,
 ) -> bool:
@@ -427,7 +434,19 @@ async def _run_utility_source_backfill(
                 poll_index + 1,
                 poll_count,
             )
-            await poll(backfill=True)
+            result = await poll(backfill=True)
+            provider_failure_count = getattr(result, "provider_failure_count", 0)
+            if isinstance(provider_failure_count, int) and provider_failure_count > 0:
+                await ledger_store.async_mark_source_backfill_failed(
+                    sensor_keys=sensor_keys,
+                    failed_at=dt_utils.utcnow(),
+                )
+                LOGGER.warning(
+                    "SP Group %s source backfill deferred: provider_failures=%d",
+                    utility_type,
+                    provider_failure_count,
+                )
+                return False
     except asyncio.CancelledError:
         raise
     except UpdateFailed:
