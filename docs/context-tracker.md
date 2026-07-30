@@ -4504,6 +4504,15 @@ blocked by the pre-existing `_classify_external_rows` collection error.
 - The first remote run confirmed the SDK repository is private and inaccessible
   to the default Actions token. CI therefore uses the checked-in vendored SDK
   snapshot with `PYTHONPATH`; no private-repository credential is required.
+
+## 2026-07-31 — CI interpreter alignment
+
+- The first vendored-SDK CI retry installed dependencies into `.venv`, but the
+  verification tasks invoked mise's bare Python and therefore could not import
+  pytest on a clean runner.
+- Updated the test, lint/mypy, docs, compile, and live-soak tasks to invoke
+  `.venv/bin/python` explicitly. This makes the installed environment the
+  authoritative interpreter in both local and CI runs.
 - Updated the development guide and repository instructions with the branch/
   CI contract, corrected the local SDK path, and removed the stale claim that Git
   history is unavailable. Corrected the manual seed design's stale two-sighting

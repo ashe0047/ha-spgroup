@@ -18,11 +18,11 @@ fi
 
 [tasks."python:test"]
 description = "Run Python tests"
-run = "python -m pytest tests/"
+run = ".venv/bin/python -m pytest tests/"
 
 [tasks."python:test:ha-live-soak"]
 description = "Run opt-in live SP Group Home Assistant runtime soak"
-run = "SPGROUP_HA_LIVE_SOAK=1 python -m pytest tests/components/sp_group/test_live_soak.py -m spgroup_ha_live_soak -vv -rs"
+run = "SPGROUP_HA_LIVE_SOAK=1 .venv/bin/python -m pytest tests/components/sp_group/test_live_soak.py -m spgroup_ha_live_soak -vv -rs"
 
 [tasks."ha:dev"]
 description = "Start HA dev (Python 3.14, HA 2026.7.2)"
@@ -78,12 +78,12 @@ run = "python scripts/ha_dev_ami_latest.py"
 
 [tasks."python:lint"]
 description = "Run Python lint and type checks"
-run = "python -m ruff check custom_components tests && python -m mypy -p custom_components.sp_group"
+run = ".venv/bin/python -m ruff check custom_components tests && .venv/bin/python -m mypy -p custom_components.sp_group"
 
 [tasks."docs:check"]
 description = "Validate documentation lifecycle headings and local links"
-run = "python scripts/check_docs.py"
+run = ".venv/bin/python scripts/check_docs.py"
 
 [tasks."ha:check"]
 description = "Run lightweight Home Assistant scaffold checks"
-run = "python -m compileall custom_components/sp_group tests"
+run = ".venv/bin/python -m compileall custom_components/sp_group tests"
