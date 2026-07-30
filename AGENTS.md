@@ -34,9 +34,33 @@ Python code targets Ruff line length `88` and strict mypy. Prefer typed async AP
 
 Default tests should be hermetic and must not call live SP Group or Auth0 services. Live tests are opt-in via the `spgroup_ha_live_soak` marker; document live credential/session assumptions in the PR.
 
+## Branching and CI workflow
+
+`main` is the release-ready default branch. `development` is the shared
+integration branch for work intended for the next release. Create a short-lived
+feature or fix branch from `development`, keep commits focused, and open a pull
+request back to `development`. Merge only after the required CI checks pass.
+Promote `development` to `main` through a reviewed pull request when the release
+is ready; do not develop directly on `main`.
+
+GitHub Actions runs `Integration CI` on pushes and pull requests targeting
+`development` or `main`. It installs the pinned Python/SDK environment and
+runs the hermetic tests, Ruff/mypy, documentation checks, and HA compile check.
+`HACS Validation` separately checks the HACS layout and runs daily. Live
+provider tests remain opt-in and are not required CI checks.
+
+CI checks out the reviewed public SDK commit into `python-packages/spgroup` and
+sets `SPGROUP_SDK_PATH`, while local development continues using the sibling
+SDK checkout. This keeps `mise run python:install` identical in both
+environments; update the workflow commit deliberately when the SDK contract
+changes.
+
 ## Commit & Pull Request Guidelines
 
-This checkout does not expose Git history, so use short imperative commit subjects such as `Add SP Group meter parsing tests` or conventional prefixes like `docs:`. PRs should summarize scope, list verification commands, note live-test status, and link relevant docs or issues. Include screenshots only for HA frontend or UI-visible changes.
+Use short imperative commit subjects such as `Add SP Group meter parsing tests`
+or conventional prefixes like `docs:`. PRs should summarize scope, list
+verification commands, note live-test status, and link relevant docs or issues.
+Include screenshots only for HA frontend or UI-visible changes.
 
 ### Dev HA instance known repair issues
 

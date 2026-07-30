@@ -74,9 +74,12 @@ HA interpretation:
   typed numerically in the APK DTO.
 - It is not proven to be a cumulative meter total.
 - A zero `consumption` value is positional coverage evidence, not universally
-  valid zero usage: leading zeros indicate pre-AMI coverage, while any zero
-  after AMI coverage begins indicates provider lag/unavailable data, including
-  trailing, internal, and future/in-progress rows.
+  valid zero usage: leading zeros indicate pre-AMI unavailable coverage;
+  explicit zeros between positive AMI buckets are valid observed zero usage,
+  while omitted middle slots are inferred gap-zero coverage. Only an explicit
+  or omitted trailing suffix in the terminal clipped polling window represents
+  provider lag; non-terminal historical gaps follow the electricity gap/no-data
+  contract.
 - It must remain non-publishable and non-statistical.
 
 Live validation:

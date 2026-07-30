@@ -172,7 +172,8 @@ Classification:
 Classification:
 
 - `plan-auth-store-refactor.md` and `plan-statistics-backfill-full-coverage-hardening.md` — `Needs implementation audit`.
-- `plan-backfill-once-refactor.md` — `Implemented` pending final verification wording.
+- `plan-backfill-once-refactor.md` — `Implemented` (historical plan; runtime
+  behavior is covered by the backfill lifecycle tests).
 - `plan-phase-a-refactor.md` — `Implemented`.
 - `plan-provider-owned-external-statistics.md` and `plan-statistics-recorder-readback-fix.md` — `Superseded`/`Implemented`.
 
