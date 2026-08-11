@@ -1247,19 +1247,34 @@ def _normal_electricity_ami_source_poll(
         return SpGroupParsedSource(
             coverage=SpGroupSourceCoverage(status=SOURCE_COVERAGE_MALFORMED)
         )
-    positive = [(start, value) for start, value in completed_rows if value > 0]
-    if not positive:
-        return SpGroupParsedSource(
-            coverage=SpGroupSourceCoverage(status=SOURCE_COVERAGE_LAGGING)
-        )
-
-    row_by_start = dict(completed_rows)
-    last_positive = positive[-1][0]
     slots = tuple(
         slot
         for slot in _half_hour_slots(backfill_from, now)
         if slot + timedelta(minutes=30) <= now
     )
+    positive = [(start, value) for start, value in completed_rows if value > 0]
+    if not positive:
+        unresolved_ranges: tuple[SpGroupUnresolvedRange, ...] = ()
+        if slots:
+            unresolved_ranges = (
+                SpGroupUnresolvedRange(
+                    cadence="30m",
+                    start=slots[0],
+                    end=slots[-1] + timedelta(minutes=30),
+                    reason="terminal_provider_lag",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                ),
+            )
+        return SpGroupParsedSource(
+            coverage=SpGroupSourceCoverage(
+                status=SOURCE_COVERAGE_LAGGING,
+                unresolved_ranges=unresolved_ranges,
+            )
+        )
+
+    row_by_start = dict(completed_rows)
+    last_positive = positive[-1][0]
     unresolved: list[SpGroupUnresolvedRange] = []
     observations_list: list[SpGroupBucketObservation] = []
     for slot in slots:
