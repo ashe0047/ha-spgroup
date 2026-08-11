@@ -436,8 +436,9 @@ design:
   bucket sightings, accepted immutable bucket contributions, and correction
   warnings;
 - a valid seed is the first trusted dashboard-ready total;
-- electricity AMI buckets require two unchanged successful sightings before
-  acceptance;
+- electricity AMI buckets use direct acceptance after normalization and
+  validation; the historical two-sighting policy is retired (see
+  [ADR: Two-Sighting Rule Removal](../adr/adr-two-sighting-removal.md));
 - water monthly buckets use the closed-month plus three-day grace policy;
 - sensors expose dashboard metadata only when a trusted ledger total exists;
 - unseeded utilities remain discovery-only and unavailable/non-statistical.

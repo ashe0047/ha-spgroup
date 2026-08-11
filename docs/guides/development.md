@@ -21,7 +21,7 @@ mise run python:install
 
 This creates or refreshes `.venv/` and installs:
 
-- the SDK from `../../../../python-packages/spgroup/` in editable mode;
+- the SDK from `../../../python-packages/spgroup/` in editable mode;
 - Home Assistant `2026.7.2`, `home-assistant-frontend`, and all needed optional
   component dependencies (`ha-ffmpeg`, `hassil`, `PyTurboJPEG`, `mutagen`,
   `home-assistant-intents`, `pymicro-vad`, `pyspeex-noise`, `aiohasupervisor`,
@@ -32,6 +32,40 @@ This creates or refreshes `.venv/` and installs:
 - optional runtime packages needed by the local HA frontend config.
 
 Use `python`, not `python3`, for direct commands in this repo.
+
+## Branching and continuous integration
+
+Use `main` only for release-ready changes. Develop on `development`, or create
+a short-lived feature/fix branch from `development` and open a pull request
+back to it. Keep the branch focused, rebase or merge the current
+`development` branch before handoff, and merge only after required checks pass.
+Promote `development` to `main` through a reviewed pull request; releases and
+HACS consumption are based on `main`.
+
+GitHub Actions runs the same gates on pushes and pull requests for both shared
+branches. `Integration CI` installs Python, the public `spgroup` SDK, Home
+Assistant, and test tooling, then runs:
+
+```bash
+mise run python:test
+mise run python:lint
+mise run docs:check
+mise run ha:check
+```
+
+`HACS Validation` separately checks HACS integration metadata and runs daily.
+The workflow is hermetic: it does not use live SP Group credentials or provider
+endpoints. Live soak tests remain an explicit local operation:
+
+```bash
+mise run python:test:ha-live-soak
+```
+
+Local development keeps using the sibling SDK checkout. CI uses the vendored
+SDK snapshot under `custom_components/sp_group/vendor/`, sets `PYTHONPATH` and
+`SPGROUP_SDK_PATH`, and runs the same `mise run python:install` task. This keeps
+the workflow self-contained because the SDK repository is private. Update the
+vendored snapshot deliberately when changing the integration's SDK contract.
 
 ## Repository Areas
 

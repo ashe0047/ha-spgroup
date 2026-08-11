@@ -1786,6 +1786,16 @@ def test_electricity_source_poll_with_only_zero_rows_is_lagging() -> None:
     )
     assert parsed.observations == ()
     assert parsed.coverage.status == "lagging"
+    assert parsed.coverage.unresolved_ranges == (
+        SpGroupUnresolvedRange(
+            cadence="30m",
+            start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+            end=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+            reason="terminal_provider_lag",
+            first_seen_at=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+            last_seen_at=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+        ),
+    )
 
 
 def test_normal_electricity_source_poll_treats_trailing_zero_as_lag() -> None:
@@ -1900,7 +1910,37 @@ def test_electricity_source_poll_treats_complete_zero_grid_as_unavailable() -> N
     )
     assert parsed.observations == ()
     assert parsed.coverage.status == "lagging"
-    assert parsed.coverage.unresolved_ranges == ()
+    assert parsed.coverage.unresolved_ranges == (
+        SpGroupUnresolvedRange(
+            cadence="30m",
+            start=month,
+            end=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+            reason="terminal_provider_lag",
+            first_seen_at=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+            last_seen_at=datetime(2026, 2, 2, tzinfo=SINGAPORE_TZ),
+        ),
+    )
+
+
+def test_electricity_source_poll_empty_window_tracks_completed_lag_suffix() -> None:
+    """An empty response tracks the clipped completed window as provider lag."""
+    parsed = _electricity_ami_source_poll(
+        {"unit": "kWh", "history": []},
+        backfill_from=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+        now=datetime(2026, 7, 15, 14, 15, tzinfo=SINGAPORE_TZ),
+    )
+    assert parsed.observations == ()
+    assert parsed.coverage.status == "lagging"
+    assert parsed.coverage.unresolved_ranges == (
+        SpGroupUnresolvedRange(
+            cadence="30m",
+            start=datetime(2026, 7, 15, 13, 0, tzinfo=SINGAPORE_TZ),
+            end=datetime(2026, 7, 15, 14, 0, tzinfo=SINGAPORE_TZ),
+            reason="terminal_provider_lag",
+            first_seen_at=datetime(2026, 7, 15, 14, 15, tzinfo=SINGAPORE_TZ),
+            last_seen_at=datetime(2026, 7, 15, 14, 15, tzinfo=SINGAPORE_TZ),
+        ),
+    )
 
 
 def test_electricity_source_poll_ignores_future_and_in_progress_rows() -> None:

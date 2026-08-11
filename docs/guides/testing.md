@@ -50,24 +50,10 @@ mise run python:lint
 mise run ha:check
 ```
 
-These checks are useful for early scaffold safety, but they are not enough to
-prove that the integration loads cleanly inside Home Assistant.
-
-## Target Test Harness
-
-The next foundation step should add a Home Assistant custom-component test
-harness:
-
-- Add `pytest-homeassistant-custom-component` to the Python test dependencies.
-- Set `asyncio_mode = auto` in `pyproject.toml`.
-- Add `custom_components/__init__.py` if required by the test loader.
-- Add `tests/components/sp_group/conftest.py` for shared fixtures.
-- Use `enable_custom_integrations` in HA integration tests.
-- Use `pytest_homeassistant_custom_component.common.MockConfigEntry` instead of
-  importing test helpers from Home Assistant Core's internal `tests.common`.
-
-After this harness is in place, `mise run python:test` should run both SDK tests
-and HA custom-integration tests.
+These checks are the repository's current scaffold and integration gate. The
+HA custom-component harness is already established; do not treat it as future
+work or add a second test loader. New tests should extend the existing fixtures
+and keep provider calls hermetic by default.
 
 ## Home Assistant Integration Tests
 

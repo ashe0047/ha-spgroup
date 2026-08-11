@@ -4485,3 +4485,54 @@ blocked by the pre-existing `_classify_external_rows` collection error.
 
 - Recommended preserving `docs/adr/` as the normative decision set, adding a top-level documentation index and explicit status/authority metadata, and separating active operational/reference guidance from historical issues and superseded plans.
 - Remaining structural drift includes plans without lifecycle status, issue records without explicit resolution status, and ADRs that retain large historical amendments inline. A staged reorganization is safer than moving files immediately because many documents are cross-linked from the context tracker and each other.
+
+## 2026-07-30 — Development branching and CI workflow
+
+- Created and pushed the `development` branch from the release-ready `main`
+  baseline (`5006802`). Feature and fix work should branch from `development`
+  and return through reviewed pull requests; promotion to `main` is the release
+  boundary.
+- Added `Integration CI` for pushes and pull requests targeting `development`
+  or `main`. It installs the pinned `mise.toml` environment and runs tests,
+  Ruff/mypy, documentation validation, and the HA compile check. Live-provider
+  tests remain opt-in.
+- Kept HACS validation as a separate branch-gated and scheduled workflow, with
+  immutable action pins and least-privilege contents-read permissions.
+- Added `SPGROUP_SDK_PATH` override and a vendored-SDK fallback to the install
+  task so local sibling-checkout development and the single-repository CI
+  workspace use the same installation command.
+- The first remote run confirmed the SDK repository is private and inaccessible
+  to the default Actions token. CI therefore uses the checked-in vendored SDK
+  snapshot with `PYTHONPATH`; no private-repository credential is required.
+
+## 2026-07-31 — CI interpreter alignment
+
+- The first vendored-SDK CI retry installed dependencies into `.venv`, but the
+  verification tasks invoked mise's bare Python and therefore could not import
+  pytest on a clean runner.
+- Updated the test, lint/mypy, docs, compile, and live-soak tasks to invoke
+  `.venv/bin/python` explicitly. This makes the installed environment the
+  authoritative interpreter in both local and CI runs.
+
+## 2026-07-31 — Development workflow verification
+
+- Remote HACS validation passed on the development workflow.
+- Remote Integration CI passed after the vendored-SDK and interpreter/mypy
+  fixes: tests, Ruff/mypy, docs validation, and HA compilation all completed
+  successfully. The mise action emitted only a non-blocking Node.js 20
+  deprecation warning.
+- Updated the development guide and repository instructions with the branch/
+  CI contract, corrected the local SDK path, and removed the stale claim that Git
+  history is unavailable. Corrected the manual seed design's stale two-sighting
+  implementation statement while retaining historical rationale in ADRs.
+
+## 2026-07-31 — CI and documentation drift closure
+
+- Rechecked maintained guidance after the workflow change. Removed the testing
+  guide's obsolete future-harness instructions because the HA custom-component
+  harness, fixtures, and Recorder coverage are already active.
+- Corrected the payload-contract zero interpretation to distinguish leading
+  unavailable coverage, accepted internal observed zeros, inferred middle gaps,
+  and terminal provider-lag suffixes.
+- Clarified the documentation index's backfill plan classification as an
+  implemented historical plan rather than pending verification wording.

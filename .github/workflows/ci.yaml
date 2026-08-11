@@ -1,0 +1,48 @@
+name: Integration CI
+
+on:
+  push:
+    branches: [development, main]
+  pull_request:
+    branches: [development, main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Tests, quality, docs, and compile checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mise
+        uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+
+      - name: Install pinned Python and dependencies
+        env:
+          SPGROUP_SDK_PATH: custom_components/sp_group/vendor
+        run: mise run python:install
+
+      - name: Run tests
+        env:
+          PYTHONPATH: custom_components/sp_group/vendor
+        run: mise run python:test
+
+      - name: Run lint and type checks
+        env:
+          MYPYPATH: custom_components/sp_group/vendor
+        run: mise run python:lint
+
+      - name: Validate documentation
+        run: mise run docs:check
+
+      - name: Compile Home Assistant scaffold
+        run: mise run ha:check

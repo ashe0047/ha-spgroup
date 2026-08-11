@@ -131,7 +131,9 @@ History:
 - explicit or omitted slots after the last positive completed row are not
   accepted and are coalesced into one `terminal_provider_lag` range;
 - a completed window with no positive row remains lagging, creates no accepted
-  observations, and does not advance the cursor;
+  observations, and does not advance the cursor; its entire completed window
+  is persisted as one coalesced `terminal_provider_lag` range so repeated empty
+  polls extend the retry diagnostic through the newest completed slot;
 - incomplete/future slots are excluded from both observations and lag ranges.
 
 Normal trailing classification is relative to the actual polling window, not
