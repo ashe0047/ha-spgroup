@@ -4536,3 +4536,21 @@ blocked by the pre-existing `_classify_external_rows` collection error.
   and terminal provider-lag suffixes.
 - Clarified the documentation index's backfill plan classification as an
   implemented historical plan rather than pending verification wording.
+
+
+## 2026-10-22 — Request the uportal claim during mobile login
+
+- The Android 15.12.0 login scope includes `me:uportal`; the vendored SDK's
+  default password-realm login scope omitted it.
+- The user confirmed that adding `me:uportal` resolves their immediate
+  post-OTP `jarvis.get_me` HTTP 403 `invalid_claim` response. This is a
+  user-reported live result; no live provider requests were made here.
+- Add only `me:uportal` to the existing default scopes. Existing sessions
+  without this scope need a fresh login/OTP flow to request it.
+- Bump the integration patch version to `0.2.1` and align the manifest test,
+  as required for runtime fixes by the contribution guide.
+- This fork exposes only `main`, so the fix branch and PR use `main` as the
+  base instead of the absent `development` branch.
+- Verification: mocked password login requests `me:uportal` before MFA;
+  existing manifest assertions, documentation validation, and
+  `git diff --check` pass. The full HA suite was not run locally.

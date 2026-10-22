@@ -12,5 +12,5 @@
   "iot_class": "cloud_polling",
   "quality_scale": "bronze",
   "requirements": ["spgroup>=0.1.0"],
-  "version": "0.2.0"
+  "version": "0.2.1"
 }
