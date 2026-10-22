@@ -21,7 +21,7 @@ TOKEN_EXPIRY_BUFFER_SECONDS = 60
 
 DEFAULT_SCOPE = (
     "openid email profile offline_access user_metadata enroll "
-    "read:authenticators me:rbac me"
+    "read:authenticators me:rbac me me:uportal"
 )
 APK_SCOPE = "openid profile email user_metadata offline_access"
 
